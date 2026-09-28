@@ -81,7 +81,7 @@ impl Tessera {
             text(format!("{:.0}%", self.camera.zoom * 100.0)),
             space::horizontal(),
             text(&self.status),
-            text("Drag corner: move · Drag edge: extend · Shift+drag: new tri · C: cut edge · Drag: pan · Wheel: zoom")
+            text("Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Middle-drag: pan · Wheel: zoom")
                 .size(12),
         ]
         .spacing(10)

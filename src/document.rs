@@ -51,6 +51,8 @@ pub enum Edit {
     /// Cut the edge `a`–`b` at a new vertex `at` on it: each triangle on
     /// the edge is split in two, towards its opposite corner.
     SplitEdge { a: VertexId, b: VertexId, at: Point },
+    /// Remove a triangle, leaving a hole (or a smaller outline).
+    RemoveTriangle { triangle: TriangleId },
     /// Move vertex `id` onto the edge `a`–`b` (to `at`, which lies on it).
     /// Triangles squashed flat by this are removed, and triangles that now
     /// have a vertex in the middle of an edge are split at it, so the mesh
@@ -208,6 +210,12 @@ impl Document {
                 for t in [[a, b, d], [b, c, d], [c, a, d]] {
                     self.push_triangle(t);
                 }
+            }
+            Edit::RemoveTriangle { triangle } => {
+                if triangle >= self.triangles.len() {
+                    return false;
+                }
+                self.triangles.remove(triangle);
             }
             Edit::SplitEdge { a, b, at } => {
                 let (pa, pb) = (self.vertices[a], self.vertices[b]);
@@ -444,6 +452,16 @@ impl Document {
         self.find_triangle(ids).is_some()
     }
 
+    /// The triangle containing `point` (on its boundary counts), if any.
+    pub fn triangle_at(&self, point: Point) -> Option<TriangleId> {
+        self.triangles().position(|[a, b, c]| {
+            // Triangles are wound positively, so inside is left of each edge.
+            [(a, b), (b, c), (c, a)]
+                .into_iter()
+                .all(|(u, v)| area2(u, v, point) >= 0.0)
+        })
+    }
+
     /// Finds a triangle with these corners, in any order.
     pub fn find_triangle(&self, mut ids: [VertexId; 3]) -> Option<TriangleId> {
         ids.sort_unstable();
@@ -562,6 +580,21 @@ mod tests {
         ids.iter_mut().for_each(|t| t.sort_unstable());
         ids.sort_unstable();
         ids
+    }
+
+    #[test]
+    fn removing_the_triangle_under_a_point() {
+        let mut doc = doc_with_triangle();
+        doc.apply(Edit::ExtendEdge {
+            a: 0,
+            b: 1,
+            apex: Corner::New(Point::new(5.0, -10.0)),
+        });
+
+        assert_eq!(doc.triangle_at(Point::new(50.0, 50.0)), None);
+        let below = doc.triangle_at(Point::new(5.0, -3.0)).unwrap();
+        assert!(doc.apply(Edit::RemoveTriangle { triangle: below }));
+        assert_eq!(sorted(&doc), vec![[0, 1, 2]]);
     }
 
     #[test]

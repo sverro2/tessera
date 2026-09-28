@@ -1,12 +1,9 @@
 //! The interactive canvas: renders a [`Document`] through a [`Camera`] and
 //! turns mouse input into [`Message`]s. It never mutates the document itself.
 //!
-//! Left-drag on blank canvas:
-//! - creates the first triangle while the document is empty,
-//! - otherwise pans (hold Shift to create a separate triangle instead).
-//!
-//! Middle-drag always pans; the wheel zooms around the cursor. C cuts the
-//! hovered edge at the cursor.
+//! Left-drag on blank canvas creates a triangle. Only middle-drag pans; the
+//! wheel zooms around the cursor. C cuts the hovered edge at the cursor; D
+//! removes the triangle under it.
 
 use iced::keyboard;
 use iced::mouse;
@@ -42,10 +39,12 @@ const BACKGROUND: Color = Color::from_rgb8(0x1a, 0x1b, 0x26);
 const GRID_DOT: Color = Color::from_rgb8(0x2f, 0x33, 0x4d);
 const FILL: Color = Color::from_rgba8(0x7a, 0xa2, 0xf7, 0.35);
 const EDGE: Color = Color::from_rgb8(0xc0, 0xca, 0xf5);
-const CURSOR: Color = Color::from_rgb8(0x9e, 0xce, 0x6a);
-const VERTEX_HANDLE: Color = Color::from_rgb8(0xbb, 0x9a, 0xf7);
-const EDGE_HANDLE: Color = Color::from_rgb8(0x7d, 0xcf, 0xff);
-const CANCEL: Color = Color::from_rgb8(0xf7, 0x76, 0x8e);
+/// What an action would add (and the cursor that creates triangles).
+const ADDED: Color = Color::from_rgb8(0x9e, 0xce, 0x6a);
+/// What an action would remove; also used for problems and cancelling.
+const REMOVED: Color = Color::from_rgb8(0xf7, 0x76, 0x8e);
+/// The hovered vertex or edge.
+const HOVER: Color = Color::from_rgb8(0x7d, 0xcf, 0xff);
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -82,7 +81,6 @@ struct Editor<'a> {
 #[derive(Debug, Default)]
 pub struct State {
     interaction: Interaction,
-    modifiers: keyboard::Modifiers,
 }
 
 /// An in-progress drag. Positions are in world coordinates.
@@ -134,24 +132,26 @@ impl canvas::Program<Message> for Editor<'_> {
         let inside = cursor.position_in(bounds);
 
         match event {
-            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
-                state.modifiers = *modifiers;
-                None
-            }
-            // C cuts the hovered edge where the cursor is.
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
                 physical_key,
                 modifiers,
                 ..
-            }) if key.to_latin(*physical_key) == Some('c')
-                && !modifiers.command()
-                && matches!(state.interaction, Interaction::Idle) =>
-            {
-                let Some(Hover::Edge { a, b, at }) = self.hit_test(inside?) else {
-                    return None;
+            }) if !modifiers.command() && matches!(state.interaction, Interaction::Idle) => {
+                let pos = inside?;
+
+                let edit = match key.to_latin(*physical_key)? {
+                    // C cuts the hovered edge where the cursor is.
+                    'c' => match self.hit_test(pos)? {
+                        Hover::Edge { a, b, at } => Edit::SplitEdge { a, b, at },
+                        Hover::Vertex(_) => return None,
+                    },
+                    // D removes the triangle under the cursor.
+                    'd' => Edit::RemoveTriangle {
+                        triangle: self.document.triangle_at(self.camera.to_world(pos))?,
+                    },
+                    _ => return None,
                 };
-                let edit = Edit::SplitEdge { a, b, at };
                 let (edits, _) = self.check(vec![edit])?;
 
                 Some(canvas::Action::publish(Message::Edit(edits)).and_capture())
@@ -173,13 +173,10 @@ impl canvas::Program<Message> for Editor<'_> {
                             start: at,
                             apex: at,
                         },
-                        None if self.document.is_empty() || state.modifiers.shift() => {
-                            Interaction::Creating {
-                                from: world,
-                                to: world,
-                            }
-                        }
-                        None => Interaction::Panning { last: pos },
+                        None => Interaction::Creating {
+                            from: world,
+                            to: world,
+                        },
                     },
                     _ => return None,
                 };
@@ -249,12 +246,6 @@ impl canvas::Program<Message> for Editor<'_> {
     ) -> Vec<Geometry> {
         let camera = self.camera;
 
-        let accent = match state.interaction {
-            Interaction::Creating { .. } => CURSOR,
-            Interaction::MovingVertex { .. } => VERTEX_HANDLE,
-            _ => EDGE_HANDLE,
-        };
-
         // While dragging, draw the document as it will be after release.
         let pending = self.pending(state.interaction);
 
@@ -262,7 +253,7 @@ impl canvas::Program<Message> for Editor<'_> {
             Some((_, result)) => {
                 let mut frame = Frame::new(renderer, bounds.size());
                 self.draw_document(&mut frame, result);
-                self.draw_changes(&mut frame, result, accent);
+                self.draw_changes(&mut frame, result);
                 frame.into_geometry()
             }
             None => self.cache.draw(renderer, bounds.size(), |frame| {
@@ -279,24 +270,26 @@ impl canvas::Program<Message> for Editor<'_> {
                     handle(
                         &mut overlay,
                         camera.to_screen(self.document.vertex(id)),
-                        VERTEX_HANDLE,
+                        HOVER,
                     );
                 }
                 Some((_, Some(Hover::Edge { a, b, at }))) => {
                     let a = camera.to_screen(self.document.vertex(a));
                     let b = camera.to_screen(self.document.vertex(b));
-                    overlay.stroke(&Path::line(a, b), stroke(EDGE_HANDLE, 2.5));
-                    handle(&mut overlay, camera.to_screen(at), EDGE_HANDLE);
+                    overlay.stroke(&Path::line(a, b), stroke(HOVER, 2.5));
+                    handle(&mut overlay, camera.to_screen(at), HOVER);
                 }
                 Some((p, None)) => {
-                    overlay.stroke(&Path::circle(p, 6.0), stroke(CURSOR, 2.0));
-                    overlay.fill(&Path::circle(p, 1.5), CURSOR);
+                    overlay.stroke(&Path::circle(p, 6.0), stroke(ADDED, 2.0));
+                    overlay.fill(&Path::circle(p, 1.5), ADDED);
                 }
                 None => {}
             },
             (Interaction::Panning { .. }, _) => {}
             (_, Some((edits, result))) => {
-                let at = camera.to_screen(placed(edits, result));
+                let Some(at) = placed(edits, result).map(|p| camera.to_screen(p)) else {
+                    return vec![content, overlay.into_geometry()];
+                };
 
                 // Stuck away from the cursor (e.g. a vertex held back by an
                 // edge): show where the mouse really is, so the jump on
@@ -307,21 +300,21 @@ impl canvas::Program<Message> for Editor<'_> {
                             segments: &[4.0, 4.0],
                             offset: 0,
                         },
-                        ..stroke(Color { a: 0.5, ..accent }, 1.0)
+                        ..stroke(Color { a: 0.5, ..ADDED }, 1.0)
                     };
                     overlay.stroke(&Path::line(p, at), dashed);
                     overlay.stroke(
                         &Path::circle(p, 4.0),
-                        stroke(Color { a: 0.7, ..accent }, 1.5),
+                        stroke(Color { a: 0.7, ..ADDED }, 1.5),
                     );
                 }
 
-                handle(&mut overlay, at, accent);
+                handle(&mut overlay, at, ADDED);
             }
             // Releasing now would do nothing.
             (_, None) => {
                 if let Some(p) = cursor_pos {
-                    handle(&mut overlay, p, CANCEL);
+                    handle(&mut overlay, p, REMOVED);
                 }
             }
         }
@@ -749,19 +742,13 @@ impl Editor<'_> {
                     segments: &[6.0, 4.0],
                     offset: 0,
                 },
-                ..stroke(CANCEL, 2.0)
+                ..stroke(REMOVED, 2.0)
             },
         );
 
         // Edges lying (partly) on top of each other mean the mesh isn't
-        // joined up properly there; show the overlapping stretches in pink.
-        let mut edges: Vec<(VertexId, VertexId)> = document
-            .edges()
-            .map(|(u, v)| (u.min(v), u.max(v)))
-            .collect();
-        edges.sort_unstable();
-        edges.dedup();
-        let edges: Vec<(Point, Point)> = edges
+        // joined up properly there; show the overlapping stretches in red.
+        let edges: Vec<(Point, Point)> = unique_edges(document)
             .into_iter()
             .map(|(u, v)| {
                 let screen = |v| self.camera.to_screen(document.vertex(v));
@@ -779,17 +766,30 @@ impl Editor<'_> {
                 }
             }
         });
-        frame.stroke(&overlapping, stroke(CANCEL, 3.0));
+        frame.stroke(&overlapping, stroke(REMOVED, 3.0));
     }
 
     /// Highlights how `result` differs from the current document: added
-    /// triangles in `accent`, and triangles squashed flat by the edit as the
-    /// red line they collapse into.
-    fn draw_changes(&self, frame: &mut Frame, result: &Document, accent: Color) {
+    /// triangles in green; removed edges, and triangles squashed flat by the
+    /// edit (as the line they collapse into), in red.
+    fn draw_changes(&self, frame: &mut Frame, result: &Document) {
         let added =
             self.mesh(new_triangles(self.document, result).map(|t| t.map(|v| result.vertex(v))));
-        frame.fill(&added, Color { a: 0.2, ..accent });
-        frame.stroke(&added, stroke(accent, 1.5));
+        frame.fill(&added, Color { a: 0.2, ..ADDED });
+        frame.stroke(&added, stroke(ADDED, 1.5));
+
+        // Vertices are never removed, so old edges can be drawn where their
+        // ends are after the edit.
+        let kept = unique_edges(result);
+        let removed = Path::new(|p| {
+            for (u, v) in unique_edges(self.document) {
+                if kept.binary_search(&(u, v)).is_err() {
+                    p.move_to(self.camera.to_screen(result.vertex(u)));
+                    p.line_to(self.camera.to_screen(result.vertex(v)));
+                }
+            }
+        });
+        frame.stroke(&removed, stroke(REMOVED, 2.0));
 
         // Removed triangles whose corners now (nearly) line up were squashed;
         // other removed ones (e.g. a split parent) were replaced.
@@ -804,7 +804,7 @@ impl Editor<'_> {
                 }
             }
         });
-        frame.stroke(&squashed, stroke(CANCEL, 3.0));
+        frame.stroke(&squashed, stroke(REMOVED, 3.0));
     }
 
     fn mesh(&self, triangles: impl Iterator<Item = [Point; 3]>) -> Path {
@@ -870,6 +870,17 @@ fn cross(a: Vector, b: Vector) -> f32 {
     a.x * b.y - a.y * b.x
 }
 
+/// Each edge once, as a sorted list of `(low, high)` vertex id pairs.
+fn unique_edges(document: &Document) -> Vec<(VertexId, VertexId)> {
+    let mut edges: Vec<_> = document
+        .edges()
+        .map(|(u, v)| (u.min(v), u.max(v)))
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+    edges
+}
+
 /// Triangles in `after` that `before` doesn't have (compared by corner ids).
 fn new_triangles<'a>(
     before: &'a Document,
@@ -890,8 +901,8 @@ fn new_triangles<'a>(
 }
 
 /// The point the user is placing with `edits`, where its handle is drawn.
-fn placed(edits: &[Edit], result: &Document) -> Point {
-    match *edits.last().expect("at least one edit") {
+fn placed(edits: &[Edit], result: &Document) -> Option<Point> {
+    Some(match *edits.last()? {
         Edit::AddTriangle([_, to, _]) => to,
         Edit::ExtendEdge {
             apex: Corner::New(at),
@@ -906,7 +917,8 @@ fn placed(edits: &[Edit], result: &Document) -> Point {
             ..
         }
         | Edit::MergeVertex { into: id, .. } => result.vertex(id),
-    }
+        Edit::RemoveTriangle { .. } => return None,
+    })
 }
 
 fn draw_grid(frame: &mut Frame, camera: Camera) {
