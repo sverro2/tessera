@@ -10,7 +10,7 @@
 
 use iced::Point;
 
-use crate::geometry::{area2, overlap};
+use crate::geometry::{area2, closest_on_segment, min_height, overlap};
 
 /// Index of a vertex in [`Document::vertices`].
 pub type VertexId = usize;
@@ -45,17 +45,19 @@ pub enum Edit {
     /// Replace a triangle with three triangles meeting at a new vertex `at`.
     SplitTriangle { triangle: TriangleId, at: Point },
     /// Move vertex `id` onto the edge `a`–`b` (to `at`, which lies on it).
-    /// The triangle squashed flat by this is removed, and a triangle on the
-    /// other side of `a`–`b` is split at `id`, so the mesh stays conforming
-    /// (no vertex ever sits in the middle of another triangle's edge).
+    /// Triangles squashed flat by this are removed, and triangles that now
+    /// have a vertex in the middle of an edge are split at it, so the mesh
+    /// stays conforming (no vertex sits in the middle of another triangle's
+    /// edge).
     CollapseOntoEdge {
         id: VertexId,
         a: VertexId,
         b: VertexId,
         at: Point,
     },
-    /// Weld vertex `id` onto its neighbour `into`. Triangles that had both
-    /// are squashed and removed.
+    /// Weld vertex `id` onto its neighbour `into`. Triangles squashed by
+    /// this are removed, and the mesh is kept conforming as for
+    /// [`Edit::CollapseOntoEdge`].
     MergeVertex { id: VertexId, into: VertexId },
     /// Move a vertex (and thereby every triangle using it).
     MoveVertex { id: VertexId, to: Point },
@@ -207,29 +209,13 @@ impl Document {
                 }
             }
             Edit::CollapseOntoEdge { id, a, b, at } => {
-                let Some(squashed) = self.find_triangle([id, a, b]) else {
+                if !self.has_triangle([id, a, b]) {
                     return false;
-                };
+                }
 
                 self.vertices[id] = at;
 
-                // Remove the squashed triangle by identity: `at` is only
-                // approximately on `a`–`b`, so a flatness test is unreliable.
-                self.triangles.remove(squashed);
-
-                // Split the neighbour across `a`–`b` so `id` becomes its corner.
-                let mut split = Vec::new();
-                self.triangles.retain(|t| {
-                    let across = t.contains(&a) && t.contains(&b);
-                    if across {
-                        let x = t.iter().copied().find(|&v| v != a && v != b).unwrap();
-                        split.extend([[a, id, x], [id, b, x]]);
-                    }
-                    !across
-                });
-                for t in split {
-                    self.push_triangle(t);
-                }
+                self.tidy_after_moving(id);
             }
             Edit::MergeVertex { id, into } => {
                 if id == into || !self.neighbours(id).any(|v| v == into) {
@@ -253,6 +239,8 @@ impl Document {
                     seen.push(key);
                     keep
                 });
+
+                self.tidy_after_moving(into);
             }
             Edit::MoveVertex { id, to } => {
                 self.vertices[id] = to;
@@ -260,6 +248,50 @@ impl Document {
         }
 
         true
+    }
+
+    /// After vertex `id` moved onto an edge or another vertex: removes the
+    /// triangles around it that are now flat, then makes the mesh conforming
+    /// again (see [`Self::split_t_junctions`]).
+    fn tidy_after_moving(&mut self, id: VertexId) {
+        let vertices = &self.vertices;
+        self.triangles
+            .retain(|t| !(t.contains(&id) && is_flat(t.map(|v| vertices[v]))));
+
+        self.split_t_junctions();
+    }
+
+    /// Splits every triangle that has a vertex lying in the middle of one of
+    /// its edges (a "T-junction") into two, towards its opposite corner, so
+    /// that vertex becomes a proper corner on both sides of the edge.
+    fn split_t_junctions(&mut self) {
+        loop {
+            let mut used: Vec<VertexId> = self.used_vertices().collect();
+            used.sort_unstable();
+            used.dedup();
+
+            let vertices = &self.vertices;
+            let junction = self.triangles.iter().enumerate().find_map(|(i, &t)| {
+                (0..3).find_map(|k| {
+                    let (u, v, x) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
+                    used.iter()
+                        .copied()
+                        .find(|&w| {
+                            !t.contains(&w)
+                                && is_inside_segment(vertices[w], vertices[u], vertices[v])
+                        })
+                        .map(|w| (i, [u, w, x], [w, v, x]))
+                })
+            });
+
+            let Some((i, first, second)) = junction else {
+                break;
+            };
+
+            self.triangles.remove(i);
+            self.push_triangle(first);
+            self.push_triangle(second);
+        }
     }
 
     /// Adds a new triangle, wound positively.
@@ -287,6 +319,24 @@ impl Document {
             t == ids
         })
     }
+}
+
+/// Relative tolerance for treating points as lying on a line.
+const FLAT: f32 = 1e-3;
+
+/// Whether a triangle is flat, relative to its size.
+fn is_flat(t: [Point; 3]) -> bool {
+    let [a, b, c] = t;
+    let longest = a.distance(b).max(b.distance(c)).max(c.distance(a));
+    min_height(t) <= FLAT * longest
+}
+
+/// Whether `p` lies on segment `a`–`b`, away from its ends.
+fn is_inside_segment(p: Point, a: Point, b: Point) -> bool {
+    let tolerance = FLAT * a.distance(b);
+    closest_on_segment(p, a, b).1 <= tolerance
+        && p.distance(a) > tolerance
+        && p.distance(b) > tolerance
 }
 
 fn is_degenerate([a, b, c]: [Point; 3]) -> bool {
@@ -491,6 +541,61 @@ mod tests {
             apex: Corner::New(Point::new(5.0, -10.0)),
         }));
         assert_eq!(doc.triangle_ids().len(), 2);
+    }
+
+    /// Total area and whether any vertex sits in the middle of an edge.
+    fn area_and_t_junctions(doc: &Document) -> (f32, bool) {
+        let area = doc.triangles().map(|[a, b, c]| area2(a, b, c) / 2.0).sum();
+        let used: Vec<_> = doc.used_vertices().collect();
+        let t_junction = doc.edges().any(|(u, v)| {
+            used.iter()
+                .any(|&w| is_inside_segment(doc.vertex(w), doc.vertex(u), doc.vertex(v)))
+        });
+        (area, t_junction)
+    }
+
+    #[test]
+    fn collapsing_can_squash_several_triangles() {
+        // Two triangles sharing the edge 0–1 (y = 300), each split.
+        let mut doc = Document::default();
+        doc.apply(Edit::AddTriangle([
+            Point::new(100.0, 300.0),
+            Point::new(300.0, 300.0),
+            Point::new(200.0, 100.0),
+        ]));
+        doc.apply(Edit::ExtendEdge {
+            a: 0,
+            b: 1,
+            apex: Corner::New(Point::new(200.0, 500.0)),
+        });
+        let split = |doc: &mut Document, corners: [VertexId; 3], at| {
+            let triangle = doc.find_triangle(corners).unwrap();
+            assert!(doc.apply(Edit::SplitTriangle { triangle, at }));
+        };
+        split(&mut doc, [0, 1, 2], Point::new(200.0, 230.0)); // centre 4
+        split(&mut doc, [0, 1, 3], Point::new(200.0, 370.0)); // centre 5
+
+        // Collapse the top centre onto the shared edge: the bottom side now
+        // has four triangles around 5, two of them along the shared line.
+        assert!(doc.apply(Edit::CollapseOntoEdge {
+            id: 4,
+            a: 0,
+            b: 1,
+            at: Point::new(200.0, 300.0),
+        }));
+        assert_eq!(area_and_t_junctions(&doc), (40_000.0, false));
+
+        // Collapse the bottom centre onto the shared line between 0 and 4.
+        // That flattens both (0, 4, 5) and (4, 1, 5); the bottom is re-split
+        // with a new edge from 4 down to 3.
+        assert!(doc.apply(Edit::CollapseOntoEdge {
+            id: 5,
+            a: 0,
+            b: 4,
+            at: Point::new(150.0, 300.0),
+        }));
+        assert_eq!(area_and_t_junctions(&doc), (40_000.0, false));
+        assert!(doc.edges().any(|e| e == (4, 3) || e == (3, 4)));
     }
 
     #[test]
