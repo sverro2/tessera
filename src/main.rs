@@ -41,8 +41,8 @@ enum Message {
 impl Tessera {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Editor(editor::Message::Edit(edit)) => {
-                self.document.apply(edit);
+            Message::Editor(editor::Message::Edit(edits)) => {
+                self.document.apply_all(&edits);
             }
             Message::Editor(editor::Message::Pan(delta)) => {
                 self.camera.pan += delta;
@@ -81,7 +81,7 @@ impl Tessera {
             text(format!("{:.0}%", self.camera.zoom * 100.0)),
             space::horizontal(),
             text(&self.status),
-            text("Drag corner: move · Drag edge: extend · Shift+drag: new tri · Drag: pan · Wheel: zoom")
+            text("Drag corner: move · Drag edge: extend · Shift+drag: new tri · C: cut edge · Drag: pan · Wheel: zoom")
                 .size(12),
         ]
         .spacing(10)

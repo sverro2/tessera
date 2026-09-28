@@ -10,7 +10,9 @@
 
 use iced::Point;
 
-use crate::geometry::{area2, closest_on_segment, min_height, overlap};
+use crate::geometry::{area2, min_height, overlap};
+
+mod fill;
 
 /// Index of a vertex in [`Document::vertices`].
 pub type VertexId = usize;
@@ -34,9 +36,11 @@ pub enum Corner {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Edit {
-    /// Add a free-standing triangle with three new vertices.
+    /// Add a triangle with three new corners. Where it runs into existing
+    /// geometry only the uncovered part is added, joined up with the mesh.
     AddTriangle([Point; 3]),
-    /// Add a triangle sharing the edge `a`–`b` with existing geometry.
+    /// Add a triangle on the edge `a`–`b`, covering (like
+    /// [`Edit::AddTriangle`]) only what isn't covered yet.
     ExtendEdge {
         a: VertexId,
         b: VertexId,
@@ -44,6 +48,9 @@ pub enum Edit {
     },
     /// Replace a triangle with three triangles meeting at a new vertex `at`.
     SplitTriangle { triangle: TriangleId, at: Point },
+    /// Cut the edge `a`–`b` at a new vertex `at` on it: each triangle on
+    /// the edge is split in two, towards its opposite corner.
+    SplitEdge { a: VertexId, b: VertexId, at: Point },
     /// Move vertex `id` onto the edge `a`–`b` (to `at`, which lies on it).
     /// Triangles squashed flat by this are removed, and triangles that now
     /// have a vertex in the middle of an edge are split at it, so the mesh
@@ -72,6 +79,11 @@ impl Document {
 
     pub fn vertex(&self, id: VertexId) -> Point {
         self.vertices[id]
+    }
+
+    /// The most recently added vertex.
+    pub fn last_vertex(&self) -> VertexId {
+        self.vertices.len() - 1
     }
 
     pub fn triangle_ids(&self) -> &[[VertexId; 3]] {
@@ -157,39 +169,26 @@ impl Document {
             })
     }
 
+    /// Applies several edits as one: all of them, or none if any is rejected.
+    pub fn apply_all(&mut self, edits: &[Edit]) -> bool {
+        let mut next = self.clone();
+
+        if edits.iter().all(|&edit| next.apply(edit)) {
+            *self = next;
+            true
+        } else {
+            false
+        }
+    }
+
     fn apply_unchecked(&mut self, edit: Edit) -> bool {
         match edit {
-            Edit::AddTriangle(corners) => {
-                if is_degenerate(corners) {
-                    return false;
-                }
-
-                let base = self.vertices.len();
-                self.vertices.extend(corners);
-                self.push_triangle([base, base + 1, base + 2]);
-            }
+            Edit::AddTriangle(corners) => return self.fill(corners.map(Corner::New)),
             Edit::ExtendEdge { a, b, apex } => {
-                let c = match apex {
-                    Corner::Existing(id) => {
-                        if id == a || id == b || self.has_triangle([a, b, id]) {
-                            return false;
-                        }
-                        id
-                    }
-                    Corner::New(point) => {
-                        if is_degenerate([self.vertices[a], self.vertices[b], point]) {
-                            return false;
-                        }
-                        self.vertices.push(point);
-                        self.vertices.len() - 1
-                    }
-                };
-
-                if is_degenerate([a, b, c].map(|id| self.vertices[id])) {
+                if apex == Corner::Existing(a) || apex == Corner::Existing(b) {
                     return false;
                 }
-
-                self.push_triangle([a, b, c]);
+                return self.fill([Corner::Existing(a), Corner::Existing(b), apex]);
             }
             Edit::SplitTriangle { triangle, at } => {
                 let [a, b, c] = self.triangles[triangle];
@@ -210,6 +209,32 @@ impl Document {
                     self.push_triangle(t);
                 }
             }
+            Edit::SplitEdge { a, b, at } => {
+                let (pa, pb) = (self.vertices[a], self.vertices[b]);
+                if at.distance(pa) < 1e-3 || at.distance(pb) < 1e-3 {
+                    return false;
+                }
+
+                self.vertices.push(at);
+                let d = self.vertices.len() - 1;
+
+                let mut split = Vec::new();
+                self.triangles.retain(|t| {
+                    let on_edge = t.contains(&a) && t.contains(&b);
+                    if on_edge {
+                        let x = t.iter().copied().find(|&v| v != a && v != b).unwrap();
+                        split.extend([[a, d, x], [d, b, x]]);
+                    }
+                    !on_edge
+                });
+
+                if split.is_empty() {
+                    return false;
+                }
+                for t in split {
+                    self.push_triangle(t);
+                }
+            }
             Edit::CollapseOntoEdge { id, a, b, at } => {
                 if !self.has_triangle([id, a, b]) {
                     return false;
@@ -217,7 +242,7 @@ impl Document {
 
                 self.vertices[id] = at;
 
-                self.tidy_after_moving(id);
+                return self.tidy_after_moving(id);
             }
             Edit::MergeVertex { id, into } => {
                 if id == into || !self.neighbours(id).any(|v| v == into) {
@@ -242,7 +267,7 @@ impl Document {
                     keep
                 });
 
-                self.tidy_after_moving(into);
+                return self.tidy_after_moving(into);
             }
             Edit::MoveVertex { id, to } => return self.move_vertex(id, to),
         }
@@ -350,19 +375,30 @@ impl Document {
     /// After vertex `id` moved onto an edge or another vertex: removes the
     /// triangles around it that are now flat, then makes the mesh conforming
     /// again (see [`Self::split_t_junctions`]).
-    fn tidy_after_moving(&mut self, id: VertexId) {
+    fn tidy_after_moving(&mut self, id: VertexId) -> bool {
         let vertices = &self.vertices;
         self.triangles
             .retain(|t| !(t.contains(&id) && is_flat(t.map(|v| vertices[v]))));
 
-        self.split_t_junctions();
+        self.split_t_junctions()
     }
 
     /// Splits every triangle that has a vertex lying in the middle of one of
     /// its edges (a "T-junction") into two, towards its opposite corner, so
     /// that vertex becomes a proper corner on both sides of the edge.
-    fn split_t_junctions(&mut self) {
-        loop {
+    ///
+    /// (Nearly) flat triangles are removed first: they cover nothing, and in
+    /// one a vertex can lie on two edges at once, which would split forever.
+    /// The edges such a triangle joined are then repaired like any other.
+    ///
+    /// Returns `false` if that doesn't settle.
+    fn split_t_junctions(&mut self) -> bool {
+        let limit = 4 * (self.triangles.len() + self.vertices.len());
+
+        for _ in 0..limit {
+            let vertices = &self.vertices;
+            self.triangles.retain(|t| !is_flat(t.map(|v| vertices[v])));
+
             let mut used: Vec<VertexId> = self.used_vertices().collect();
             used.sort_unstable();
             used.dedup();
@@ -382,13 +418,15 @@ impl Document {
             });
 
             let Some((i, first, second)) = junction else {
-                break;
+                return true;
             };
 
             self.triangles.remove(i);
             self.push_triangle(first);
             self.push_triangle(second);
         }
+
+        false
     }
 
     /// Adds a new triangle, wound positively.
@@ -424,22 +462,34 @@ fn opposite(t: [VertexId; 3], id: VertexId) -> Option<(VertexId, VertexId)> {
     Some((t[(i + 1) % 3], t[(i + 2) % 3]))
 }
 
-/// Relative tolerance for treating points as lying on a line.
-const FLAT: f32 = 1e-3;
+/// How far (world units) a point may be off a line of the given length and
+/// still count as on it. Just enough to absorb rounding (e.g. of a point
+/// snapped onto an edge); anything further off is a real distance, and
+/// treating it as zero lets near-collinear points split each other forever.
+fn tolerance(length: f32) -> f32 {
+    1e-3 + 1e-5 * length
+}
 
-/// Whether a triangle is flat, relative to its size.
-fn is_flat(t: [Point; 3]) -> bool {
+/// Whether a triangle is flat: a corner lies on the line through the other two.
+pub(super) fn is_flat(t: [Point; 3]) -> bool {
     let [a, b, c] = t;
     let longest = a.distance(b).max(b.distance(c)).max(c.distance(a));
-    min_height(t) <= FLAT * longest
+    min_height(t) <= tolerance(longest)
 }
 
 /// Whether `p` lies on segment `a`–`b`, away from its ends.
 fn is_inside_segment(p: Point, a: Point, b: Point) -> bool {
-    let tolerance = FLAT * a.distance(b);
-    closest_on_segment(p, a, b).1 <= tolerance
-        && p.distance(a) > tolerance
-        && p.distance(b) > tolerance
+    let length = a.distance(b);
+    let tolerance = tolerance(length);
+    if length == 0.0 {
+        return false;
+    }
+
+    // How far along a → b the point is, and how far off the line.
+    let along = ((p - a).x * (b - a).x + (p - a).y * (b - a).y) / length;
+    let off = area2(a, b, p).abs() / length;
+
+    off <= tolerance && along > tolerance && along < length - tolerance
 }
 
 fn is_degenerate([a, b, c]: [Point; 3]) -> bool {
@@ -512,6 +562,34 @@ mod tests {
         ids.iter_mut().for_each(|t| t.sort_unstable());
         ids.sort_unstable();
         ids
+    }
+
+    #[test]
+    fn cutting_an_edge_splits_both_sides() {
+        let mut doc = doc_with_triangle();
+        doc.apply(Edit::ExtendEdge {
+            a: 0,
+            b: 1,
+            apex: Corner::New(Point::new(5.0, -10.0)),
+        });
+
+        assert!(doc.apply(Edit::SplitEdge {
+            a: 0,
+            b: 1,
+            at: Point::new(3.0, 0.0),
+        }));
+        assert_eq!(
+            sorted(&doc),
+            vec![[0, 2, 4], [0, 3, 4], [1, 2, 4], [1, 3, 4]]
+        );
+        assert_eq!(area_and_t_junctions(&doc), (100.0, false));
+
+        // Right on a corner there's nothing to cut.
+        assert!(!doc.apply(Edit::SplitEdge {
+            a: 0,
+            b: 4,
+            at: Point::new(0.0, 0.0),
+        }));
     }
 
     #[test]
@@ -680,30 +758,43 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_is_rejected() {
+    fn extending_into_geometry_fills_only_the_gap() {
         let mut doc = doc_with_triangle();
 
-        // Extending edge 0–1 towards the side the triangle is already on.
-        assert!(!doc.apply(Edit::ExtendEdge {
+        // Extending edge 0–1 towards the side the triangle is already on:
+        // only the dart-shaped gap around its top corner 2 gets filled.
+        assert!(doc.apply(Edit::ExtendEdge {
             a: 0,
             b: 1,
             apex: Corner::New(Point::new(5.0, 20.0)),
         }));
+        assert_eq!(sorted(&doc), vec![[0, 1, 2], [0, 2, 3], [1, 2, 3]]);
+        assert_eq!(area_and_t_junctions(&doc), (100.0, false));
+    }
 
-        // A separate triangle on top of the existing one.
-        assert!(!doc.apply(Edit::AddTriangle([
+    #[test]
+    fn adding_on_top_of_geometry_fills_only_the_gap() {
+        let mut doc = doc_with_triangle();
+
+        // A triangle poking out of the top of the existing one: the part
+        // outside it is added, and the existing edges it crosses are split.
+        assert!(doc.apply(Edit::AddTriangle([
             Point::new(2.0, 2.0),
             Point::new(8.0, 2.0),
             Point::new(5.0, 20.0),
         ])));
+        let (area, t_junctions) = area_and_t_junctions(&doc);
+        assert!(!t_junctions);
+        // The sides cross at y = 5. Above that the new triangle adds 37.5,
+        // less the 12.5 of the existing top corner poking into it.
+        assert!((area - (50.0 + 37.5 - 12.5)).abs() < 1e-3, "{area}");
 
-        // Touching along an edge is fine.
-        assert!(doc.apply(Edit::ExtendEdge {
-            a: 0,
-            b: 1,
-            apex: Corner::New(Point::new(5.0, -10.0)),
-        }));
-        assert_eq!(doc.triangle_ids().len(), 2);
+        // Entirely inside existing geometry: nothing to add.
+        assert!(!doc.apply(Edit::AddTriangle([
+            Point::new(4.0, 1.0),
+            Point::new(6.0, 1.0),
+            Point::new(5.0, 3.0),
+        ])));
     }
 
     /// Whether a vertex sits in the middle of another triangle's edge.
@@ -801,6 +892,7 @@ mod tests {
 #[cfg(test)]
 mod fuzz {
     use super::*;
+    use crate::geometry::closest_on_segment;
 
     #[test]
     fn random_moves() {
@@ -868,5 +960,62 @@ mod fuzz {
             }
         }
         println!("ok {ok}, rejected {rejected}");
+    }
+
+    #[test]
+    fn random_fills() {
+        let mut seed = 777u64;
+        let mut rand = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32) / (1u64 << 31) as f32
+        };
+
+        let (mut ok, mut empty, mut rejected) = (0, 0, 0);
+        for _ in 0..30 {
+            let mut doc = Document::default();
+            doc.apply(Edit::AddTriangle([
+                Point::new(200.0, 300.0),
+                Point::new(300.0, 300.0),
+                Point::new(250.0, 200.0),
+            ]));
+
+            for _ in 0..15 {
+                let r: Vec<f32> = (0..8).map(|_| rand()).collect();
+                let point = |i: usize| Point::new(r[i] * 500.0, r[i + 1] * 500.0);
+                let edit = if r[0] < 0.5 {
+                    let edges: Vec<_> = doc.edges().collect();
+                    let (a, b) = edges[(r[1] * edges.len() as f32) as usize % edges.len()];
+                    Edit::ExtendEdge {
+                        a,
+                        b,
+                        apex: Corner::New(point(2)),
+                    }
+                } else {
+                    Edit::AddTriangle([point(2), point(4), point(6)])
+                };
+
+                let started = std::time::Instant::now();
+                let mut unchecked = doc.clone();
+                if !unchecked.apply_unchecked(edit) {
+                    empty += 1;
+                } else if doc.apply(edit) {
+                    ok += 1;
+                    assert!(!super::tests::has_t_junction(&doc), "{edit:?}");
+                } else {
+                    rejected += 1;
+                }
+                if std::env::var("FILL_TRACE").is_ok() {
+                    println!(
+                        "{} tris, {} vertices, {:?}",
+                        doc.triangle_ids().len(),
+                        doc.vertices.len(),
+                        started.elapsed()
+                    );
+                }
+            }
+        }
+        println!("fills: ok {ok}, nothing to add {empty}, rejected {rejected}");
     }
 }

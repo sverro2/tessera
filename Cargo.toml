@@ -6,3 +6,11 @@ edition = "2024"
 [dependencies]
 iced = { git = "https://github.com/iced-rs/iced", branch = "master", features = ["canvas", "tokio"] }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+
+# Geometry and rendering are far too slow unoptimised; keep our own code
+# quick to build but optimise it a little, and dependencies fully.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
