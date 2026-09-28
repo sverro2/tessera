@@ -10,7 +10,7 @@
 
 use iced::Point;
 
-use crate::geometry::{area2, contains, overlap};
+use crate::geometry::{area2, overlap};
 
 /// Index of a vertex in [`Document::vertices`].
 pub type VertexId = usize;
@@ -262,13 +262,6 @@ impl Document {
         true
     }
 
-    /// The topmost (most recently added) triangle containing `point`.
-    pub fn triangle_at(&self, point: Point) -> Option<TriangleId> {
-        self.triangle_ids()
-            .iter()
-            .rposition(|t| contains(t.map(|id| self.vertices[id]), point))
-    }
-
     /// Adds a new triangle, wound positively.
     fn push_triangle(&mut self, [a, b, c]: [VertexId; 3]) {
         let [pa, pb, pc] = [a, b, c].map(|id| self.vertices[id]);
@@ -285,7 +278,7 @@ impl Document {
     }
 
     /// Finds a triangle with these corners, in any order.
-    fn find_triangle(&self, mut ids: [VertexId; 3]) -> Option<TriangleId> {
+    pub fn find_triangle(&self, mut ids: [VertexId; 3]) -> Option<TriangleId> {
         ids.sort_unstable();
 
         self.triangles.iter().position(|t| {
@@ -336,10 +329,8 @@ mod tests {
     fn splitting_replaces_parent() {
         let mut doc = doc_with_triangle();
         let at = Point::new(5.0, 3.0);
-        assert_eq!(doc.triangle_at(at), Some(0));
         assert!(doc.apply(Edit::SplitTriangle { triangle: 0, at }));
         assert_eq!(doc.triangle_ids(), &[[0, 1, 3], [1, 2, 3], [2, 0, 3]]);
-        assert_eq!(doc.triangle_at(Point::new(50.0, 50.0)), None);
     }
 
     #[test]

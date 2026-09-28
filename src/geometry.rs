@@ -7,14 +7,6 @@ pub fn area2(a: Point, b: Point, c: Point) -> f32 {
     (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)
 }
 
-/// Whether `p` lies inside (or on the boundary of) a triangle.
-pub fn contains([a, b, c]: [Point; 3], p: Point) -> bool {
-    let (d1, d2, d3) = (area2(a, b, p), area2(b, c, p), area2(c, a, p));
-    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-    !(has_neg && has_pos)
-}
-
 /// Whether two positively wound triangles overlap by more than a hair.
 /// Sharing corners or edges doesn't count.
 pub fn overlap(t: [Point; 3], u: [Point; 3]) -> bool {

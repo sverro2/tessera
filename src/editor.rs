@@ -15,8 +15,8 @@ use iced::widget::canvas::{
 use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Theme, Vector};
 
 use crate::camera::Camera;
-use crate::document::{Corner, Document, Edit, VertexId};
-use crate::geometry::{closest_on_segment, min_height};
+use crate::document::{Corner, Document, Edit, TriangleId, VertexId};
+use crate::geometry::{area2, closest_on_segment, min_height, overlap};
 
 /// Screen-space distance within which a corner is grabbed.
 const VERTEX_HIT: f32 = 10.0;
@@ -28,8 +28,9 @@ const MIN_THICKNESS: f32 = 5.0;
 /// A triangle whose height is below this fraction of its longest side is
 /// considered flat.
 const FLAT_RATIO: f32 = 0.02;
-/// How far (screen px) inside a limiting edge a dragged vertex stops.
-const SLIDE_INSET: f32 = 1.0;
+/// How far (screen px) inside a limiting edge a dragged vertex stops: just
+/// clear of making its triangle with that edge a sliver.
+const SLIDE_INSET: f32 = MIN_THICKNESS + 0.5;
 /// World-space spacing of the background dot grid.
 const GRID: f32 = 50.0;
 
@@ -167,7 +168,9 @@ impl canvas::Program<Message> for Editor<'_> {
                     }
                     Interaction::Creating { to, .. } => *to = world,
                     Interaction::MovingVertex { id, to } => *to = self.limit_move(*id, *to, world),
-                    Interaction::Extending { apex, .. } => *apex = world,
+                    Interaction::Extending { a, b, apex } => {
+                        *apex = self.limit_extend(*a, *b, *apex, world);
+                    }
                 }
 
                 Some(canvas::Action::request_redraw().and_capture())
@@ -353,35 +356,55 @@ impl Editor<'_> {
         let mut result = self.document.clone();
         let applied = result.apply(edit);
 
-        // Slivers would be invisible and impossible to grab.
-        let has_sliver = new_triangles(self.document, &result)
-            .map(|t| t.map(|v| result.vertex(v)))
-            .any(|t| min_height(t.map(|p| self.camera.to_screen(p))) < MIN_THICKNESS);
+        // Slivers would be invisible and impossible to grab. Triangles that
+        // were already that thin (e.g. when zoomed far out) may stay so, as
+        // long as they don't get any thinner.
+        let height = |document: &Document, t: [VertexId; 3]| {
+            min_height(t.map(|v| self.camera.to_screen(document.vertex(v))))
+        };
+        let has_sliver = result.triangle_ids().iter().any(|&t| {
+            let after = height(&result, t);
+            after < MIN_THICKNESS
+                && match self.document.find_triangle(t) {
+                    Some(_) => after < height(self.document, t) - 1e-3,
+                    None => true,
+                }
+        });
 
         (applied && !has_sliver).then_some((edit, result))
     }
 
-    /// Dragging from edge `a`–`b` to `apex`: attach to a nearby vertex, split
-    /// the triangle under the cursor, or add a triangle with a new corner.
+    /// Dragging from edge `a`–`b` to `apex`. On a side of the edge that has a
+    /// triangle, split that triangle; on an empty side, add a triangle whose
+    /// third corner is a nearby vertex or a new one.
     fn extend_edit(&self, a: VertexId, b: VertexId, apex: Point) -> Edit {
+        if let Some(triangle) = self.triangle_beside(a, b, apex) {
+            return Edit::SplitTriangle { triangle, at: apex };
+        }
+
         let snapped = self.nearest_vertex(
             self.camera.to_screen(apex),
             self.document.used_vertices().filter(|&v| v != a && v != b),
         );
 
-        match (snapped, self.document.triangle_at(apex)) {
-            (Some(id), _) => Edit::ExtendEdge {
-                a,
-                b,
-                apex: Corner::Existing(id),
-            },
-            (None, Some(triangle)) => Edit::SplitTriangle { triangle, at: apex },
-            (None, None) => Edit::ExtendEdge {
-                a,
-                b,
-                apex: Corner::New(apex),
-            },
+        Edit::ExtendEdge {
+            a,
+            b,
+            apex: snapped.map_or(Corner::New(apex), Corner::Existing),
         }
+    }
+
+    /// The triangle on edge `a`–`b` lying on the same side as `point`.
+    fn triangle_beside(&self, a: VertexId, b: VertexId, point: Point) -> Option<TriangleId> {
+        let (pa, pb) = (self.document.vertex(a), self.document.vertex(b));
+        let side = area2(pa, pb, point);
+
+        self.document.triangle_ids().iter().position(|t| {
+            let third = t.iter().find(|&&v| v != a && v != b);
+            t.contains(&a)
+                && t.contains(&b)
+                && third.is_some_and(|&v| area2(pa, pb, self.document.vertex(v)) * side > 0.0)
+        })
     }
 
     /// Dragging vertex `id` to `to`: weld onto a neighbouring vertex, snap onto
@@ -415,23 +438,12 @@ impl Editor<'_> {
     /// the closest allowed point, so the vertex slides along the edges that
     /// keep it from folding over its neighbours.
     fn limit_move(&self, id: VertexId, from: Point, to: Point) -> Point {
-        let valid = |p| {
-            self.pending(Interaction::MovingVertex { id, to: p })
-                .is_some()
-        };
-
-        if valid(to) {
-            return to;
-        }
-
         let camera = self.camera;
-        let cursor = camera.to_screen(to);
         let origin = camera.to_screen(self.document.vertex(id));
 
         // The vertex must stay on its own side of the opposite edge of each
-        // of its triangles. Those edges' lines, nudged inwards (screen space)
-        // as (point, unit direction):
-        let lines: Vec<(Point, Vector)> = self
+        // of its triangles.
+        let lines: Vec<Line> = self
             .document
             .triangle_ids()
             .iter()
@@ -439,17 +451,102 @@ impl Editor<'_> {
                 let i = t.iter().position(|&v| v == id)?;
                 let a = camera.to_screen(self.document.vertex(t[(i + 1) % 3]));
                 let b = camera.to_screen(self.document.vertex(t[(i + 2) % 3]));
-                let dir = (b - a) * (1.0 / a.distance(b));
-                let mut normal = Vector::new(-dir.y, dir.x);
-                if dot(normal, origin - a) < 0.0 {
-                    normal *= -1.0;
-                }
-                Some((a + normal * SLIDE_INSET, dir))
+                Some(offset_line(a, b, origin, SLIDE_INSET))
             })
             .collect();
 
-        // Candidates: the cursor projected onto each line (sliding along an
-        // edge) and the lines' crossings (stuck in a corner).
+        self.closest_valid(&lines, from, to, |p| {
+            self.pending(Interaction::MovingVertex { id, to: p })
+                .is_some()
+        })
+    }
+
+    /// Where the new corner of an extension from edge `a`–`b` should be when
+    /// the cursor is at `to`, given that `from` was valid. It stays on the
+    /// cursor's side of the edge and slides along whatever limits it there:
+    /// the edges of the triangle it splits, or the geometry a new triangle
+    /// would overlap.
+    fn limit_extend(&self, a: VertexId, b: VertexId, from: Point, to: Point) -> Point {
+        let camera = self.camera;
+        let (pa, pb) = (
+            camera.to_screen(self.document.vertex(a)),
+            camera.to_screen(self.document.vertex(b)),
+        );
+        let cursor = camera.to_screen(to);
+
+        // On the source edge the drag reads as cancelled, so don't hold the
+        // corner back there.
+        if closest_on_segment(cursor, pa, pb).1 <= EDGE_HIT {
+            return to;
+        }
+
+        let lines: Vec<Line> = match self.triangle_beside(a, b, to) {
+            // Splitting: stay inside that triangle.
+            Some(triangle) => {
+                let [u, v, w] = self.document.triangle_ids()[triangle]
+                    .map(|v| camera.to_screen(self.document.vertex(v)));
+                vec![
+                    offset_line(u, v, w, SLIDE_INSET),
+                    offset_line(v, w, u, SLIDE_INSET),
+                    offset_line(w, u, v, SLIDE_INSET),
+                ]
+            }
+            // New triangle: stay clear of the source edge and of the edges of
+            // (and the lines from `a` and `b` past) anything it would overlap.
+            None => {
+                let (wa, wb) = (self.document.vertex(a), self.document.vertex(b));
+                let wanted = if area2(wa, wb, to) > 0.0 {
+                    [wa, wb, to]
+                } else {
+                    [wb, wa, to]
+                };
+
+                let mut lines = vec![offset_line(pa, pb, cursor, SLIDE_INSET)];
+                for [u, v, w] in self.document.triangles() {
+                    if !overlap(wanted, [u, v, w]) {
+                        continue;
+                    }
+                    let [u, v, w] = [u, v, w].map(|p| camera.to_screen(p));
+                    lines.extend([
+                        offset_line(u, v, w, -SLIDE_INSET),
+                        offset_line(v, w, u, -SLIDE_INSET),
+                        offset_line(w, u, v, -SLIDE_INSET),
+                    ]);
+                    for corner in [u, v, w] {
+                        for end in [pa, pb] {
+                            if end.distance(corner) > 0.0 {
+                                lines.push((end, (corner - end) * (1.0 / end.distance(corner))));
+                            }
+                        }
+                    }
+                }
+                lines
+            }
+        };
+
+        self.closest_valid(&lines, from, to, |p| {
+            self.pending(Interaction::Extending { a, b, apex: p })
+                .is_some()
+        })
+    }
+
+    /// The valid position closest to the cursor at `to` (world): the cursor
+    /// itself, its projection onto one of `lines` (sliding along a limit) or
+    /// where two of them cross (stuck in a corner). Falls back to `from`.
+    fn closest_valid(
+        &self,
+        lines: &[Line],
+        from: Point,
+        to: Point,
+        valid: impl Fn(Point) -> bool,
+    ) -> Point {
+        if valid(to) {
+            return to;
+        }
+
+        let camera = self.camera;
+        let cursor = camera.to_screen(to);
+
         let projections = lines.iter().map(|&(p, d)| p + d * dot(cursor - p, d));
         let corners = lines.iter().enumerate().flat_map(|(i, &(p1, d1))| {
             lines[i + 1..].iter().filter_map(move |&(p2, d2)| {
@@ -458,12 +555,17 @@ impl Editor<'_> {
             })
         });
 
-        projections
+        let mut candidates: Vec<_> = projections
             .chain(corners)
             .map(|p| (camera.to_world(p), p.distance(cursor)))
-            .filter(|&(p, _)| valid(p))
-            .min_by(|x, y| x.1.total_cmp(&y.1))
-            .map_or(from, |(p, _)| p)
+            .collect();
+        candidates.sort_by(|x, y| x.1.total_cmp(&y.1));
+
+        candidates
+            .into_iter()
+            .map(|(p, _)| p)
+            .find(|&p| valid(p))
+            .unwrap_or(from)
     }
 
     /// The candidate vertex closest to a screen position, within grab range.
@@ -552,6 +654,20 @@ impl Editor<'_> {
             }
         })
     }
+}
+
+/// A line in screen space: a point on it and its unit direction.
+type Line = (Point, Vector);
+
+/// The line through `a` and `b`, shifted `offset` px towards `towards`
+/// (away from it if negative).
+fn offset_line(a: Point, b: Point, towards: Point, offset: f32) -> Line {
+    let dir = (b - a) * (1.0 / a.distance(b));
+    let mut normal = Vector::new(-dir.y, dir.x);
+    if dot(normal, towards - a) < 0.0 {
+        normal *= -1.0;
+    }
+    (a + normal * offset, dir)
 }
 
 fn longest_edge([a, b, c]: [Point; 3]) -> (Point, Point) {
@@ -828,6 +944,127 @@ mod tests {
             panic!("expected a collapse onto 0–1, got {edit:?}");
         };
         assert!((at.x - 260.0).abs() < 1.0, "{at:?}");
+        assert!(doc.clone().apply(edit));
+    }
+
+    #[test]
+    fn limited_moves_never_leave_flat_triangles() {
+        // A fan around vertex 0 whose outline has a dent at (30, 30), so the
+        // area vertex 0 may move in is bounded by some edges' extensions.
+        let mut doc = Document::default();
+        let ring = [
+            Point::new(100.0, 0.0),
+            Point::new(30.0, 30.0),
+            Point::new(0.0, 100.0),
+            Point::new(-100.0, 0.0),
+            Point::new(0.0, -100.0),
+        ]
+        .map(|p| p + Vector::new(400.0, 300.0));
+        let centre = Point::new(390.0, 290.0);
+
+        // Vertex 0 is the centre, 1..=5 the ring.
+        assert!(doc.apply(Edit::AddTriangle([centre, ring[0], ring[1]])));
+        for (b, apex) in [
+            (2, Corner::New(ring[2])),
+            (3, Corner::New(ring[3])),
+            (4, Corner::New(ring[4])),
+            (5, Corner::Existing(1)),
+        ] {
+            assert!(doc.apply(Edit::ExtendEdge { a: 0, b, apex }));
+        }
+        assert_eq!(doc.triangle_ids().len(), 5);
+
+        let cache = canvas::Cache::new();
+        let editor = Editor {
+            document: &doc,
+            camera: Camera::default(),
+            cache: &cache,
+        };
+
+        for x in (0..16).map(|i| i as f32 * 50.0) {
+            for y in (0..12).map(|i| i as f32 * 50.0) {
+                let to = editor.limit_move(0, centre, Point::new(x, y));
+                let (edit, result) = editor
+                    .pending(Interaction::MovingVertex { id: 0, to })
+                    .expect("limited position is valid");
+
+                if let Edit::MoveVertex { .. } = edit {
+                    for t in result.triangle_ids().iter().filter(|t| t.contains(&0)) {
+                        let h = min_height(t.map(|v| result.vertex(v)));
+                        assert!(
+                            h >= MIN_THICKNESS,
+                            "cursor ({x}, {y}): {edit:?} leaves height {h}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_triangle_is_held_back_by_other_triangles() {
+        let mut doc = Document::default();
+        doc.apply(Edit::AddTriangle([
+            Point::new(100.0, 300.0),
+            Point::new(300.0, 300.0),
+            Point::new(200.0, 100.0),
+        ]));
+        // A separate triangle to the right.
+        doc.apply(Edit::AddTriangle([
+            Point::new(400.0, 300.0),
+            Point::new(500.0, 300.0),
+            Point::new(450.0, 200.0),
+        ]));
+        let cache = canvas::Cache::new();
+        let editor = Editor {
+            document: &doc,
+            camera: Camera::default(),
+            cache: &cache,
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+        let mut state = State::default();
+
+        let moved = mouse::Event::CursorMoved {
+            position: Point::ORIGIN,
+        };
+        let mut published = vec![];
+        for (e, x, y) in [
+            // From the right side of the first triangle out, then into the
+            // other triangle: must not turn into splitting it.
+            (
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                250.0,
+                200.0,
+            ),
+            (moved, 320.0, 220.0),
+            (moved, 380.0, 260.0),
+            (moved, 460.0, 270.0),
+            (
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+                460.0,
+                270.0,
+            ),
+        ] {
+            let cursor = mouse::Cursor::Available(Point::new(x, y));
+            if let Some(action) = editor.update(&mut state, &Event::Mouse(e), bounds, cursor) {
+                published.extend(action.into_inner().0);
+            }
+        }
+
+        let [Message::Edit(edit)] = published[..] else {
+            panic!("expected one edit, got {published:?}");
+        };
+        assert!(
+            matches!(
+                edit,
+                Edit::ExtendEdge {
+                    a: 1 | 2,
+                    b: 1 | 2,
+                    ..
+                }
+            ),
+            "{edit:?}"
+        );
         assert!(doc.clone().apply(edit));
     }
 }
