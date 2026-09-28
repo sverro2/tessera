@@ -59,7 +59,9 @@ pub enum Edit {
     /// this are removed, and the mesh is kept conforming as for
     /// [`Edit::CollapseOntoEdge`].
     MergeVertex { id: VertexId, into: VertexId },
-    /// Move a vertex (and thereby every triangle using it).
+    /// Move a vertex (and thereby every triangle using it). Where the move
+    /// would fold a triangle over, the mesh is rearranged around the vertex
+    /// instead; see [`Document::move_vertex`].
     MoveVertex { id: VertexId, to: Point },
 }
 
@@ -242,12 +244,107 @@ impl Document {
 
                 self.tidy_after_moving(into);
             }
-            Edit::MoveVertex { id, to } => {
-                self.vertices[id] = to;
-            }
+            Edit::MoveVertex { id, to } => return self.move_vertex(id, to),
         }
 
         true
+    }
+
+    /// Moves vertex `id` in a straight line to `to`, rearranging its
+    /// triangles whenever one of them would fold over, i.e. when the vertex
+    /// crosses the line through the opposite edge `u`–`w` of that triangle:
+    ///
+    /// - Through the edge itself, with a triangle on the other side: the edge
+    ///   is flipped, so the vertex connects to that triangle's far corner.
+    /// - Through the edge, into empty space: the triangle is dropped and the
+    ///   vertex's other triangles stretch along with it. If it is the only
+    ///   triangle holding the vertex, it turns over to the other side instead.
+    /// - Past the end of the edge (say `u` ends up between the vertex and
+    ///   `w`): the edge from the vertex to `w` runs through `u`, so it is
+    ///   flipped the same way, or the (flat) triangle is dropped.
+    ///
+    /// Returns `false` if the rearranging doesn't settle.
+    fn move_vertex(&mut self, id: VertexId, to: Point) -> bool {
+        const MAX_EVENTS: usize = 64;
+
+        let mut from = self.vertices[id];
+
+        for _ in 0..MAX_EVENTS {
+            // The first triangle around `id` the move would flatten, as the
+            // fraction of the remaining way at which that happens.
+            let event = self
+                .triangles
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| {
+                    let (u, w) = opposite(*t, id)?;
+                    let (pu, pw) = (self.vertices[u], self.vertices[w]);
+                    let (now, then) = (area2(pu, pw, from), area2(pu, pw, to));
+                    (then <= 0.0).then(|| (i, (now / (now - then)).clamp(0.0, 1.0)))
+                })
+                .min_by(|x, y| x.1.total_cmp(&y.1));
+
+            let Some((i, fraction)) = event else {
+                self.vertices[id] = to;
+                return true;
+            };
+
+            from = from + (to - from) * fraction;
+            self.vertices[id] = from;
+            self.unfold(i, id);
+        }
+
+        false
+    }
+
+    /// Resolves triangle `i`, flattened because vertex `id` lies on the line
+    /// through its opposite edge. See [`Self::move_vertex`].
+    fn unfold(&mut self, i: TriangleId, id: VertexId) {
+        let t = self.triangles[i];
+        let (u, w) = opposite(t, id).expect("triangle contains the vertex");
+        let (pu, pw, pv) = (self.vertices[u], self.vertices[w], self.vertices[id]);
+
+        // Where the vertex is along u → w.
+        let along = (pv - pu).x * (pw - pu).x + (pv - pu).y * (pw - pu).y;
+        let along = along / (pw - pu).x.hypot((pw - pu).y).powi(2);
+
+        // The edge running through the flattened triangle, and the corner
+        // lying in the middle of it.
+        let ((p, q), middle) = if along <= 0.0 {
+            ((id, w), u)
+        } else if along >= 1.0 {
+            ((id, u), w)
+        } else {
+            ((u, w), id)
+        };
+
+        let across = self.triangles.iter().enumerate().find_map(|(j, other)| {
+            (j != i && other.contains(&p) && other.contains(&q))
+                .then(|| other.iter().copied().find(|&v| v != p && v != q))
+                .flatten()
+                .map(|x| (j, x))
+        });
+
+        let alone = !self.triangles.iter().enumerate().any(|(j, other)| {
+            j != i && other.contains(&id) && (other.contains(&u) || other.contains(&w))
+        });
+
+        match across {
+            // Flip: the two triangles on edge p–q become two triangles on
+            // the edge from `middle` to the far corner `x`.
+            Some((j, x)) => {
+                self.triangles.remove(i.max(j));
+                self.triangles.remove(i.min(j));
+                self.push_triangle([p, middle, x]);
+                self.push_triangle([middle, q, x]);
+            }
+            // Only this triangle holds the vertex: let it turn over. It is
+            // flat right now, so its winding is set for the far side.
+            None if alone => self.triangles[i] = [t[0], t[2], t[1]],
+            None => {
+                self.triangles.remove(i);
+            }
+        }
     }
 
     /// After vertex `id` moved onto an edge or another vertex: removes the
@@ -319,6 +416,12 @@ impl Document {
             t == ids
         })
     }
+}
+
+/// The corners of `t` other than `id`, in winding order after it.
+fn opposite(t: [VertexId; 3], id: VertexId) -> Option<(VertexId, VertexId)> {
+    let i = t.iter().position(|&v| v == id)?;
+    Some((t[(i + 1) % 3], t[(i + 2) % 3]))
 }
 
 /// Relative tolerance for treating points as lying on a line.
@@ -497,8 +600,38 @@ mod tests {
         }
     }
 
+    fn area(doc: &Document) -> f32 {
+        doc.triangles().map(|[a, b, c]| area2(a, b, c) / 2.0).sum()
+    }
+
     #[test]
-    fn folding_over_is_rejected() {
+    fn moving_across_an_inner_edge_flips_it() {
+        let mut doc = doc_with_triangle();
+        doc.apply(Edit::ExtendEdge {
+            a: 0,
+            b: 1,
+            apex: Corner::New(Point::new(5.0, -10.0)),
+        });
+        doc.apply(Edit::SplitTriangle {
+            triangle: 0,
+            at: Point::new(5.0, 3.0),
+        });
+
+        // Pull the top centre 4 across the shared edge 0–1 into the bottom
+        // triangle: that edge flips to 4–3; the outline stays the same.
+        assert!(doc.apply(Edit::MoveVertex {
+            id: 4,
+            to: Point::new(5.0, -3.0),
+        }));
+        assert_eq!(
+            sorted(&doc),
+            vec![[0, 2, 4], [0, 3, 4], [1, 2, 4], [1, 3, 4]]
+        );
+        assert_eq!(area_and_t_junctions(&doc), (100.0, false));
+    }
+
+    #[test]
+    fn moving_an_outline_corner_across_an_edge_dents_the_outline() {
         let mut doc = doc_with_triangle();
         doc.apply(Edit::ExtendEdge {
             a: 0,
@@ -506,14 +639,44 @@ mod tests {
             apex: Corner::New(Point::new(5.0, -10.0)),
         });
 
-        // Pulling the top corner across the shared edge folds its triangle.
-        let before = sorted(&doc);
-        assert!(!doc.apply(Edit::MoveVertex {
+        // The top corner 2 pulled down into the bottom triangle: the peak
+        // becomes a notch, with the shared edge flipped to 2–3.
+        assert!(doc.apply(Edit::MoveVertex {
             id: 2,
             to: Point::new(5.0, -5.0),
         }));
-        assert_eq!(sorted(&doc), before);
-        assert_eq!(doc.vertex(2), Point::new(5.0, 10.0));
+        assert_eq!(sorted(&doc), vec![[0, 2, 3], [1, 2, 3]]);
+        assert_eq!(area(&doc), 25.0);
+    }
+
+    #[test]
+    fn moving_out_through_the_outline_drops_the_crossed_triangle() {
+        let mut doc = doc_with_triangle();
+        doc.apply(Edit::SplitTriangle {
+            triangle: 0,
+            at: Point::new(5.0, 3.0),
+        });
+
+        // The centre 3 leaves through the bottom edge 0–1: the triangle on
+        // that edge goes, the other two stretch down with the vertex.
+        assert!(doc.apply(Edit::MoveVertex {
+            id: 3,
+            to: Point::new(5.0, -4.0),
+        }));
+        assert_eq!(sorted(&doc), vec![[0, 2, 3], [1, 2, 3]]);
+        assert_eq!(area(&doc), 50.0 + 20.0);
+        assert!(!area_and_t_junctions(&doc).1);
+    }
+
+    #[test]
+    fn a_lone_triangle_turns_over() {
+        let mut doc = doc_with_triangle();
+        assert!(doc.apply(Edit::MoveVertex {
+            id: 2,
+            to: Point::new(5.0, -10.0),
+        }));
+        assert_eq!(doc.triangle_ids().len(), 1);
+        assert_eq!(area(&doc), 50.0);
     }
 
     #[test]
@@ -543,15 +706,24 @@ mod tests {
         assert_eq!(doc.triangle_ids().len(), 2);
     }
 
+    /// Whether a vertex sits in the middle of another triangle's edge.
+    pub(super) fn has_t_junction(doc: &Document) -> bool {
+        let used: Vec<_> = doc.used_vertices().collect();
+        doc.triangle_ids().iter().any(|t| {
+            (0..3).any(|k| {
+                let (u, v) = (t[k], t[(k + 1) % 3]);
+                used.iter().any(|&w| {
+                    !t.contains(&w)
+                        && is_inside_segment(doc.vertex(w), doc.vertex(u), doc.vertex(v))
+                })
+            })
+        })
+    }
+
     /// Total area and whether any vertex sits in the middle of an edge.
     fn area_and_t_junctions(doc: &Document) -> (f32, bool) {
         let area = doc.triangles().map(|[a, b, c]| area2(a, b, c) / 2.0).sum();
-        let used: Vec<_> = doc.used_vertices().collect();
-        let t_junction = doc.edges().any(|(u, v)| {
-            used.iter()
-                .any(|&w| is_inside_segment(doc.vertex(w), doc.vertex(u), doc.vertex(v)))
-        });
-        (area, t_junction)
+        (area, has_t_junction(doc))
     }
 
     #[test]
@@ -623,5 +795,78 @@ mod tests {
             apex: Corner::Existing(2)
         }));
         assert_eq!(doc.triangle_ids().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+
+    #[test]
+    fn random_moves() {
+        let mut seed = 12345u64;
+        let mut rand = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32) / (1u64 << 31) as f32
+        };
+
+        let (mut ok, mut rejected) = (0, 0);
+        for _ in 0..200 {
+            let mut doc = Document::default();
+            doc.apply(Edit::AddTriangle([
+                Point::new(100.0, 300.0),
+                Point::new(300.0, 300.0),
+                Point::new(200.0, 100.0),
+            ]));
+            doc.apply(Edit::ExtendEdge {
+                a: 0,
+                b: 1,
+                apex: Corner::New(Point::new(200.0, 500.0)),
+            });
+            doc.apply(Edit::ExtendEdge {
+                a: 1,
+                b: 2,
+                apex: Corner::New(Point::new(350.0, 150.0)),
+            });
+            doc.apply(Edit::SplitTriangle {
+                triangle: 0,
+                at: Point::new(200.0, 230.0),
+            });
+            doc.apply(Edit::SplitTriangle {
+                triangle: 0,
+                at: Point::new(200.0, 370.0),
+            });
+
+            for _ in 0..20 {
+                let used: Vec<_> = doc.used_vertices().collect();
+                let id = used[(rand() * used.len() as f32) as usize % used.len()];
+                let to = Point::new(rand() * 500.0, rand() * 600.0);
+                let before = doc.clone();
+                if doc.apply(Edit::MoveVertex { id, to }) {
+                    ok += 1;
+                    // Only exact T-junctions (as rearranging would create) count;
+                    // a random target merely touching an edge is fine.
+                    let used: Vec<_> = doc.used_vertices().collect();
+                    let t_junction = doc.triangle_ids().iter().any(|t| {
+                        (0..3).any(|k| {
+                            let (u, v) = (doc.vertex(t[k]), doc.vertex(t[(k + 1) % 3]));
+                            used.iter().any(|&w| {
+                                let p = doc.vertex(w);
+                                !t.contains(&w)
+                                    && closest_on_segment(p, u, v).1 < 1e-4
+                                    && p.distance(u) > 1e-3
+                                    && p.distance(v) > 1e-3
+                            })
+                        })
+                    });
+                    assert!(!t_junction, "{before:?} {id} -> {to:?}");
+                } else {
+                    rejected += 1;
+                }
+            }
+        }
+        println!("ok {ok}, rejected {rejected}");
     }
 }

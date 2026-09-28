@@ -434,9 +434,11 @@ impl Editor<'_> {
     }
 
     /// Where vertex `id` should be when the cursor is at `to`, given that
-    /// `from` was valid: the cursor itself if the move is allowed, otherwise
-    /// the closest allowed point, so the vertex slides along the edges that
-    /// keep it from folding over its neighbours.
+    /// `from` was valid: the cursor itself if the move is allowed (the mesh
+    /// rearranges itself around the vertex where needed), otherwise the
+    /// closest allowed point, sliding along the edges around the vertex.
+    /// That's the last resort, e.g. when a triangle would be swept over an
+    /// unconnected part of the drawing.
     fn limit_move(&self, id: VertexId, from: Point, to: Point) -> Point {
         let camera = self.camera;
         let origin = camera.to_screen(self.document.vertex(id));
@@ -883,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn dragging_a_vertex_across_an_edge_stops_at_it() {
+    fn dragging_a_centre_out_of_the_outline_stretches_the_shape() {
         let mut doc = Document::default();
         doc.apply(Edit::AddTriangle([
             Point::new(100.0, 300.0),
@@ -929,21 +931,18 @@ mod tests {
             }
         }
 
-        // The centre can't pass the bottom edge 0–1; it slides along it to
-        // right above the cursor and snaps onto it, and the result is valid.
+        // The centre follows the cursor out through the bottom edge 0–1: the
+        // triangle on that edge is dropped and the other two stretch along.
         let [Message::Edit(edit)] = published[..] else {
             panic!("expected one edit, got {published:?}");
         };
-        let Edit::CollapseOntoEdge {
-            a: 0 | 1,
-            b: 0 | 1,
-            at,
-            ..
-        } = edit
-        else {
-            panic!("expected a collapse onto 0–1, got {edit:?}");
-        };
-        assert!((at.x - 260.0).abs() < 1.0, "{at:?}");
+        assert_eq!(
+            edit,
+            Edit::MoveVertex {
+                id: 3,
+                to: Point::new(260.0, 400.0),
+            }
+        );
         assert!(doc.clone().apply(edit));
     }
 
