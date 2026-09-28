@@ -1,6 +1,7 @@
 mod camera;
 mod document;
 mod editor;
+mod geometry;
 mod svg;
 
 use std::path::PathBuf;

@@ -2,8 +2,15 @@
 //!
 //! This module knows nothing about rendering or input. All mutations go
 //! through [`Edit`] so they can later be recorded for undo/redo or saving.
+//!
+//! Invariants, checked after every edit (violating edits are rejected):
+//! - every triangle has positive winding; one whose winding flips has been
+//!   folded over its neighbours,
+//! - no two triangles overlap.
 
 use iced::Point;
+
+use crate::geometry::{area2, contains, overlap};
 
 /// Index of a vertex in [`Document::vertices`].
 pub type VertexId = usize;
@@ -106,9 +113,47 @@ impl Document {
         }))
     }
 
-    /// Applies an edit. Returns `false` if the edit was rejected (e.g. it
-    /// would produce a degenerate or duplicate triangle).
+    /// Applies an edit. Returns `false` (leaving the document unchanged) if
+    /// the edit was rejected, e.g. because it would produce a degenerate,
+    /// duplicate, folded-over or overlapping triangle.
     pub fn apply(&mut self, edit: Edit) -> bool {
+        let mut next = self.clone();
+
+        if next.apply_unchecked(edit) && next.is_valid_after(self) {
+            *self = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Checks the invariants, assuming they held in `before`: only triangles
+    /// that are new or have a moved corner need checking for overlaps.
+    fn is_valid_after(&self, before: &Document) -> bool {
+        if !self.triangles().all(|[a, b, c]| area2(a, b, c) > 0.0) {
+            return false;
+        }
+
+        let changed = |t: &[VertexId; 3]| {
+            before.find_triangle(*t).is_none()
+                || t.iter()
+                    .any(|&v| before.vertices.get(v) != Some(&self.vertices[v]))
+        };
+
+        self.triangle_ids()
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| changed(t))
+            .all(|(i, t)| {
+                let points = t.map(|v| self.vertices[v]);
+                self.triangle_ids()
+                    .iter()
+                    .enumerate()
+                    .all(|(j, u)| i == j || !overlap(points, u.map(|v| self.vertices[v])))
+            })
+    }
+
+    fn apply_unchecked(&mut self, edit: Edit) -> bool {
         match edit {
             Edit::AddTriangle(corners) => {
                 if is_degenerate(corners) {
@@ -117,7 +162,7 @@ impl Document {
 
                 let base = self.vertices.len();
                 self.vertices.extend(corners);
-                self.triangles.push([base, base + 1, base + 2]);
+                self.push_triangle([base, base + 1, base + 2]);
             }
             Edit::ExtendEdge { a, b, apex } => {
                 let c = match apex {
@@ -140,7 +185,7 @@ impl Document {
                     return false;
                 }
 
-                self.triangles.push([a, b, c]);
+                self.push_triangle([a, b, c]);
             }
             Edit::SplitTriangle { triangle, at } => {
                 let [a, b, c] = self.triangles[triangle];
@@ -157,7 +202,9 @@ impl Document {
                 let d = self.vertices.len() - 1;
 
                 self.triangles.remove(triangle);
-                self.triangles.extend([[a, b, d], [b, c, d], [c, a, d]]);
+                for t in [[a, b, d], [b, c, d], [c, a, d]] {
+                    self.push_triangle(t);
+                }
             }
             Edit::CollapseOntoEdge { id, a, b, at } => {
                 let Some(squashed) = self.find_triangle([id, a, b]) else {
@@ -180,7 +227,9 @@ impl Document {
                     }
                     !across
                 });
-                self.triangles.extend(split);
+                for t in split {
+                    self.push_triangle(t);
+                }
             }
             Edit::MergeVertex { id, into } => {
                 if id == into || !self.neighbours(id).any(|v| v == into) {
@@ -220,6 +269,17 @@ impl Document {
             .rposition(|t| contains(t.map(|id| self.vertices[id]), point))
     }
 
+    /// Adds a new triangle, wound positively.
+    fn push_triangle(&mut self, [a, b, c]: [VertexId; 3]) {
+        let [pa, pb, pc] = [a, b, c].map(|id| self.vertices[id]);
+
+        self.triangles.push(if area2(pa, pb, pc) < 0.0 {
+            [a, c, b]
+        } else {
+            [a, b, c]
+        });
+    }
+
     fn has_triangle(&self, ids: [VertexId; 3]) -> bool {
         self.find_triangle(ids).is_some()
     }
@@ -236,17 +296,8 @@ impl Document {
     }
 }
 
-fn contains([a, b, c]: [Point; 3], p: Point) -> bool {
-    let side = |u: Point, v: Point| (v.x - u.x) * (p.y - u.y) - (p.x - u.x) * (v.y - u.y);
-    let (d1, d2, d3) = (side(a, b), side(b, c), side(c, a));
-    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-    !(has_neg && has_pos)
-}
-
 fn is_degenerate([a, b, c]: [Point; 3]) -> bool {
-    let area2 = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
-    area2.abs() < 1e-3
+    area2(a, b, c).abs() < 1e-3
 }
 
 #[cfg(test)]
@@ -271,7 +322,7 @@ mod tests {
             b: 1,
             apex: Corner::New(Point::new(5.0, -10.0))
         }));
-        assert_eq!(doc.triangle_ids(), &[[0, 1, 2], [0, 1, 3]]);
+        assert_eq!(sorted(&doc), vec![[0, 1, 2], [0, 1, 3]]);
 
         // Moving a shared corner moves both triangles.
         doc.apply(Edit::MoveVertex {
@@ -403,6 +454,52 @@ mod tests {
                     .all(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
             );
         }
+    }
+
+    #[test]
+    fn folding_over_is_rejected() {
+        let mut doc = doc_with_triangle();
+        doc.apply(Edit::ExtendEdge {
+            a: 0,
+            b: 1,
+            apex: Corner::New(Point::new(5.0, -10.0)),
+        });
+
+        // Pulling the top corner across the shared edge folds its triangle.
+        let before = sorted(&doc);
+        assert!(!doc.apply(Edit::MoveVertex {
+            id: 2,
+            to: Point::new(5.0, -5.0),
+        }));
+        assert_eq!(sorted(&doc), before);
+        assert_eq!(doc.vertex(2), Point::new(5.0, 10.0));
+    }
+
+    #[test]
+    fn overlapping_is_rejected() {
+        let mut doc = doc_with_triangle();
+
+        // Extending edge 0–1 towards the side the triangle is already on.
+        assert!(!doc.apply(Edit::ExtendEdge {
+            a: 0,
+            b: 1,
+            apex: Corner::New(Point::new(5.0, 20.0)),
+        }));
+
+        // A separate triangle on top of the existing one.
+        assert!(!doc.apply(Edit::AddTriangle([
+            Point::new(2.0, 2.0),
+            Point::new(8.0, 2.0),
+            Point::new(5.0, 20.0),
+        ])));
+
+        // Touching along an edge is fine.
+        assert!(doc.apply(Edit::ExtendEdge {
+            a: 0,
+            b: 1,
+            apex: Corner::New(Point::new(5.0, -10.0)),
+        }));
+        assert_eq!(doc.triangle_ids().len(), 2);
     }
 
     #[test]

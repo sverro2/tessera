@@ -9,11 +9,14 @@
 
 use iced::keyboard;
 use iced::mouse;
-use iced::widget::canvas::{self, Canvas, Event, Frame, Geometry, LineCap, LineJoin, Path, Stroke};
+use iced::widget::canvas::{
+    self, Canvas, Event, Frame, Geometry, LineCap, LineDash, LineJoin, Path, Stroke,
+};
 use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Theme, Vector};
 
 use crate::camera::Camera;
 use crate::document::{Corner, Document, Edit, VertexId};
+use crate::geometry::{closest_on_segment, min_height};
 
 /// Screen-space distance within which a corner is grabbed.
 const VERTEX_HIT: f32 = 10.0;
@@ -22,6 +25,11 @@ const EDGE_HIT: f32 = 7.0;
 /// Minimum height (screen px) of any triangle we create; thinner slivers
 /// would be invisible and impossible to grab.
 const MIN_THICKNESS: f32 = 5.0;
+/// A triangle whose height is below this fraction of its longest side is
+/// considered flat.
+const FLAT_RATIO: f32 = 0.02;
+/// How far (screen px) inside a limiting edge a dragged vertex stops.
+const SLIDE_INSET: f32 = 1.0;
 /// World-space spacing of the background dot grid.
 const GRID: f32 = 50.0;
 
@@ -158,7 +166,7 @@ impl canvas::Program<Message> for Editor<'_> {
                         return Some(canvas::Action::publish(Message::Pan(delta)).and_capture());
                     }
                     Interaction::Creating { to, .. } => *to = world,
-                    Interaction::MovingVertex { to, .. } => *to = world,
+                    Interaction::MovingVertex { id, to } => *to = self.limit_move(*id, *to, world),
                     Interaction::Extending { apex, .. } => *apex = world,
                 }
 
@@ -218,7 +226,7 @@ impl canvas::Program<Message> for Editor<'_> {
             Some((_, result)) => {
                 let mut frame = Frame::new(renderer, bounds.size());
                 self.draw_document(&mut frame, result);
-                self.draw_additions(&mut frame, result, accent);
+                self.draw_changes(&mut frame, result, accent);
                 frame.into_geometry()
             }
             None => self.cache.draw(renderer, bounds.size(), |frame| {
@@ -252,11 +260,27 @@ impl canvas::Program<Message> for Editor<'_> {
             },
             (Interaction::Panning { .. }, _) => {}
             (_, Some((edit, result))) => {
-                handle(
-                    &mut overlay,
-                    camera.to_screen(placed(*edit, result)),
-                    accent,
-                );
+                let at = camera.to_screen(placed(*edit, result));
+
+                // Stuck away from the cursor (e.g. a vertex held back by an
+                // edge): show where the mouse really is, so the jump on
+                // release is expected. Small snaps don't count.
+                if let Some(p) = cursor_pos.filter(|p| p.distance(at) > VERTEX_HIT) {
+                    let dashed = Stroke {
+                        line_dash: LineDash {
+                            segments: &[4.0, 4.0],
+                            offset: 0,
+                        },
+                        ..stroke(Color { a: 0.5, ..accent }, 1.0)
+                    };
+                    overlay.stroke(&Path::line(p, at), dashed);
+                    overlay.stroke(
+                        &Path::circle(p, 4.0),
+                        stroke(Color { a: 0.7, ..accent }, 1.5),
+                    );
+                }
+
+                handle(&mut overlay, at, accent);
             }
             // Releasing now would do nothing.
             (_, None) => {
@@ -331,6 +355,7 @@ impl Editor<'_> {
 
         // Slivers would be invisible and impossible to grab.
         let has_sliver = new_triangles(self.document, &result)
+            .map(|t| t.map(|v| result.vertex(v)))
             .any(|t| min_height(t.map(|p| self.camera.to_screen(p))) < MIN_THICKNESS);
 
         (applied && !has_sliver).then_some((edit, result))
@@ -385,6 +410,62 @@ impl Editor<'_> {
             .map_or(Edit::MoveVertex { id, to }, |(edit, _)| edit)
     }
 
+    /// Where vertex `id` should be when the cursor is at `to`, given that
+    /// `from` was valid: the cursor itself if the move is allowed, otherwise
+    /// the closest allowed point, so the vertex slides along the edges that
+    /// keep it from folding over its neighbours.
+    fn limit_move(&self, id: VertexId, from: Point, to: Point) -> Point {
+        let valid = |p| {
+            self.pending(Interaction::MovingVertex { id, to: p })
+                .is_some()
+        };
+
+        if valid(to) {
+            return to;
+        }
+
+        let camera = self.camera;
+        let cursor = camera.to_screen(to);
+        let origin = camera.to_screen(self.document.vertex(id));
+
+        // The vertex must stay on its own side of the opposite edge of each
+        // of its triangles. Those edges' lines, nudged inwards (screen space)
+        // as (point, unit direction):
+        let lines: Vec<(Point, Vector)> = self
+            .document
+            .triangle_ids()
+            .iter()
+            .filter_map(|t| {
+                let i = t.iter().position(|&v| v == id)?;
+                let a = camera.to_screen(self.document.vertex(t[(i + 1) % 3]));
+                let b = camera.to_screen(self.document.vertex(t[(i + 2) % 3]));
+                let dir = (b - a) * (1.0 / a.distance(b));
+                let mut normal = Vector::new(-dir.y, dir.x);
+                if dot(normal, origin - a) < 0.0 {
+                    normal *= -1.0;
+                }
+                Some((a + normal * SLIDE_INSET, dir))
+            })
+            .collect();
+
+        // Candidates: the cursor projected onto each line (sliding along an
+        // edge) and the lines' crossings (stuck in a corner).
+        let projections = lines.iter().map(|&(p, d)| p + d * dot(cursor - p, d));
+        let corners = lines.iter().enumerate().flat_map(|(i, &(p1, d1))| {
+            lines[i + 1..].iter().filter_map(move |&(p2, d2)| {
+                let den = cross(d1, d2);
+                (den.abs() > 1e-6).then(|| p1 + d1 * (cross(p2 - p1, d2) / den))
+            })
+        });
+
+        projections
+            .chain(corners)
+            .map(|p| (camera.to_world(p), p.distance(cursor)))
+            .filter(|&(p, _)| valid(p))
+            .min_by(|x, y| x.1.total_cmp(&y.1))
+            .map_or(from, |(p, _)| p)
+    }
+
     /// The candidate vertex closest to a screen position, within grab range.
     fn nearest_vertex(
         &self,
@@ -411,13 +492,54 @@ impl Editor<'_> {
         let mesh = self.mesh(document.triangles());
         frame.fill(&mesh, FILL);
         frame.stroke(&mesh, stroke(EDGE, 1.5));
+
+        // Existing triangles that have become (almost) flat are easy to miss,
+        // yet they block moves that would fold them; show them as dashed red.
+        let flat = Path::new(|p| {
+            for t in document.triangles() {
+                let t = t.map(|v| self.camera.to_screen(v));
+                let (from, to) = longest_edge(t);
+                if min_height(t) < FLAT_RATIO * from.distance(to) {
+                    p.move_to(from);
+                    p.line_to(to);
+                }
+            }
+        });
+        frame.stroke(
+            &flat,
+            Stroke {
+                line_dash: LineDash {
+                    segments: &[6.0, 4.0],
+                    offset: 0,
+                },
+                ..stroke(CANCEL, 2.0)
+            },
+        );
     }
 
-    /// Highlights the triangles `result` adds to the current document.
-    fn draw_additions(&self, frame: &mut Frame, result: &Document, accent: Color) {
-        let added = self.mesh(new_triangles(self.document, result));
+    /// Highlights how `result` differs from the current document: added
+    /// triangles in `accent`, and triangles squashed flat by the edit as the
+    /// red line they collapse into.
+    fn draw_changes(&self, frame: &mut Frame, result: &Document, accent: Color) {
+        let added =
+            self.mesh(new_triangles(self.document, result).map(|t| t.map(|v| result.vertex(v))));
         frame.fill(&added, Color { a: 0.2, ..accent });
         frame.stroke(&added, stroke(accent, 1.5));
+
+        // Removed triangles whose corners now (nearly) line up were squashed;
+        // other removed ones (e.g. a split parent) were replaced.
+        let squashed = Path::new(|p| {
+            for t in new_triangles(result, self.document) {
+                let [a, b, c] = t.map(|v| self.camera.to_screen(result.vertex(v)));
+
+                if min_height([a, b, c]) < 1.0 {
+                    let (from, to) = longest_edge([a, b, c]);
+                    p.move_to(from);
+                    p.line_to(to);
+                }
+            }
+        });
+        frame.stroke(&squashed, stroke(CANCEL, 3.0));
     }
 
     fn mesh(&self, triangles: impl Iterator<Item = [Point; 3]>) -> Path {
@@ -432,11 +554,26 @@ impl Editor<'_> {
     }
 }
 
+fn longest_edge([a, b, c]: [Point; 3]) -> (Point, Point) {
+    [(a, b), (b, c), (c, a)]
+        .into_iter()
+        .max_by(|x, y| x.0.distance(x.1).total_cmp(&y.0.distance(y.1)))
+        .unwrap()
+}
+
+fn dot(a: Vector, b: Vector) -> f32 {
+    a.x * b.x + a.y * b.y
+}
+
+fn cross(a: Vector, b: Vector) -> f32 {
+    a.x * b.y - a.y * b.x
+}
+
 /// Triangles in `after` that `before` doesn't have (compared by corner ids).
 fn new_triangles<'a>(
     before: &'a Document,
     after: &'a Document,
-) -> impl Iterator<Item = [Point; 3]> + 'a {
+) -> impl Iterator<Item = [VertexId; 3]> + 'a {
     let key = |t: &[VertexId; 3]| {
         let mut t = *t;
         t.sort_unstable();
@@ -448,7 +585,7 @@ fn new_triangles<'a>(
         .triangle_ids()
         .iter()
         .filter(move |t| !existing.contains(&key(t)))
-        .map(|t| t.map(|id| after.vertex(id)))
+        .copied()
 }
 
 /// The point the user is placing with `edit`, where its handle is drawn.
@@ -516,26 +653,6 @@ fn equilateral(from: Point, to: Point) -> [Point; 3] {
     let mid = Point::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
     let h = 3f32.sqrt() / 2.0;
     [from, to, mid + Vector::new(d.y * h, -d.x * h)]
-}
-
-/// The smallest height of a triangle (twice its area over its longest side).
-fn min_height([a, b, c]: [Point; 3]) -> f32 {
-    let area2 = ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs();
-    let longest = a.distance(b).max(b.distance(c)).max(c.distance(a));
-    if longest == 0.0 { 0.0 } else { area2 / longest }
-}
-
-/// Closest point on segment `a`–`b` to `p`, and its distance.
-fn closest_on_segment(p: Point, a: Point, b: Point) -> (Point, f32) {
-    let ab = b - a;
-    let len2 = ab.x * ab.x + ab.y * ab.y;
-    let t = if len2 == 0.0 {
-        0.0
-    } else {
-        (((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / len2).clamp(0.0, 1.0)
-    };
-    let closest = a + ab * t;
-    (closest, closest.distance(p))
 }
 
 #[cfg(test)]
@@ -635,6 +752,7 @@ mod tests {
         };
         assert_eq!(edit(297.0), None); // thin split
         assert_eq!(edit(303.0), None); // thin extension
+        assert_eq!(edit(50.0), None); // out through the far side: would overlap
         assert!(matches!(
             edit(250.0),
             Some(Edit::SplitTriangle { triangle: 0, .. })
@@ -646,5 +764,70 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn dragging_a_vertex_across_an_edge_stops_at_it() {
+        let mut doc = Document::default();
+        doc.apply(Edit::AddTriangle([
+            Point::new(100.0, 300.0),
+            Point::new(300.0, 300.0),
+            Point::new(200.0, 100.0),
+        ]));
+        doc.apply(Edit::SplitTriangle {
+            triangle: 0,
+            at: Point::new(200.0, 230.0),
+        });
+        let cache = canvas::Cache::new();
+        let editor = Editor {
+            document: &doc,
+            camera: Camera::default(),
+            cache: &cache,
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+        let mut state = State::default();
+
+        let mut published = vec![];
+        let moved = mouse::Event::CursorMoved {
+            position: Point::ORIGIN,
+        };
+        for (e, x, y) in [
+            (
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                200.0,
+                230.0,
+            ),
+            (moved, 200.0, 280.0),
+            (moved, 200.0, 360.0),
+            // Far past the edge, off to the side: slides along it.
+            (moved, 260.0, 400.0),
+            (
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+                260.0,
+                400.0,
+            ),
+        ] {
+            let cursor = mouse::Cursor::Available(Point::new(x, y));
+            if let Some(action) = editor.update(&mut state, &Event::Mouse(e), bounds, cursor) {
+                published.extend(action.into_inner().0);
+            }
+        }
+
+        // The centre can't pass the bottom edge 0–1; it slides along it to
+        // right above the cursor and snaps onto it, and the result is valid.
+        let [Message::Edit(edit)] = published[..] else {
+            panic!("expected one edit, got {published:?}");
+        };
+        let Edit::CollapseOntoEdge {
+            a: 0 | 1,
+            b: 0 | 1,
+            at,
+            ..
+        } = edit
+        else {
+            panic!("expected a collapse onto 0–1, got {edit:?}");
+        };
+        assert!((at.x - 260.0).abs() < 1.0, "{at:?}");
+        assert!(doc.clone().apply(edit));
     }
 }
