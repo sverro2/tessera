@@ -2,7 +2,7 @@
 //! turns mouse input into [`Message`]s. It never mutates the document itself.
 //!
 //! Left-drag on blank canvas creates a triangle. Only middle-drag pans; the
-//! wheel zooms around the cursor. C cuts the hovered edge at the cursor; D
+//! wheel zooms around the cursor, Shift+wheel rotates around it. C cuts the hovered edge at the cursor; D
 //! removes the triangle under it.
 
 use iced::keyboard;
@@ -34,6 +34,11 @@ const SLIDE_INSET: f32 = MIN_THICKNESS + 0.5;
 const ACROSS_NUDGE: f32 = 0.01;
 /// World-space spacing of the background dot grid.
 const GRID: f32 = 50.0;
+/// Rotation per wheel notch with Shift held.
+const ROTATE_STEP: f32 = 5.0 * std::f32::consts::PI / 180.0;
+/// Radius and margin (screen px) of the compass showing the rotation.
+const COMPASS: f32 = 16.0;
+const COMPASS_MARGIN: f32 = 12.0;
 
 const BACKGROUND: Color = Color::from_rgb8(0x1a, 0x1b, 0x26);
 const GRID_DOT: Color = Color::from_rgb8(0x2f, 0x33, 0x4d);
@@ -52,6 +57,11 @@ pub enum Message {
     Zoom {
         anchor: Point,
         factor: f32,
+    },
+    /// Rotate clockwise by `angle` radians around `anchor`.
+    Rotate {
+        anchor: Point,
+        angle: f32,
     },
     /// One user action, made of edits applied together (all or nothing).
     Edit(Vec<Edit>),
@@ -81,6 +91,8 @@ struct Editor<'a> {
 #[derive(Debug, Default)]
 pub struct State {
     interaction: Interaction,
+    /// The wheel event doesn't carry these, so keep track of them.
+    modifiers: keyboard::Modifiers,
 }
 
 /// An in-progress drag. Positions are in world coordinates.
@@ -132,6 +144,10 @@ impl canvas::Program<Message> for Editor<'_> {
         let inside = cursor.position_in(bounds);
 
         match event {
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.modifiers = *modifiers;
+                None
+            }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
                 physical_key,
@@ -224,6 +240,19 @@ impl canvas::Program<Message> for Editor<'_> {
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let anchor = inside?;
+
+                if state.modifiers.shift() {
+                    // Some platforms turn Shift+wheel into horizontal scrolling.
+                    let (x, y, per_notch) = match *delta {
+                        mouse::ScrollDelta::Lines { x, y } => (x, y, 1.0),
+                        mouse::ScrollDelta::Pixels { x, y } => (x, y, 50.0),
+                    };
+                    let angle = if y != 0.0 { y } else { x } / per_notch * ROTATE_STEP;
+                    return Some(
+                        canvas::Action::publish(Message::Rotate { anchor, angle }).and_capture(),
+                    );
+                }
+
                 let factor = match *delta {
                     mouse::ScrollDelta::Lines { y, .. } => 1.15f32.powf(y),
                     mouse::ScrollDelta::Pixels { y, .. } => (y / 200.0).exp(),
@@ -262,6 +291,7 @@ impl canvas::Program<Message> for Editor<'_> {
         };
 
         let mut overlay = Frame::new(renderer, bounds.size());
+        draw_compass(&mut overlay, camera);
         let cursor_pos = cursor.position_in(bounds);
 
         match (state.interaction, &pending) {
@@ -748,7 +778,8 @@ impl Editor<'_> {
 
         // Edges lying (partly) on top of each other mean the mesh isn't
         // joined up properly there; show the overlapping stretches in red.
-        let edges: Vec<(Point, Point)> = unique_edges(document)
+        let edges: Vec<(Point, Point)> = document
+            .unique_edges()
             .into_iter()
             .map(|(u, v)| {
                 let screen = |v| self.camera.to_screen(document.vertex(v));
@@ -780,9 +811,9 @@ impl Editor<'_> {
 
         // Vertices are never removed, so old edges can be drawn where their
         // ends are after the edit.
-        let kept = unique_edges(result);
+        let kept = result.unique_edges();
         let removed = Path::new(|p| {
-            for (u, v) in unique_edges(self.document) {
+            for (u, v) in self.document.unique_edges() {
                 if kept.binary_search(&(u, v)).is_err() {
                     p.move_to(self.camera.to_screen(result.vertex(u)));
                     p.line_to(self.camera.to_screen(result.vertex(v)));
@@ -870,17 +901,6 @@ fn cross(a: Vector, b: Vector) -> f32 {
     a.x * b.y - a.y * b.x
 }
 
-/// Each edge once, as a sorted list of `(low, high)` vertex id pairs.
-fn unique_edges(document: &Document) -> Vec<(VertexId, VertexId)> {
-    let mut edges: Vec<_> = document
-        .edges()
-        .map(|(u, v)| (u.min(v), u.max(v)))
-        .collect();
-    edges.sort_unstable();
-    edges.dedup();
-    edges
-}
-
 /// Triangles in `after` that `before` doesn't have (compared by corner ids).
 fn new_triangles<'a>(
     before: &'a Document,
@@ -927,17 +947,28 @@ fn draw_grid(frame: &mut Frame, camera: Camera) {
         return;
     }
 
+    // The world-space bounds of the (possibly rotated) visible area.
     let size = frame.size();
-    let top_left = camera.to_world(Point::ORIGIN);
-    let start_x = (top_left.x / GRID).floor() * GRID;
-    let start_y = (top_left.y / GRID).floor() * GRID;
+    let corners = [
+        Point::ORIGIN,
+        Point::new(size.width, 0.0),
+        Point::new(0.0, size.height),
+        Point::new(size.width, size.height),
+    ]
+    .map(|p| camera.to_world(p));
+    let min = |f: fn(&Point) -> f32| corners.iter().map(f).fold(f32::INFINITY, f32::min);
+    let max = |f: fn(&Point) -> f32| corners.iter().map(f).fold(f32::NEG_INFINITY, f32::max);
+    let visible = Rectangle::new(Point::ORIGIN, size);
 
     let dots = Path::new(|p| {
-        let mut y = start_y;
-        while camera.to_screen(Point::new(0.0, y)).y <= size.height {
-            let mut x = start_x;
-            while camera.to_screen(Point::new(x, 0.0)).x <= size.width {
-                p.circle(camera.to_screen(Point::new(x, y)), 1.2);
+        let mut y = (min(|p| p.y) / GRID).floor() * GRID;
+        while y <= max(|p| p.y) {
+            let mut x = (min(|p| p.x) / GRID).floor() * GRID;
+            while x <= max(|p| p.x) {
+                let dot = camera.to_screen(Point::new(x, y));
+                if visible.contains(dot) {
+                    p.circle(dot, 1.2);
+                }
                 x += GRID;
             }
             y += GRID;
@@ -945,6 +976,24 @@ fn draw_grid(frame: &mut Frame, camera: Camera) {
     });
 
     frame.fill(&dots, GRID_DOT);
+}
+
+/// A compass in the top right corner whose needle points to world "up".
+fn draw_compass(frame: &mut Frame, camera: Camera) {
+    let centre = Point::new(
+        frame.width() - COMPASS_MARGIN - COMPASS,
+        COMPASS_MARGIN + COMPASS,
+    );
+    let (sin, cos) = camera.rotation.sin_cos();
+    let up = Vector::new(sin, -cos) * (COMPASS - 4.0);
+    let dial = Path::circle(centre, COMPASS);
+
+    frame.fill(&dial, BACKGROUND);
+    frame.stroke(&dial, stroke(GRID_DOT, 1.5));
+    let tail = centre - up * 0.6;
+    frame.stroke(&Path::line(tail, centre), stroke(GRID_DOT, 2.0));
+    frame.stroke(&Path::line(centre, centre + up), stroke(EDGE, 2.0));
+    frame.fill(&Path::circle(centre + up, 2.5), EDGE);
 }
 
 fn handle(frame: &mut Frame, at: Point, color: Color) {

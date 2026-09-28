@@ -6,7 +6,7 @@ mod svg;
 
 use std::path::PathBuf;
 
-use iced::widget::{button, canvas, column, container, row, space, text};
+use iced::widget::{button, canvas, column, container, row, space, stack, text};
 use iced::{Center, Element, Fill, Task, Theme};
 
 use camera::Camera;
@@ -50,6 +50,9 @@ impl Tessera {
             Message::Editor(editor::Message::Zoom { anchor, factor }) => {
                 self.camera.zoom_at(anchor, factor);
             }
+            Message::Editor(editor::Message::Rotate { anchor, angle }) => {
+                self.camera.rotate_at(anchor, angle);
+            }
             Message::ResetView => {
                 self.camera = Camera::default();
             }
@@ -78,19 +81,41 @@ impl Tessera {
                 (!self.document.is_empty()).then_some(Message::ExportSvg)
             ),
             button("Reset view").on_press(Message::ResetView),
-            text(format!("{:.0}%", self.camera.zoom * 100.0)),
+            text(format!(
+                "{:.0}% · {:.0}°",
+                self.camera.zoom * 100.0,
+                self.camera.rotation.to_degrees()
+            )),
             space::horizontal(),
             text(&self.status),
-            text("Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Middle-drag: pan · Wheel: zoom")
+            text("Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate")
                 .size(12),
         ]
         .spacing(10)
         .padding(8)
         .align_y(Center);
 
+        let stats = container(
+            text(format!(
+                "{} vertices · {} edges · {} faces",
+                self.document.vertex_count(),
+                self.document.unique_edges().len(),
+                self.document.triangle_ids().len(),
+            ))
+            .size(12),
+        )
+        .padding([4, 8])
+        .style(container::dark);
+
         column![
             container(toolbar).width(Fill).style(container::dark),
-            editor::view(&self.document, self.camera, &self.cache).map(Message::Editor),
+            stack![
+                editor::view(&self.document, self.camera, &self.cache).map(Message::Editor),
+                container(stats)
+                    .align_right(Fill)
+                    .align_bottom(Fill)
+                    .padding(10),
+            ],
         ]
         .into()
     }

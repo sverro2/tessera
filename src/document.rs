@@ -118,6 +118,22 @@ impl Document {
             .flat_map(|&[a, b, c]| [(a, b), (b, c), (c, a)])
     }
 
+    /// Each edge once, as a sorted list of `(low, high)` vertex id pairs.
+    pub fn unique_edges(&self) -> Vec<(VertexId, VertexId)> {
+        let mut edges: Vec<_> = self.edges().map(|(u, v)| (u.min(v), u.max(v))).collect();
+        edges.sort_unstable();
+        edges.dedup();
+        edges
+    }
+
+    /// The number of vertices used by triangles.
+    pub fn vertex_count(&self) -> usize {
+        let mut used: Vec<_> = self.used_vertices().collect();
+        used.sort_unstable();
+        used.dedup();
+        used.len()
+    }
+
     /// Axis-aligned bounds of all vertices used by triangles.
     pub fn bounds(&self) -> Option<(Point, Point)> {
         let mut points = self.triangles.iter().flatten().map(|&id| self.vertices[id]);
