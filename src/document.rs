@@ -13,6 +13,8 @@
 //!   folded over its neighbours,
 //! - no two triangles overlap.
 
+use std::time::Instant;
+
 use iced::Point;
 
 use crate::geometry::{area2, min_height, overlap};
@@ -30,6 +32,9 @@ pub type TriangleId = usize;
 pub struct Document {
     vertices: Vec<Point>,
     triangles: Vec<[VertexId; 3]>,
+    /// Counts the edits applied, so views can tell when to redo what they
+    /// derived from it.
+    revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,6 +82,11 @@ impl Changes {
 }
 
 impl Document {
+    /// Changes with every applied edit.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn is_empty(&self) -> bool {
         self.triangles.is_empty()
     }
@@ -202,6 +212,7 @@ impl Document {
         match self.preview(edits) {
             Some((next, _)) => {
                 *self = next;
+                self.revision += 1;
                 true
             }
             None => false,
@@ -211,6 +222,16 @@ impl Document {
     /// The document after `edits`, and what normalizing it changed; `None`
     /// if any of them is rejected.
     pub fn preview(&self, edits: &[Edit]) -> Option<(Document, Changes)> {
+        self.preview_until(edits, None)
+    }
+
+    /// Like [`Self::preview`], but gives up (returning `None`) once past
+    /// `deadline`: filling can take long in crowded geometry.
+    pub fn preview_until(
+        &self,
+        edits: &[Edit],
+        deadline: Option<Instant>,
+    ) -> Option<(Document, Changes)> {
         let mut changes = Changes::default();
         let mut document = self.clone();
 
@@ -220,7 +241,7 @@ impl Document {
                 Edit::MoveVertex { id, .. } => Some(id),
                 _ => None,
             };
-            let valid = next.apply_unchecked(edit, &mut changes)
+            let valid = next.apply_unchecked(edit, &mut changes, deadline)
                 && next.normalize(moved, &mut changes)
                 && next.is_valid_after(&document);
             if !valid {
@@ -232,9 +253,14 @@ impl Document {
         Some((document, changes))
     }
 
-    fn apply_unchecked(&mut self, edit: Edit, changes: &mut Changes) -> bool {
+    fn apply_unchecked(
+        &mut self,
+        edit: Edit,
+        changes: &mut Changes,
+        deadline: Option<Instant>,
+    ) -> bool {
         match edit {
-            Edit::AddTriangle { corners, snap } => self.fill(corners, snap, changes),
+            Edit::AddTriangle { corners, snap } => self.fill(corners, snap, changes, deadline),
             Edit::InsertVertex { at } => self.insert_vertex(at),
             Edit::RemoveTriangle { triangle } => {
                 triangle < self.triangles.len() && {
@@ -1138,7 +1164,7 @@ mod fuzz {
 
                 let started = std::time::Instant::now();
                 let mut unchecked = doc.clone();
-                if !unchecked.apply_unchecked(edit, &mut Changes::default()) {
+                if !unchecked.apply_unchecked(edit, &mut Changes::default(), None) {
                     empty += 1;
                 } else if doc.apply(edit) {
                     ok += 1;

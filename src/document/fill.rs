@@ -1,6 +1,8 @@
 //! Adding a triangle where it may run into existing geometry: only the part
 //! not covered yet is added, triangulated so it joins the mesh properly.
 
+use std::time::Instant;
+
 use iced::Point;
 
 use super::{Changes, Document, VertexId, is_flat};
@@ -33,7 +35,15 @@ impl Document {
     ///
     /// Records the existing vertices the new triangles attach to in
     /// `changes`.
-    pub(super) fn fill(&mut self, corners: [Point; 3], snap: f32, changes: &mut Changes) -> bool {
+    ///
+    /// Gives up (returning `false`) once past `deadline`.
+    pub(super) fn fill(
+        &mut self,
+        corners: [Point; 3],
+        snap: f32,
+        changes: &mut Changes,
+        deadline: Option<Instant>,
+    ) -> bool {
         /// How often to bend the outline again to get rid of thin pieces.
         const MAX_ROUNDS: usize = 8;
 
@@ -66,9 +76,12 @@ impl Document {
         for _ in 0..MAX_ROUNDS {
             let outline = bent(triangle, &through, |id| self.vertices[id], snap);
             let mut next = self.clone();
-            let Some(attached) = next.fill_outline(corners, &outline) else {
+            let Some(attached) = next.fill_outline(corners, &outline, deadline) else {
                 break;
             };
+            if late(deadline) {
+                return false;
+            }
             let thin = next.thin_piece(self, snap, &outline);
             filled = Some((next, attached));
             match thin {
@@ -110,7 +123,12 @@ impl Document {
     ///
     /// Returns the existing vertices the new triangles attach to, or `None`
     /// if nothing is left to cover.
-    fn fill_outline(&mut self, corners: [Point; 3], outline: &[Point]) -> Option<Vec<VertexId>> {
+    fn fill_outline(
+        &mut self,
+        corners: [Point; 3],
+        outline: &[Point],
+        deadline: Option<Instant>,
+    ) -> Option<Vec<VertexId>> {
         let used = self.unique_vertices();
         let sides: Vec<(Point, Point)> = (0..outline.len())
             .map(|i| (outline[i], outline[(i + 1) % outline.len()]))
@@ -171,6 +189,9 @@ impl Document {
         // All usable connections, shortest first.
         let mut connections: Vec<(f32, usize, usize)> = Vec::new();
         for i in 0..candidates.len() {
+            if late(deadline) {
+                return None;
+            }
             for j in i + 1..candidates.len() {
                 let (p, q) = (candidates[i].point, candidates[j].point);
                 let through_other = candidates
@@ -191,6 +212,9 @@ impl Document {
         // divides the gap into triangles.
         let mut kept: Vec<(usize, usize)> = Vec::new();
         for (_, i, j) in connections {
+            if late(deadline) {
+                return None;
+            }
             let (p, q) = (candidates[i].point, candidates[j].point);
             let crosses_kept = kept
                 .iter()
@@ -203,6 +227,9 @@ impl Document {
         let connected = |i: usize, j: usize| kept.contains(&(i.min(j), i.max(j)));
         let mut faces: Vec<[usize; 3]> = Vec::new();
         for &(i, j) in &kept {
+            if late(deadline) {
+                return None;
+            }
             for k in j + 1..candidates.len() {
                 if !connected(i, k) || !connected(j, k) {
                     continue;
@@ -348,6 +375,10 @@ fn in_polygon(polygon: &[Point], p: Point) -> bool {
         .count()
         % 2
         == 1
+}
+
+fn late(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
 fn oriented([a, b, c]: [Point; 3]) -> [Point; 3] {

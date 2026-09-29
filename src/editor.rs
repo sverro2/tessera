@@ -9,6 +9,8 @@
 //! [`Editor::snaps`]); the document then joins things up by itself, so the
 //! editor only decides where points go.
 
+use std::cell::Cell;
+
 use iced::keyboard;
 use iced::mouse;
 use iced::time::{Duration, Instant};
@@ -32,6 +34,11 @@ const MIN_THICKNESS: f32 = 5.0;
 /// How far (screen px) inside a limiting edge a dragged vertex stops: just
 /// clear of making its triangle with that edge a sliver.
 const SLIDE_INSET: f32 = MIN_THICKNESS + 0.5;
+/// How long working out what a drag does may take per mouse move.
+const BUDGET: Duration = Duration::from_millis(12);
+/// How many snap targets to try (closest first) before giving up on
+/// snapping.
+const MAX_SNAPS: usize = 4;
 /// How long the shape highlight takes to move over to another shape.
 const SHAPE_FADE: Duration = Duration::from_millis(200);
 /// World-space spacing of the background dot grid.
@@ -78,11 +85,14 @@ pub fn view<'a>(
     document: &'a Document,
     camera: Camera,
     cache: &'a canvas::Cache,
+    grid: &'a canvas::Cache,
 ) -> Element<'a, Message> {
     Canvas::new(Editor {
         document,
         camera,
         cache,
+        grid,
+        deadline: Cell::new(None),
     })
     .width(Fill)
     .height(Fill)
@@ -93,6 +103,12 @@ struct Editor<'a> {
     document: &'a Document,
     camera: Camera,
     cache: &'a canvas::Cache,
+    /// The background and grid, drawn apart so a drag's preview only needs
+    /// to draw the document afresh.
+    grid: &'a canvas::Cache,
+    /// When working out what a drag does should give up, so a heavy case
+    /// (e.g. a fill through crowded geometry) can't make it crawl.
+    deadline: Cell<Option<std::time::Instant>>,
 }
 
 #[derive(Debug, Default)]
@@ -100,11 +116,14 @@ pub struct State {
     interaction: Interaction,
     /// The wheel event doesn't carry these, so keep track of them.
     modifiers: keyboard::Modifiers,
-    /// A vertex of the shape last hovered: it stays highlighted until
-    /// another shape is hovered, so it doesn't flicker on and off.
-    shape: Option<VertexId>,
+    /// The shape last hovered: it stays highlighted until another shape is
+    /// hovered, so it doesn't flicker on and off.
+    shape: Option<Highlight>,
     /// The shape highlighted before (if any), fading out since when.
-    fading: Option<(Option<VertexId>, Instant)>,
+    fading: Option<(Option<Highlight>, Instant)>,
+    /// What releasing the current drag would do, worked out when the mouse
+    /// last moved: drawn, and applied on release.
+    pending: Option<Pending>,
 }
 
 /// An in-progress drag. Positions are in world coordinates.
@@ -147,12 +166,29 @@ enum Target {
     Edge(VertexId, VertexId),
 }
 
+/// A highlighted shape, worked out once (when it's hovered, and again
+/// after an edit) rather than every frame. While dragging it's drawn where
+/// the preview puts its vertices.
+#[derive(Debug, Clone)]
+struct Highlight {
+    /// The document revision it was worked out for.
+    revision: u64,
+    /// The vertex it was found from.
+    start: VertexId,
+    /// Its triangles, each with sorted corners, sorted.
+    triangles: Vec<[VertexId; 3]>,
+    outline: Vec<(VertexId, VertexId)>,
+}
+
 /// What releasing the current drag would do.
+#[derive(Debug)]
 struct Pending {
     edits: Vec<Edit>,
     /// The document afterwards, and how normalizing it joined things up.
     result: Document,
     changes: Changes,
+    /// Triangles of `result` that are new (not just renumbered by welds).
+    added: Vec<[VertexId; 3]>,
     /// Where the point being placed ends up.
     at: Point,
 }
@@ -172,6 +208,18 @@ impl canvas::Program<Message> for Editor<'_> {
             .position()
             .map(|p| p - Vector::new(bounds.x, bounds.y));
         let inside = cursor.position_in(bounds);
+
+        // After an edit, the highlighted shapes may have grown or shrunk.
+        let revision = self.document.revision();
+        let previous = state
+            .fading
+            .as_mut()
+            .and_then(|(previous, _)| previous.as_mut());
+        for shape in state.shape.iter_mut().chain(previous) {
+            if shape.revision != revision {
+                *shape = self.highlight(shape.start);
+            }
+        }
 
         match event {
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
@@ -226,6 +274,9 @@ impl canvas::Program<Message> for Editor<'_> {
                     },
                     _ => return None,
                 };
+                self.deadline.set(Some(std::time::Instant::now() + BUDGET));
+                state.pending = self.pending(state.interaction);
+                self.deadline.set(None);
 
                 Some(canvas::Action::request_redraw().and_capture())
             }
@@ -237,17 +288,13 @@ impl canvas::Program<Message> for Editor<'_> {
                     Interaction::Idle => {
                         if let Some(hover) = self.hit_test(pos) {
                             let vertex = self.hover_vertex(hover);
-                            let same = state.shape.is_some_and(|shape| {
-                                self.document
-                                    .connected(shape)
-                                    .iter()
-                                    .flatten()
-                                    .any(|&v| v == vertex)
+                            let same = state.shape.as_ref().is_some_and(|shape| {
+                                shape.triangles.iter().flatten().any(|&v| v == vertex)
                             });
                             if !same {
-                                state.fading = Some((state.shape, Instant::now()));
+                                let previous = state.shape.replace(self.highlight(vertex));
+                                state.fading = Some((previous, Instant::now()));
                             }
-                            state.shape = Some(vertex);
                         }
                         return Some(canvas::Action::request_redraw());
                     }
@@ -256,12 +303,32 @@ impl canvas::Program<Message> for Editor<'_> {
                         *last = pos;
                         return Some(canvas::Action::publish(Message::Pan(delta)).and_capture());
                     }
-                    Interaction::Creating { to, .. } => *to = world,
-                    Interaction::MovingVertex { id, to } => *to = self.limit_move(*id, *to, world),
-                    Interaction::Extending { a, b, start, apex } => {
-                        *apex = self.limit_extend(*a, *b, *start, *apex, world);
-                    }
+                    _ => {}
                 }
+
+                // Where the drag gets to, and what releasing there does. If
+                // nothing works out (in time), it stays where it was.
+                self.deadline.set(Some(std::time::Instant::now() + BUDGET));
+                match &mut state.interaction {
+                    Interaction::Creating { to, .. } => {
+                        *to = world;
+                        state.pending = self.pending(state.interaction);
+                    }
+                    Interaction::MovingVertex { id, to } => {
+                        if let Some((p, pending)) = self.limit_move(*id, world) {
+                            *to = p;
+                            state.pending = Some(pending);
+                        }
+                    }
+                    Interaction::Extending { a, b, start, apex } => {
+                        if let Some((p, pending)) = self.limit_extend(*a, *b, *start, world) {
+                            *apex = p;
+                            state.pending = pending;
+                        }
+                    }
+                    Interaction::Idle | Interaction::Panning { .. } => {}
+                }
+                self.deadline.set(None);
 
                 Some(canvas::Action::request_redraw().and_capture())
             }
@@ -269,13 +336,15 @@ impl canvas::Program<Message> for Editor<'_> {
                 mouse::Button::Left | mouse::Button::Middle,
             )) => {
                 let finished = std::mem::take(&mut state.interaction);
+                let pending = state.pending.take();
 
                 if let Interaction::Idle = finished {
                     return None;
                 }
 
+                // Exactly what was shown.
                 Some(
-                    match self.pending(finished) {
+                    match pending {
                         Some(pending) => canvas::Action::publish(Message::Edit(pending.edits)),
                         None => canvas::Action::request_redraw(),
                     }
@@ -307,8 +376,8 @@ impl canvas::Program<Message> for Editor<'_> {
             Event::Mouse(mouse::Event::CursorLeft) => Some(canvas::Action::request_redraw()),
             // Keep drawing frames while the shape highlight moves over.
             Event::Window(window::Event::RedrawRequested(now)) => {
-                let (_, since) = state.fading?;
-                if now.duration_since(since) >= SHAPE_FADE {
+                let (_, since) = state.fading.as_ref()?;
+                if now.duration_since(*since) >= SHAPE_FADE {
                     state.fading = None;
                 }
                 Some(canvas::Action::request_redraw())
@@ -328,13 +397,20 @@ impl canvas::Program<Message> for Editor<'_> {
         let camera = self.camera;
 
         // While dragging, draw the document as it will be after release.
-        let pending = self.pending(state.interaction);
+        let pending = match state.interaction {
+            Interaction::Idle | Interaction::Panning { .. } => None,
+            _ => state.pending.as_ref(),
+        };
         // Extending always shares its source edge; that's no news.
         let source = match state.interaction {
             Interaction::Extending { a, b, .. } => Some((a, b)),
             _ => None,
         };
 
+        let grid = self.grid.draw(renderer, bounds.size(), |frame| {
+            frame.fill_rectangle(Point::ORIGIN, frame.size(), BACKGROUND);
+            draw_grid(frame, camera);
+        });
         let content = match &pending {
             Some(pending) => {
                 let mut frame = Frame::new(renderer, bounds.size());
@@ -354,14 +430,10 @@ impl canvas::Program<Message> for Editor<'_> {
         let hover = cursor_pos.and_then(|p| self.hit_test(p));
 
         // The outline of the shape last hovered, so it's clear what hangs
-        // together and what is loose. While dragging, as it will be after
-        // release (grown, if the edit joins it to another shape). Moving
-        // over to another shape, the old outline fades out as the new one
-        // fades in.
-        let (document, kept): (&Document, &dyn Fn(VertexId) -> VertexId) = match &pending {
-            Some(pending) => (&pending.result, &|v| pending.changes.kept(v)),
-            None => (self.document, &|v| v),
-        };
+        // together and what is loose; while dragging, where the preview puts
+        // its vertices. Moving over to another shape, the old outline fades
+        // out as the new one fades in.
+        let document = pending.map_or(self.document, |pending| &pending.result);
         let shown = match state.fading {
             Some((_, since)) => {
                 let t = (since.elapsed().as_secs_f32() / SHAPE_FADE.as_secs_f32()).min(1.0);
@@ -369,29 +441,28 @@ impl canvas::Program<Message> for Editor<'_> {
             }
             None => 1.0,
         };
-        let previous = state.fading.and_then(|(previous, _)| previous);
-        let highlighted = [(previous, 1.0 - shown), (state.shape, shown)]
-            .map(|(start, strength)| (start.map(|v| document.connected(kept(v))), strength));
+        let previous = state
+            .fading
+            .as_ref()
+            .and_then(|(previous, _)| previous.as_ref());
+        let highlighted = [(previous, 1.0 - shown), (state.shape.as_ref(), shown)];
 
         // Everything else is grayed out, so the highlighted shape stands
         // apart. What the pending edit adds never is.
         if state.shape.is_some() {
-            let added: Vec<[VertexId; 3]> = match &pending {
-                Some(pending) => {
-                    let kept = |v| pending.changes.kept(v);
-                    new_triangles(self.document, &pending.result, &kept).collect()
-                }
-                None => Vec::new(),
-            };
+            let added = pending.map_or(&[][..], |pending| &pending.added);
             let mut dimmed: Vec<(f32, Vec<[Point; 3]>)> = Vec::new();
             for t in document
                 .triangle_ids()
                 .iter()
                 .filter(|t| !added.contains(t))
             {
+                let mut key = *t;
+                key.sort_unstable();
                 let lit: f32 = highlighted
                     .iter()
-                    .filter(|(shape, _)| shape.as_ref().is_some_and(|s| s.contains(t)))
+                    .filter_map(|&(shape, strength)| Some((shape?, strength)))
+                    .filter(|(shape, _)| shape.triangles.binary_search(&key).is_ok())
                     .map(|(_, strength)| strength)
                     .sum();
                 let dim = (1.0 - lit).clamp(0.0, 1.0);
@@ -414,9 +485,9 @@ impl canvas::Program<Message> for Editor<'_> {
             }
         }
 
-        for (shape, strength) in &highlighted {
+        for (shape, strength) in highlighted {
             if let Some(shape) = shape {
-                self.draw_shape(&mut overlay, document, shape, *strength);
+                self.draw_shape(&mut overlay, document, shape, strength);
             }
         }
 
@@ -492,7 +563,7 @@ impl canvas::Program<Message> for Editor<'_> {
             }
         }
 
-        vec![content, overlay.into_geometry()]
+        vec![grid, content, overlay.into_geometry()]
     }
 
     fn mouse_interaction(
@@ -610,7 +681,10 @@ impl Editor<'_> {
     /// Applies `edits` (placing a point `at`) to a copy of the document, if
     /// the document accepts them and they leave no slivers.
     fn check(&self, edits: Vec<Edit>, at: Point) -> Option<Pending> {
-        let (result, changes) = self.document.preview(&edits)?;
+        if self.out_of_time() {
+            return None;
+        }
+        let (result, changes) = self.document.preview_until(&edits, self.deadline.get())?;
 
         // Slivers would be invisible and impossible to grab. Triangles that
         // were already that thin (e.g. when zoomed far out) may stay so, as
@@ -627,10 +701,15 @@ impl Editor<'_> {
                 }
         });
 
-        (!has_sliver).then_some(Pending {
+        if has_sliver {
+            return None;
+        }
+        let added = new_triangles(self.document, &result, &|v| changes.kept(v)).collect();
+        Some(Pending {
             edits,
             result,
             changes,
+            added,
             at,
         })
     }
@@ -640,6 +719,12 @@ impl Editor<'_> {
     /// needs to leave no slivers.
     fn snap_distance(&self) -> f32 {
         MIN_THICKNESS / self.camera.zoom
+    }
+
+    fn out_of_time(&self) -> bool {
+        self.deadline
+            .get()
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
     }
 
     fn is_near_edge(&self, point: Point, a: VertexId, b: VertexId) -> bool {
@@ -667,6 +752,7 @@ impl Editor<'_> {
 
         snaps
             .into_iter()
+            .take(MAX_SNAPS)
             .map(|(_, p)| p)
             .chain([to])
             .find_map(|p| self.check(vec![Edit::MoveVertex { id, to: p }], p))
@@ -698,6 +784,7 @@ impl Editor<'_> {
 
         snaps
             .into_iter()
+            .take(MAX_SNAPS)
             .map(|(_, p)| p)
             .chain([apex])
             .find_map(|p| {
@@ -743,6 +830,8 @@ impl Editor<'_> {
             document,
             camera: self.camera,
             cache: self.cache,
+            grid: self.grid,
+            deadline: self.deadline.clone(),
         }
     }
 
@@ -759,13 +848,15 @@ impl Editor<'_> {
         })
     }
 
-    /// Where vertex `id` should be when the cursor is at `to`, given that
-    /// `from` was valid: the cursor itself if the move is allowed (the mesh
+    /// Where vertex `id` should be when the cursor is at `to`: the cursor itself if the move is allowed (the mesh
     /// rearranges itself around the vertex where needed), otherwise the
     /// closest allowed point, sliding along the edges around the vertex.
     /// That's the last resort, e.g. when a triangle would be swept over an
     /// unconnected part of the drawing.
-    fn limit_move(&self, id: VertexId, from: Point, to: Point) -> Point {
+    ///
+    /// Returns the position and what releasing there would do; `None` if no
+    /// valid position was found (in time).
+    fn limit_move(&self, id: VertexId, to: Point) -> Option<(Point, Pending)> {
         let camera = self.camera;
         let origin = camera.to_screen(self.document.vertex(id));
 
@@ -783,14 +874,13 @@ impl Editor<'_> {
             })
             .collect();
 
-        self.closest_valid(&lines, from, to, |p| {
+        self.closest_valid(&lines, to, |p| {
             self.pending(Interaction::MovingVertex { id, to: p })
-                .is_some()
         })
     }
 
     /// Where the new corner of an extension from edge `a`–`b` should be when
-    /// the cursor is at `to`, given that `from` was valid. Into a triangle,
+    /// the cursor is at `to`. Into a triangle,
     /// the new vertex is limited like any dragged vertex; on an empty side it
     /// slides along the geometry a new triangle would overlap.
     fn limit_extend(
@@ -798,9 +888,8 @@ impl Editor<'_> {
         a: VertexId,
         b: VertexId,
         start: Point,
-        from: Point,
         to: Point,
-    ) -> Point {
+    ) -> Option<(Point, Option<Pending>)> {
         let camera = self.camera;
         let (pa, pb) = (
             camera.to_screen(self.document.vertex(a)),
@@ -811,47 +900,47 @@ impl Editor<'_> {
         // On the source edge the drag reads as cancelled, so don't hold the
         // corner back there.
         if closest_on_segment(cursor, pa, pb).1 <= EDGE_HIT {
-            return to;
+            return Some((to, None));
         }
 
         let lines: Vec<Line> = match self.triangle_beside(a, b, to) {
             // Splitting, then moving the new vertex.
             Some(triangle) => {
-                return match self.split_from_edge(a, b, start, triangle) {
-                    Some((_, document, id)) => {
-                        self.with_document(&document).limit_move(id, from, to)
-                    }
+                let apex = match self.split_from_edge(a, b, start, triangle) {
+                    Some((_, document, id)) => self.with_document(&document).limit_move(id, to)?.0,
                     None => to,
                 };
+                let pending = self.pending(Interaction::Extending { a, b, start, apex })?;
+                return Some((apex, Some(pending)));
             }
             // New triangle: the fill bends around other geometry rather than
             // leaving slivers, so just stay clear of the source edge.
             None => vec![offset_line(pa, pb, cursor, SLIDE_INSET)],
         };
 
-        self.closest_valid(&lines, from, to, |p| {
+        self.closest_valid(&lines, to, |p| {
             self.pending(Interaction::Extending {
                 a,
                 b,
                 start,
                 apex: p,
             })
-            .is_some()
         })
+        .map(|(p, pending)| (p, Some(pending)))
     }
 
     /// The valid position closest to the cursor at `to` (world): the cursor
     /// itself, its projection onto one of `lines` (sliding along a limit) or
-    /// where two of them cross (stuck in a corner). Falls back to `from`.
+    /// where two of them cross (stuck in a corner), with what `evaluate`
+    /// says releasing there does. `None` if there's none (in time).
     fn closest_valid(
         &self,
         lines: &[Line],
-        from: Point,
         to: Point,
-        valid: impl Fn(Point) -> bool,
-    ) -> Point {
-        if valid(to) {
-            return to;
+        evaluate: impl Fn(Point) -> Option<Pending>,
+    ) -> Option<(Point, Pending)> {
+        if let Some(pending) = evaluate(to) {
+            return Some((to, pending));
         }
 
         let camera = self.camera;
@@ -873,15 +962,11 @@ impl Editor<'_> {
 
         candidates
             .into_iter()
-            .map(|(p, _)| p)
-            .find(|&p| valid(p))
-            .unwrap_or(from)
+            .take_while(|_| !self.out_of_time())
+            .find_map(|(p, _)| evaluate(p).map(|pending| (p, pending)))
     }
 
     fn draw_document(&self, frame: &mut Frame, document: &Document) {
-        frame.fill_rectangle(Point::ORIGIN, frame.size(), BACKGROUND);
-        draw_grid(frame, self.camera);
-
         let mesh = self.mesh(document.triangles());
         frame.fill(&mesh, FILL);
         frame.stroke(&mesh, stroke(EDGE, 1.5));
@@ -903,7 +988,6 @@ impl Editor<'_> {
             result, changes, ..
         } = pending;
         let before = self.document;
-        let kept = |v| changes.kept(v);
         let screen = |v| self.camera.to_screen(result.vertex(v));
         let segments = |edges: &[(VertexId, VertexId)]| {
             Path::new(|p| {
@@ -914,8 +998,7 @@ impl Editor<'_> {
             })
         };
 
-        let added =
-            self.mesh(new_triangles(before, result, &kept).map(|t| t.map(|v| result.vertex(v))));
+        let added = self.mesh(pending.added.iter().map(|t| t.map(|v| result.vertex(v))));
         frame.fill(&added, Color { a: 0.2, ..ADDED });
         frame.stroke(&added, stroke(ADDED, 1.5));
 
@@ -940,26 +1023,41 @@ impl Editor<'_> {
         }
     }
 
-    /// Highlights a `shape` (its triangles): a faint tint, and its
-    /// outline with a soft glow. `strength` (0 to 1) fades it.
-    fn draw_shape(
-        &self,
-        frame: &mut Frame,
-        document: &Document,
-        shape: &[[VertexId; 3]],
-        strength: f32,
-    ) {
+    /// The shape `start` belongs to, to highlight.
+    fn highlight(&self, start: VertexId) -> Highlight {
+        let mut triangles = self.document.connected(start);
+        for t in &mut triangles {
+            t.sort_unstable();
+        }
+        triangles.sort_unstable();
+        Highlight {
+            revision: self.document.revision(),
+            start,
+            outline: outline_of(&triangles),
+            triangles,
+        }
+    }
+
+    /// Highlights a `shape` (with its vertices where `document` has them):
+    /// a faint tint, and its outline with a soft glow. `strength` (0 to 1)
+    /// fades it.
+    fn draw_shape(&self, frame: &mut Frame, document: &Document, shape: &Highlight, strength: f32) {
         if strength <= 0.0 {
             return;
         }
         let screen = |v| self.camera.to_screen(document.vertex(v));
         let edges = Path::new(|p| {
-            for (u, v) in outline_of(shape) {
+            for &(u, v) in &shape.outline {
                 p.move_to(screen(u));
                 p.line_to(screen(v));
             }
         });
-        let tint = self.mesh(shape.iter().map(|t| t.map(|v| document.vertex(v))));
+        let tint = self.mesh(
+            shape
+                .triangles
+                .iter()
+                .map(|t| t.map(|v| document.vertex(v))),
+        );
         let faded = |a: f32| Color {
             a: a * strength,
             ..HOVER
@@ -1259,6 +1357,8 @@ mod tests {
             document: doc,
             camera: Camera::default(),
             cache,
+            grid: cache,
+            deadline: Cell::new(None),
         }
     }
 
@@ -1357,21 +1457,32 @@ mod tests {
         let editor = editor(&doc, &cache);
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
         let mut state = State::default();
-        let hover = |state: &mut State, x, y| {
+        let hover = |editor: &Editor, state: &mut State, x, y| {
             let cursor = mouse::Cursor::Available(Point::new(x, y));
             editor.update(state, &Event::Mouse(MOVE), bounds, cursor);
-            state.shape.map(|v| doc.connected(v))
+            state.shape.as_ref().map(|shape| shape.triangles.clone())
         };
+        let shape = |v| Some(editor.highlight(v).triangles);
 
-        let left = hover(&mut state, 150.0, 270.0);
-        assert_eq!(left, Some(doc.connected(0)));
+        let left = hover(&editor, &mut state, 150.0, 270.0);
+        assert_eq!(left, shape(0));
         state.fading = None;
-        assert_eq!(hover(&mut state, 600.0, 500.0), left); // blank canvas
-        assert_eq!(hover(&mut state, 100.0, 300.0), left); // another corner
+        assert_eq!(hover(&editor, &mut state, 600.0, 500.0), left); // blank canvas
+        assert_eq!(hover(&editor, &mut state, 100.0, 300.0), left); // another corner
         assert!(state.fading.is_none(), "same shape: no fade");
 
-        assert_eq!(hover(&mut state, 300.0, 270.0), Some(doc.connected(3)));
+        assert_eq!(hover(&editor, &mut state, 300.0, 270.0), shape(3));
         assert!(matches!(state.fading, Some((Some(_), _))), "fades over");
+
+        // After an edit joining the two, the highlight follows (once).
+        let mut joined = doc.clone();
+        joined.apply(Edit::MoveVertex {
+            id: 1,
+            to: doc.vertex(3),
+        });
+        let editor = super::tests::editor(&joined, &cache);
+        let triangles = hover(&editor, &mut state, 600.0, 500.0).unwrap();
+        assert_eq!(triangles.len(), 2);
     }
 
     #[test]
@@ -1542,10 +1653,10 @@ mod tests {
 
         for x in (0..16).map(|i| i as f32 * 50.0) {
             for y in (0..12).map(|i| i as f32 * 50.0) {
-                let to = editor.limit_move(0, centre, Point::new(x, y));
-                let pending = editor
-                    .pending(Interaction::MovingVertex { id: 0, to })
-                    .expect("limited position is valid");
+                // Without a valid position the vertex stays where it was.
+                let Some((_, pending)) = editor.limit_move(0, Point::new(x, y)) else {
+                    continue;
+                };
 
                 for t in pending
                     .result
@@ -1683,6 +1794,117 @@ mod tests {
             );
             assert!(result.edges().any(|e| e == (4, 3) || e == (3, 4)));
             assert!((area(result) - area(&doc)).abs() < 0.5);
+        }
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant as T;
+
+    fn grid(n: usize, size: f32) -> Document {
+        let mut doc = Document::default();
+        let p = |i: usize, j: usize| Point::new(50.0 + i as f32 * size, 50.0 + j as f32 * size);
+        for i in 0..n - 1 {
+            for j in 0..n - 1 {
+                for corners in [
+                    [p(i, j), p(i + 1, j), p(i, j + 1)],
+                    [p(i + 1, j), p(i + 1, j + 1), p(i, j + 1)],
+                ] {
+                    doc.apply(Edit::AddTriangle { corners, snap: 0.0 });
+                }
+            }
+        }
+        doc
+    }
+
+    fn time<R>(label: &str, runs: u32, mut f: impl FnMut() -> R) {
+        let start = T::now();
+        for _ in 0..runs {
+            std::hint::black_box(f());
+        }
+        println!("BENCH {label}: {:?}", start.elapsed() / runs);
+    }
+
+    /// Times one mouse move's worth of work (as `update` does it) on a
+    /// 10×10 grid, at normal zoom and zoomed far out, without and with the
+    /// time budget. Run with `cargo test bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_editor() {
+        let doc = grid(10, 40.0);
+        let cache = canvas::Cache::new();
+        let at = |x: f32, y: f32| {
+            doc.unique_vertices()
+                .into_iter()
+                .find(|&v| doc.vertex(v) == Point::new(x, y))
+                .unwrap()
+        };
+        let centre = at(210.0, 210.0);
+        let corner = at(410.0, 410.0);
+        let (a, b) = doc
+            .unique_edges()
+            .into_iter()
+            .find(|&(u, v)| doc.vertex(u).x == 410.0 && doc.vertex(v).x == 410.0)
+            .unwrap();
+        let start = doc.vertex(a);
+
+        for (label, zoom) in [("near", 1.0), ("far", 0.1)] {
+            for budget in [None, Some(BUDGET)] {
+                let editor = Editor {
+                    document: &doc,
+                    camera: Camera {
+                        zoom,
+                        ..Camera::default()
+                    },
+                    cache: &cache,
+                    grid: &cache,
+                    deadline: Cell::new(None),
+                };
+                let run = |f: &dyn Fn(&Editor)| {
+                    editor
+                        .deadline
+                        .set(budget.map(|budget| std::time::Instant::now() + budget));
+                    f(&editor);
+                };
+                let label = format!(
+                    "{label} {}",
+                    if budget.is_some() {
+                        "budget"
+                    } else {
+                        "unbounded"
+                    }
+                );
+                let far = zoom < 1.0;
+                let scale = if far { 10.0 } else { 1.0 };
+
+                time(&format!("{label}: small move"), 5, || {
+                    run(&|e| {
+                        e.limit_move(centre, Point::new(215.0, 205.0));
+                    })
+                });
+                time(&format!("{label}: blocked move"), 3, || {
+                    run(&|e| {
+                        e.limit_move(centre, Point::new(600.0 * scale, 600.0 * scale));
+                    })
+                });
+                time(&format!("{label}: corner outward"), 5, || {
+                    run(&|e| {
+                        e.limit_move(corner, Point::new(450.0, 450.0));
+                    })
+                });
+                time(&format!("{label}: extend over crowded"), 3, || {
+                    run(&|e| {
+                        e.limit_extend(
+                            a,
+                            b,
+                            start,
+                            Point::new(470.0 * scale.sqrt(), 600.0 * scale.sqrt()),
+                        );
+                    })
+                });
+            }
         }
     }
 }

@@ -26,7 +26,10 @@ struct Tessera {
     document: Document,
     /// View state, independent of the data.
     camera: Camera,
+    /// The drawn document; cleared when it or the camera changes.
     cache: canvas::Cache,
+    /// The drawn background grid; cleared when the camera changes.
+    grid: canvas::Cache,
     status: String,
 }
 
@@ -43,6 +46,8 @@ impl Tessera {
         match message {
             Message::Editor(editor::Message::Edit(edits)) => {
                 self.document.apply_all(&edits);
+                self.cache.clear();
+                return Task::none();
             }
             Message::Editor(editor::Message::Pan(delta)) => {
                 self.camera.pan += delta;
@@ -70,8 +75,9 @@ impl Tessera {
             }
         }
 
-        // Everything above either edits the document or moves the camera.
+        // Everything else above moves the camera.
         self.cache.clear();
+        self.grid.clear();
         Task::none()
     }
 
@@ -110,7 +116,8 @@ impl Tessera {
         column![
             container(toolbar).width(Fill).style(container::dark),
             stack![
-                editor::view(&self.document, self.camera, &self.cache).map(Message::Editor),
+                editor::view(&self.document, self.camera, &self.cache, &self.grid)
+                    .map(Message::Editor),
                 container(stats)
                     .align_right(Fill)
                     .align_bottom(Fill)
