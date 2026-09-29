@@ -3,7 +3,7 @@
 
 use iced::Point;
 
-use super::{Document, VertexId, is_flat};
+use super::{Changes, Document, VertexId, is_flat};
 use crate::geometry::{area2, closest_on_segment, min_height};
 
 /// Distance (world units) within which points count as coinciding, or as
@@ -30,7 +30,10 @@ impl Document {
     /// the shortest edges that stay in the uncovered part and cross nothing,
     /// which divides that part into triangles. Returns `false` if nothing is
     /// left to cover.
-    pub(super) fn fill(&mut self, corners: [Point; 3], snap: f32) -> bool {
+    ///
+    /// Records the existing vertices the new triangles attach to in
+    /// `changes`.
+    pub(super) fn fill(&mut self, corners: [Point; 3], snap: f32, changes: &mut Changes) -> bool {
         /// How often to bend the outline again to get rid of thin pieces.
         const MAX_ROUNDS: usize = 8;
 
@@ -63,11 +66,11 @@ impl Document {
         for _ in 0..MAX_ROUNDS {
             let outline = bent(triangle, &through, |id| self.vertices[id], snap);
             let mut next = self.clone();
-            if !next.fill_outline(corners, &outline) {
+            let Some(attached) = next.fill_outline(corners, &outline) else {
                 break;
-            }
+            };
             let thin = next.thin_piece(self, snap, &outline);
-            filled = Some(next);
+            filled = Some((next, attached));
             match thin {
                 Some(id) => through.push(id),
                 None => break,
@@ -75,8 +78,9 @@ impl Document {
         }
 
         match filled {
-            Some(next) => {
+            Some((next, attached)) => {
                 *self = next;
+                changes.attached.extend(attached);
                 true
             }
             None => false,
@@ -103,7 +107,10 @@ impl Document {
 
     /// Covers the part of the polygon `outline` that no triangle covers yet;
     /// see [`Self::fill`]. New vertices at `corners` get the lowest ids.
-    fn fill_outline(&mut self, corners: [Point; 3], outline: &[Point]) -> bool {
+    ///
+    /// Returns the existing vertices the new triangles attach to, or `None`
+    /// if nothing is left to cover.
+    fn fill_outline(&mut self, corners: [Point; 3], outline: &[Point]) -> Option<Vec<VertexId>> {
         let used = self.unique_vertices();
         let sides: Vec<(Point, Point)> = (0..outline.len())
             .map(|i| (outline[i], outline[(i + 1) % outline.len()]))
@@ -214,10 +221,18 @@ impl Document {
         }
 
         if faces.is_empty() {
-            return false;
+            return None;
         }
         // New corners in the middle of existing edges are joined up when
         // the document is normalized.
+
+        let mut attached: Vec<VertexId> = faces
+            .iter()
+            .flatten()
+            .filter_map(|&n| candidates[n].vertex)
+            .collect();
+        attached.sort_unstable();
+        attached.dedup();
 
         let mut ids: Vec<Option<VertexId>> = candidates.iter().map(|c| c.vertex).collect();
         for face in faces {
@@ -229,7 +244,7 @@ impl Document {
             });
             self.push_triangle(face);
         }
-        true
+        Some(attached)
     }
 }
 

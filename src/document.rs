@@ -62,6 +62,8 @@ pub struct Changes {
     pub cut: Vec<(VertexId, VertexId, VertexId)>,
     /// Triangles dropped because they became flat.
     pub squashed: Vec<[VertexId; 3]>,
+    /// Existing vertices that added triangles attach to.
+    pub attached: Vec<VertexId>,
 }
 
 impl Changes {
@@ -99,6 +101,26 @@ impl Document {
     /// Vertices used by at least one triangle (with repeats).
     pub fn used_vertices(&self) -> impl Iterator<Item = VertexId> + '_ {
         self.triangles.iter().flatten().copied()
+    }
+
+    /// The triangles of the shape `vertex` belongs to: all those reachable
+    /// through shared vertices.
+    pub fn connected(&self, vertex: VertexId) -> Vec<[VertexId; 3]> {
+        let mut reached = vec![vertex];
+        let mut shape: Vec<[VertexId; 3]> = Vec::new();
+        let mut grew = true;
+
+        while grew {
+            grew = false;
+            for t in &self.triangles {
+                if !shape.contains(t) && t.iter().any(|v| reached.contains(v)) {
+                    shape.push(*t);
+                    reached.extend(t);
+                    grew = true;
+                }
+            }
+        }
+        shape
     }
 
     /// All edges, as vertex id pairs. Shared edges appear once per triangle.
@@ -198,7 +220,7 @@ impl Document {
                 Edit::MoveVertex { id, .. } => Some(id),
                 _ => None,
             };
-            let valid = next.apply_unchecked(edit)
+            let valid = next.apply_unchecked(edit, &mut changes)
                 && next.normalize(moved, &mut changes)
                 && next.is_valid_after(&document);
             if !valid {
@@ -210,9 +232,9 @@ impl Document {
         Some((document, changes))
     }
 
-    fn apply_unchecked(&mut self, edit: Edit) -> bool {
+    fn apply_unchecked(&mut self, edit: Edit, changes: &mut Changes) -> bool {
         match edit {
-            Edit::AddTriangle { corners, snap } => self.fill(corners, snap),
+            Edit::AddTriangle { corners, snap } => self.fill(corners, snap, changes),
             Edit::InsertVertex { at } => self.insert_vertex(at),
             Edit::RemoveTriangle { triangle } => {
                 triangle < self.triangles.len() && {
@@ -1116,7 +1138,7 @@ mod fuzz {
 
                 let started = std::time::Instant::now();
                 let mut unchecked = doc.clone();
-                if !unchecked.apply_unchecked(edit) {
+                if !unchecked.apply_unchecked(edit, &mut Changes::default()) {
                     empty += 1;
                 } else if doc.apply(edit) {
                     ok += 1;

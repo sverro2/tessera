@@ -11,9 +11,11 @@
 
 use iced::keyboard;
 use iced::mouse;
+use iced::time::{Duration, Instant};
 use iced::widget::canvas::{
     self, Canvas, Event, Frame, Geometry, LineCap, LineDash, LineJoin, Path, Stroke,
 };
+use iced::window;
 use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Theme, Vector};
 
 use crate::camera::Camera;
@@ -27,12 +29,11 @@ const EDGE_HIT: f32 = 7.0;
 /// Minimum height (screen px) of any triangle we create; thinner slivers
 /// would be invisible and impossible to grab.
 const MIN_THICKNESS: f32 = 5.0;
-/// A triangle whose height is below this fraction of its longest side is
-/// considered flat.
-const FLAT_RATIO: f32 = 0.02;
 /// How far (screen px) inside a limiting edge a dragged vertex stops: just
 /// clear of making its triangle with that edge a sliver.
 const SLIDE_INSET: f32 = MIN_THICKNESS + 0.5;
+/// How long the shape highlight takes to move over to another shape.
+const SHAPE_FADE: Duration = Duration::from_millis(200);
 /// World-space spacing of the background dot grid.
 const GRID: f32 = 50.0;
 /// Rotation per wheel notch with Shift held.
@@ -45,12 +46,14 @@ const BACKGROUND: Color = Color::from_rgb8(0x1a, 0x1b, 0x26);
 const GRID_DOT: Color = Color::from_rgb8(0x2f, 0x33, 0x4d);
 const FILL: Color = Color::from_rgba8(0x7a, 0xa2, 0xf7, 0.35);
 const EDGE: Color = Color::from_rgb8(0xc0, 0xca, 0xf5);
+/// Washed over the shapes other than the highlighted one.
+const UNFOCUSED: Color = Color::from_rgb8(0x3b, 0x3e, 0x4f);
 /// What an action would add (and the cursor that creates triangles).
 const ADDED: Color = Color::from_rgb8(0x9e, 0xce, 0x6a);
 /// What an action would remove.
 const REMOVED: Color = Color::from_rgb8(0xf7, 0x76, 0x8e);
 /// Where an action joins things up: edges that become shared, vertices
-/// welded together.
+/// welded together (and the cursor, when it lands on such a join).
 const JOINED: Color = Color::from_rgb8(0xe0, 0xaf, 0x68);
 /// The hovered vertex or edge.
 const HOVER: Color = Color::from_rgb8(0x7d, 0xcf, 0xff);
@@ -97,6 +100,11 @@ pub struct State {
     interaction: Interaction,
     /// The wheel event doesn't carry these, so keep track of them.
     modifiers: keyboard::Modifiers,
+    /// A vertex of the shape last hovered: it stays highlighted until
+    /// another shape is hovered, so it doesn't flicker on and off.
+    shape: Option<VertexId>,
+    /// The shape highlighted before (if any), fading out since when.
+    fading: Option<(Option<VertexId>, Instant)>,
 }
 
 /// An in-progress drag. Positions are in world coordinates.
@@ -227,6 +235,20 @@ impl canvas::Program<Message> for Editor<'_> {
 
                 match &mut state.interaction {
                     Interaction::Idle => {
+                        if let Some(hover) = self.hit_test(pos) {
+                            let vertex = self.hover_vertex(hover);
+                            let same = state.shape.is_some_and(|shape| {
+                                self.document
+                                    .connected(shape)
+                                    .iter()
+                                    .flatten()
+                                    .any(|&v| v == vertex)
+                            });
+                            if !same {
+                                state.fading = Some((state.shape, Instant::now()));
+                            }
+                            state.shape = Some(vertex);
+                        }
                         return Some(canvas::Action::request_redraw());
                     }
                     Interaction::Panning { last } => {
@@ -283,6 +305,14 @@ impl canvas::Program<Message> for Editor<'_> {
                 Some(canvas::Action::publish(Message::Zoom { anchor, factor }).and_capture())
             }
             Event::Mouse(mouse::Event::CursorLeft) => Some(canvas::Action::request_redraw()),
+            // Keep drawing frames while the shape highlight moves over.
+            Event::Window(window::Event::RedrawRequested(now)) => {
+                let (_, since) = state.fading?;
+                if now.duration_since(since) >= SHAPE_FADE {
+                    state.fading = None;
+                }
+                Some(canvas::Action::request_redraw())
+            }
             _ => None,
         }
     }
@@ -299,16 +329,16 @@ impl canvas::Program<Message> for Editor<'_> {
 
         // While dragging, draw the document as it will be after release.
         let pending = self.pending(state.interaction);
+        // Extending always shares its source edge; that's no news.
+        let source = match state.interaction {
+            Interaction::Extending { a, b, .. } => Some((a, b)),
+            _ => None,
+        };
 
         let content = match &pending {
             Some(pending) => {
                 let mut frame = Frame::new(renderer, bounds.size());
                 self.draw_document(&mut frame, &pending.result);
-                // Extending always shares its source edge; that's no news.
-                let source = match state.interaction {
-                    Interaction::Extending { a, b, .. } => Some((a, b)),
-                    _ => None,
-                };
                 self.draw_changes(&mut frame, pending, source);
                 frame.into_geometry()
             }
@@ -321,14 +351,82 @@ impl canvas::Program<Message> for Editor<'_> {
         draw_compass(&mut overlay, camera);
         let cursor_pos = cursor.position_in(bounds);
 
+        let hover = cursor_pos.and_then(|p| self.hit_test(p));
+
+        // The outline of the shape last hovered, so it's clear what hangs
+        // together and what is loose. While dragging, as it will be after
+        // release (grown, if the edit joins it to another shape). Moving
+        // over to another shape, the old outline fades out as the new one
+        // fades in.
+        let (document, kept): (&Document, &dyn Fn(VertexId) -> VertexId) = match &pending {
+            Some(pending) => (&pending.result, &|v| pending.changes.kept(v)),
+            None => (self.document, &|v| v),
+        };
+        let shown = match state.fading {
+            Some((_, since)) => {
+                let t = (since.elapsed().as_secs_f32() / SHAPE_FADE.as_secs_f32()).min(1.0);
+                1.0 - (1.0 - t).powi(2)
+            }
+            None => 1.0,
+        };
+        let previous = state.fading.and_then(|(previous, _)| previous);
+        let highlighted = [(previous, 1.0 - shown), (state.shape, shown)]
+            .map(|(start, strength)| (start.map(|v| document.connected(kept(v))), strength));
+
+        // Everything else is grayed out, so the highlighted shape stands
+        // apart. What the pending edit adds never is.
+        if state.shape.is_some() {
+            let added: Vec<[VertexId; 3]> = match &pending {
+                Some(pending) => {
+                    let kept = |v| pending.changes.kept(v);
+                    new_triangles(self.document, &pending.result, &kept).collect()
+                }
+                None => Vec::new(),
+            };
+            let mut dimmed: Vec<(f32, Vec<[Point; 3]>)> = Vec::new();
+            for t in document
+                .triangle_ids()
+                .iter()
+                .filter(|t| !added.contains(t))
+            {
+                let lit: f32 = highlighted
+                    .iter()
+                    .filter(|(shape, _)| shape.as_ref().is_some_and(|s| s.contains(t)))
+                    .map(|(_, strength)| strength)
+                    .sum();
+                let dim = (1.0 - lit).clamp(0.0, 1.0);
+                let corners = t.map(|v| document.vertex(v));
+                match dimmed.iter_mut().find(|(d, _)| *d == dim) {
+                    Some((_, group)) => group.push(corners),
+                    None => dimmed.push((dim, vec![corners])),
+                }
+            }
+            for (dim, triangles) in dimmed {
+                if dim > 0.0 {
+                    let wash = self.mesh(triangles.into_iter());
+                    let gray = Color {
+                        a: 0.55 * dim,
+                        ..UNFOCUSED
+                    };
+                    overlay.fill(&wash, gray);
+                    overlay.stroke(&wash, stroke(gray, 1.5));
+                }
+            }
+        }
+
+        for (shape, strength) in &highlighted {
+            if let Some(shape) = shape {
+                self.draw_shape(&mut overlay, document, shape, *strength);
+            }
+        }
+
         match (state.interaction, &pending) {
-            (Interaction::Idle, _) => match cursor_pos.map(|p| (p, self.hit_test(p))) {
+            (Interaction::Idle, _) => match cursor_pos.map(|p| (p, hover)) {
                 Some((_, Some(Hover::Vertex(id)))) => {
-                    handle(
-                        &mut overlay,
-                        camera.to_screen(self.document.vertex(id)),
-                        HOVER,
-                    );
+                    // A ring as well, to stand out against the shape outline.
+                    let at = camera.to_screen(self.document.vertex(id));
+                    overlay.stroke(&Path::circle(at, 11.0), stroke(HOVER, 2.5));
+                    handle(&mut overlay, at, HOVER);
                 }
                 Some((_, Some(Hover::Edge { a, b, at }))) => {
                     let a = camera.to_screen(self.document.vertex(a));
@@ -371,8 +469,20 @@ impl canvas::Program<Message> for Editor<'_> {
                     );
                 }
 
-                let removes = !pending.changes.squashed.is_empty();
-                handle(&mut overlay, at, if removes { REMOVED } else { ADDED });
+                // Landing on a join (a weld, or cutting into an edge) shows
+                // as that, even if it squashes something on the way.
+                let (_, rings) = self.joins(pending, source);
+                let joins = rings
+                    .iter()
+                    .any(|&v| camera.to_screen(pending.result.vertex(v)).distance(at) < 1.0);
+                let color = if joins {
+                    JOINED
+                } else if !pending.changes.squashed.is_empty() {
+                    REMOVED
+                } else {
+                    ADDED
+                };
+                handle(&mut overlay, at, color);
             }
             // Releasing now would do nothing.
             (_, None) => {
@@ -411,6 +521,14 @@ impl Editor<'_> {
                 .document
                 .triangle_at(self.camera.to_world(screen))
                 .map(Hover::Face),
+        }
+    }
+
+    /// A vertex of what `hover` is over, to find its shape by.
+    fn hover_vertex(&self, hover: Hover) -> VertexId {
+        match hover {
+            Hover::Vertex(id) | Hover::Edge { a: id, .. } => id,
+            Hover::Face(t) => self.document.triangle_ids()[t][0],
         }
     }
 
@@ -767,52 +885,6 @@ impl Editor<'_> {
         let mesh = self.mesh(document.triangles());
         frame.fill(&mesh, FILL);
         frame.stroke(&mesh, stroke(EDGE, 1.5));
-
-        // Existing triangles that have become (almost) flat are easy to miss,
-        // yet they block moves that would fold them; show them as dashed red.
-        let flat = Path::new(|p| {
-            for t in document.triangles() {
-                let t = t.map(|v| self.camera.to_screen(v));
-                let (from, to) = longest_edge(t);
-                if min_height(t) < FLAT_RATIO * from.distance(to) {
-                    p.move_to(from);
-                    p.line_to(to);
-                }
-            }
-        });
-        frame.stroke(
-            &flat,
-            Stroke {
-                line_dash: LineDash {
-                    segments: &[6.0, 4.0],
-                    offset: 0,
-                },
-                ..stroke(REMOVED, 2.0)
-            },
-        );
-
-        // Edges lying (partly) on top of each other mean the mesh isn't
-        // joined up properly there; show the overlapping stretches in red.
-        let edges: Vec<(Point, Point)> = document
-            .unique_edges()
-            .into_iter()
-            .map(|(u, v)| {
-                let screen = |v| self.camera.to_screen(document.vertex(v));
-                (screen(u), screen(v))
-            })
-            .collect();
-
-        let overlapping = Path::new(|p| {
-            for (i, &first) in edges.iter().enumerate() {
-                for &second in &edges[i + 1..] {
-                    if let Some((from, to)) = collinear_overlap(first, second) {
-                        p.move_to(from);
-                        p.line_to(to);
-                    }
-                }
-            }
-        });
-        frame.stroke(&overlapping, stroke(REMOVED, 3.0));
     }
 
     /// Highlights how the pending result differs from the current document:
@@ -832,10 +904,6 @@ impl Editor<'_> {
         } = pending;
         let before = self.document;
         let kept = |v| changes.kept(v);
-        let key = |(u, v): (VertexId, VertexId)| {
-            let (u, v) = (kept(u), kept(v));
-            (u.min(v), u.max(v))
-        };
         let screen = |v| self.camera.to_screen(result.vertex(v));
         let segments = |edges: &[(VertexId, VertexId)]| {
             Path::new(|p| {
@@ -865,7 +933,61 @@ impl Editor<'_> {
         });
         frame.stroke(&squashed, stroke(REMOVED, 3.0));
 
-        // Joins.
+        let (joined, rings) = self.joins(pending, source);
+        frame.stroke(&segments(&joined), stroke(JOINED, 4.0));
+        for v in rings {
+            frame.stroke(&Path::circle(screen(v), 10.0), stroke(JOINED, 2.5));
+        }
+    }
+
+    /// Highlights a `shape` (its triangles): a faint tint, and its
+    /// outline with a soft glow. `strength` (0 to 1) fades it.
+    fn draw_shape(
+        &self,
+        frame: &mut Frame,
+        document: &Document,
+        shape: &[[VertexId; 3]],
+        strength: f32,
+    ) {
+        if strength <= 0.0 {
+            return;
+        }
+        let screen = |v| self.camera.to_screen(document.vertex(v));
+        let edges = Path::new(|p| {
+            for (u, v) in outline_of(shape) {
+                p.move_to(screen(u));
+                p.line_to(screen(v));
+            }
+        });
+        let tint = self.mesh(shape.iter().map(|t| t.map(|v| document.vertex(v))));
+        let faded = |a: f32| Color {
+            a: a * strength,
+            ..HOVER
+        };
+
+        frame.fill(&tint, faded(0.08));
+        frame.stroke(&edges, stroke(faded(0.2), 8.0));
+        frame.stroke(&edges, stroke(faded(1.0), 2.0));
+    }
+
+    /// Where the pending result joins things up: outline edges that become
+    /// shared (other than `source`) or are cut where a vertex lands on
+    /// them, and the vertices that join, as ids after it.
+    fn joins(
+        &self,
+        pending: &Pending,
+        source: Option<(VertexId, VertexId)>,
+    ) -> (Vec<(VertexId, VertexId)>, Vec<VertexId>) {
+        let Pending {
+            result, changes, ..
+        } = pending;
+        let before = self.document;
+        let kept = |v| changes.kept(v);
+        let key = |(u, v): (VertexId, VertexId)| {
+            let (u, v) = (kept(u), kept(v));
+            (u.min(v), u.max(v))
+        };
+
         let outline_before: Vec<_> = outline(before).into_iter().map(key).collect();
         let interior_before: Vec<_> = interior(before).into_iter().map(key).collect();
         let source = source.map(key);
@@ -876,6 +998,15 @@ impl Editor<'_> {
             .collect();
         let mut rings: Vec<VertexId> = joined.iter().flat_map(|&(u, v)| [u, v]).collect();
         rings.extend(changes.welded.iter().map(|&(_, k)| kept(k)));
+        // Where added triangles attach to existing vertices; the ends of the
+        // source edge are no news.
+        rings.extend(
+            changes
+                .attached
+                .iter()
+                .map(|&v| kept(v))
+                .filter(|&v| source.is_none_or(|(a, b)| v != a && v != b)),
+        );
 
         // A vertex landing on an outline edge it wasn't connected to.
         let connected = |w, x| {
@@ -894,10 +1025,7 @@ impl Editor<'_> {
         rings.sort_unstable();
         rings.dedup();
 
-        frame.stroke(&segments(&joined), stroke(JOINED, 4.0));
-        for v in rings {
-            frame.stroke(&Path::circle(screen(v), 10.0), stroke(JOINED, 2.5));
-        }
+        (joined, rings)
     }
 
     fn mesh(&self, triangles: impl Iterator<Item = [Point; 3]>) -> Path {
@@ -924,28 +1052,6 @@ fn offset_line(a: Point, b: Point, towards: Point, offset: f32) -> Line {
         normal *= -1.0;
     }
     (a + normal * offset, dir)
-}
-
-/// Where two screen-space segments lie on top of each other (on the same
-/// line, within half a pixel, and overlapping by more than that).
-fn collinear_overlap((a, b): (Point, Point), (c, d): (Point, Point)) -> Option<(Point, Point)> {
-    const TOLERANCE: f32 = 0.5;
-
-    let length = a.distance(b);
-    if length < TOLERANCE {
-        return None;
-    }
-    let dir = (b - a) * (1.0 / length);
-
-    if cross(dir, c - a).abs() > TOLERANCE || cross(dir, d - a).abs() > TOLERANCE {
-        return None;
-    }
-
-    let (tc, td) = (dot(dir, c - a), dot(dir, d - a));
-    let from = tc.min(td).max(0.0);
-    let to = tc.max(td).min(length);
-
-    (to - from > TOLERANCE).then(|| (a + dir * from, a + dir * to))
 }
 
 fn longest_edge([a, b, c]: [Point; 3]) -> (Point, Point) {
@@ -1012,8 +1118,18 @@ fn removed_edges(before: &Document, pending: &Pending) -> Vec<(VertexId, VertexI
 
 /// Edges used by exactly `uses` triangles, as `(low, high)`.
 fn edges_used(document: &Document, uses: usize) -> Vec<(VertexId, VertexId)> {
-    let mut edges: Vec<_> = document
-        .edges()
+    edges_used_by(document.triangle_ids(), uses)
+}
+
+/// The outline of some `triangles`: edges used by one of them.
+fn outline_of(triangles: &[[VertexId; 3]]) -> Vec<(VertexId, VertexId)> {
+    edges_used_by(triangles, 1)
+}
+
+fn edges_used_by(triangles: &[[VertexId; 3]], uses: usize) -> Vec<(VertexId, VertexId)> {
+    let mut edges: Vec<_> = triangles
+        .iter()
+        .flat_map(|&[a, b, c]| [(a, b), (b, c), (c, a)])
         .map(|(u, v)| (u.min(v), u.max(v)))
         .collect();
     edges.sort_unstable();
@@ -1232,6 +1348,84 @@ mod tests {
         assert!(removed_edges(&doc, &pending).is_empty());
         let kept = |v| pending.changes.kept(v);
         assert_eq!(new_triangles(&doc, &pending.result, &kept).count(), 0);
+    }
+
+    #[test]
+    fn the_hovered_shape_stays_until_another_is_hovered() {
+        let doc = two_apart();
+        let cache = canvas::Cache::new();
+        let editor = editor(&doc, &cache);
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+        let mut state = State::default();
+        let hover = |state: &mut State, x, y| {
+            let cursor = mouse::Cursor::Available(Point::new(x, y));
+            editor.update(state, &Event::Mouse(MOVE), bounds, cursor);
+            state.shape.map(|v| doc.connected(v))
+        };
+
+        let left = hover(&mut state, 150.0, 270.0);
+        assert_eq!(left, Some(doc.connected(0)));
+        state.fading = None;
+        assert_eq!(hover(&mut state, 600.0, 500.0), left); // blank canvas
+        assert_eq!(hover(&mut state, 100.0, 300.0), left); // another corner
+        assert!(state.fading.is_none(), "same shape: no fade");
+
+        assert_eq!(hover(&mut state, 300.0, 270.0), Some(doc.connected(3)));
+        assert!(matches!(state.fading, Some((Some(_), _))), "fades over");
+    }
+
+    #[test]
+    fn a_shape_is_everything_connected_through_vertices() {
+        let mut doc = two_apart();
+        assert_eq!(doc.connected(0).len(), 1);
+        assert_eq!(outline_of(&doc.connected(0)).len(), 3);
+
+        // Welded tip to tip, the two triangles are one shape.
+        doc.apply(Edit::MoveVertex {
+            id: 1,
+            to: doc.vertex(3),
+        });
+        assert_eq!(doc.connected(0).len(), 2);
+        assert_eq!(outline_of(&doc.connected(0)).len(), 6);
+    }
+
+    #[test]
+    fn extending_onto_a_separate_corner_shows_as_a_join() {
+        let doc = two_apart();
+        let cache = canvas::Cache::new();
+        let editor = editor(&doc, &cache);
+
+        // From the right side 1–2 of the left triangle out to (near) the top
+        // corner 5 of the right one.
+        let pending = editor
+            .pending(Interaction::Extending {
+                a: 1,
+                b: 2,
+                start: Point::new(175.0, 250.0),
+                apex: Point::new(296.0, 204.0),
+            })
+            .unwrap();
+        assert_eq!(pending.at, doc.vertex(5));
+        let (_, rings) = editor.joins(&pending, Some((1, 2)));
+        assert_eq!(rings, [5]);
+    }
+
+    #[test]
+    fn welding_onto_a_neighbour_shows_as_a_join() {
+        let mut doc = one();
+        doc.apply(Edit::InsertVertex {
+            at: Point::new(200.0, 230.0),
+        });
+        let cache = canvas::Cache::new();
+        let editor = editor(&doc, &cache);
+
+        // The centre 3 onto corner 0: it squashes two triangles, but what
+        // it lands on is a weld.
+        let pending = editor.move_to(3, Point::new(104.0, 297.0)).unwrap();
+        assert!(!pending.changes.squashed.is_empty());
+        let (_, rings) = editor.joins(&pending, None);
+        assert_eq!(rings, [0]);
+        assert_eq!(pending.at, doc.vertex(0));
     }
 
     #[test]
