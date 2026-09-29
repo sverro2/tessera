@@ -13,6 +13,7 @@
 //!   folded over its neighbours,
 //! - no two triangles overlap.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use iced::Point;
@@ -28,13 +29,29 @@ pub type VertexId = usize;
 /// edits that remove triangles.
 pub type TriangleId = usize;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Document {
     vertices: Vec<Point>,
     triangles: Vec<[VertexId; 3]>,
-    /// Counts the edits applied, so views can tell when to redo what they
-    /// derived from it.
+    /// Changes with every edit, and differs between documents, so views
+    /// can tell when to redo what they derived from it.
     revision: u64,
+}
+
+impl Default for Document {
+    fn default() -> Self {
+        Document {
+            vertices: Vec::new(),
+            triangles: Vec::new(),
+            revision: next_revision(),
+        }
+    }
+}
+
+/// A revision number no document has had yet.
+fn next_revision() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -82,7 +99,7 @@ impl Changes {
 }
 
 impl Document {
-    /// Changes with every applied edit.
+    /// Changes with every applied edit; also differs between documents.
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -174,6 +191,50 @@ impl Document {
         }))
     }
 
+    /// The vertices triangles use (renumbered from 0, in order) and the
+    /// triangles in terms of those: everything needed to rebuild the
+    /// document with [`Self::from_parts`].
+    pub fn to_parts(&self) -> (Vec<Point>, Vec<[usize; 3]>) {
+        let used = self.unique_vertices();
+        let index = |v| used.binary_search(&v).expect("used vertex");
+        let vertices = used.iter().map(|&v| self.vertices[v]).collect();
+        let triangles = self.triangles.iter().map(|t| t.map(index)).collect();
+        (vertices, triangles)
+    }
+
+    /// Rebuilds a document from [`Self::to_parts`], checking that it holds
+    /// together: finite points, corners that exist, positive winding (which
+    /// it restores), no flat or overlapping triangles.
+    pub fn from_parts(vertices: Vec<Point>, triangles: Vec<[usize; 3]>) -> Result<Self, String> {
+        if let Some(p) = vertices
+            .iter()
+            .find(|p| !p.x.is_finite() || !p.y.is_finite())
+        {
+            return Err(format!("vertex {p:?} is not a finite point"));
+        }
+        if let Some(t) = triangles
+            .iter()
+            .find(|t| t.iter().any(|&v| v >= vertices.len()))
+        {
+            return Err(format!("triangle {t:?} refers to a missing vertex"));
+        }
+
+        let mut document = Document {
+            vertices,
+            ..Document::default()
+        };
+        for t in triangles {
+            if is_flat(t.map(|v| document.vertices[v])) {
+                return Err(format!("triangle {t:?} is flat"));
+            }
+            document.push_triangle(t);
+        }
+        if !document.is_valid_after(&Document::default()) {
+            return Err("triangles overlap".to_string());
+        }
+        Ok(document)
+    }
+
     /// Applies an edit. Returns `false` (leaving the document unchanged) if
     /// the edit was rejected, e.g. because it would produce a degenerate,
     /// duplicate, folded-over or overlapping triangle.
@@ -212,7 +273,7 @@ impl Document {
         match self.preview(edits) {
             Some((next, _)) => {
                 *self = next;
-                self.revision += 1;
+                self.revision = next_revision();
                 true
             }
             None => false,

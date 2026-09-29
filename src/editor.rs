@@ -78,7 +78,12 @@ pub enum Message {
         angle: f32,
     },
     /// One user action, made of edits applied together (all or nothing).
-    Edit(Vec<Edit>),
+    Edit {
+        edits: Vec<Edit>,
+        /// The document revision they were worked out for; against another
+        /// (e.g. after an undo mid-drag) they may not make sense.
+        revision: u64,
+    },
 }
 
 pub fn view<'a>(
@@ -248,7 +253,8 @@ impl canvas::Program<Message> for Editor<'_> {
                 };
                 let edits = self.check(vec![edit], self.camera.to_world(pos))?.edits;
 
-                Some(canvas::Action::publish(Message::Edit(edits)).and_capture())
+                let revision = self.document.revision();
+                Some(canvas::Action::publish(Message::Edit { edits, revision }).and_capture())
             }
             Event::Mouse(mouse::Event::ButtonPressed(button)) => {
                 let pos = inside?;
@@ -345,7 +351,10 @@ impl canvas::Program<Message> for Editor<'_> {
                 // Exactly what was shown.
                 Some(
                     match pending {
-                        Some(pending) => canvas::Action::publish(Message::Edit(pending.edits)),
+                        Some(pending) => canvas::Action::publish(Message::Edit {
+                            edits: pending.edits,
+                            revision: self.document.revision(),
+                        }),
                         None => canvas::Action::request_redraw(),
                     }
                     .and_capture(),
@@ -441,15 +450,22 @@ impl canvas::Program<Message> for Editor<'_> {
             }
             None => 1.0,
         };
+        // A highlight from another document (just opened, say) is ignored
+        // until it's worked out again.
+        let current = |shape: &&Highlight| shape.revision == self.document.revision();
         let previous = state
             .fading
             .as_ref()
-            .and_then(|(previous, _)| previous.as_ref());
-        let highlighted = [(previous, 1.0 - shown), (state.shape.as_ref(), shown)];
+            .and_then(|(previous, _)| previous.as_ref())
+            .filter(current);
+        let highlighted = [
+            (previous, 1.0 - shown),
+            (state.shape.as_ref().filter(current), shown),
+        ];
 
         // Everything else is grayed out, so the highlighted shape stands
         // apart. What the pending edit adds never is.
-        if state.shape.is_some() {
+        if highlighted[1].0.is_some() {
             let added = pending.map_or(&[][..], |pending| &pending.added);
             let mut dimmed: Vec<(f32, Vec<[Point; 3]>)> = Vec::new();
             for t in document
@@ -1377,7 +1393,7 @@ mod tests {
         published
             .into_iter()
             .filter_map(|m| match m {
-                Message::Edit(edits) => Some(edits),
+                Message::Edit { edits, .. } => Some(edits),
                 _ => None,
             })
             .collect()

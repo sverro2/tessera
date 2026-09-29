@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 iced = { git = "https://github.com/iced-rs/iced", branch = "master", features = ["canvas", "tokio"] }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Geometry and rendering are far too slow unoptimised; keep our own code
 # quick to build but optimise it a little, and dependencies fully.
