@@ -46,3 +46,17 @@ pub fn closest_on_segment(p: Point, a: Point, b: Point) -> (Point, f32) {
     let closest = a + ab * t;
     (closest, closest.distance(p))
 }
+
+/// Closest point on the (infinite) line through `a` and `b` to `p`, and its
+/// distance.
+pub fn closest_on_line(p: Point, a: Point, b: Point) -> (Point, f32) {
+    let ab = b - a;
+    let len2 = ab.x * ab.x + ab.y * ab.y;
+    let t = if len2 == 0.0 {
+        0.0
+    } else {
+        ((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / len2
+    };
+    let closest = a + ab * t;
+    (closest, closest.distance(p))
+}

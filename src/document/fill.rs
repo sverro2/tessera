@@ -3,8 +3,8 @@
 
 use iced::Point;
 
-use super::{Corner, Document, VertexId, is_flat};
-use crate::geometry::area2;
+use super::{Document, VertexId, is_flat};
+use crate::geometry::{area2, closest_on_segment, min_height};
 
 /// Distance (world units) within which points count as coinciding, or as
 /// lying on a line.
@@ -20,32 +20,100 @@ struct Candidate {
 impl Document {
     /// Covers the part of the triangle `corners` that no triangle covers yet.
     ///
-    /// Its corners, the existing vertices inside it and the points where
-    /// existing edges cross its sides are joined greedily by the shortest
-    /// edges that stay in the uncovered part and cross nothing, which
-    /// divides that part into triangles. Returns `false` if nothing is left
-    /// to cover.
-    pub(super) fn fill(&mut self, corners: [Corner; 3]) -> bool {
-        let points = corners.map(|corner| match corner {
-            Corner::Existing(id) => self.vertices[id],
-            Corner::New(point) => point,
-        });
-        let [a, b, c] = points;
+    /// Things within `snap` of each other count as touching, so the fill
+    /// leaves no pieces thinner than that: each corner snaps onto an
+    /// existing vertex or edge nearby, and a side passing close to an
+    /// existing vertex is bent through it.
+    ///
+    /// The corners of that outline, the existing vertices inside it and the
+    /// points where existing edges cross its sides are joined greedily by
+    /// the shortest edges that stay in the uncovered part and cross nothing,
+    /// which divides that part into triangles. Returns `false` if nothing is
+    /// left to cover.
+    pub(super) fn fill(&mut self, corners: [Point; 3], snap: f32) -> bool {
+        /// How often to bend the outline again to get rid of thin pieces.
+        const MAX_ROUNDS: usize = 8;
+
+        let snap = snap.max(EPSILON);
+        let used = self.unique_vertices();
+        let corners = corners.map(|corner| self.snap_point(corner, snap, &used));
+        let [a, b, c] = corners;
         if area2(a, b, c).abs() < EPSILON {
             return false;
         }
-        let outline = if area2(a, b, c) > 0.0 {
+        let triangle = if area2(a, b, c) > 0.0 {
             [a, b, c]
         } else {
             [a, c, b]
         };
+
+        // The vertices the outline bends through: at first those close to a
+        // side, then any the fill would otherwise leave in a thin piece.
+        let mut through: Vec<VertexId> = used
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let p = self.vertices[id];
+                let (off, along) = nearest_side(triangle, p);
+                along > 0.0 && along < 1.0 && off > EPSILON && off <= snap
+            })
+            .collect();
+
+        let mut filled = None;
+        for _ in 0..MAX_ROUNDS {
+            let outline = bent(triangle, &through, |id| self.vertices[id], snap);
+            let mut next = self.clone();
+            if !next.fill_outline(corners, &outline) {
+                break;
+            }
+            let thin = next.thin_piece(self, snap, &outline);
+            filled = Some(next);
+            match thin {
+                Some(id) => through.push(id),
+                None => break,
+            }
+        }
+
+        match filled {
+            Some(next) => {
+                *self = next;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// An existing vertex of a new triangle thinner than `snap` (once edges
+    /// with new vertices on them are split, as normalizing will), which the
+    /// `outline` doesn't pass through yet: bending it through there avoids
+    /// that piece.
+    fn thin_piece(&self, before: &Document, snap: f32, outline: &[Point]) -> Option<VertexId> {
+        let mut after = self.clone();
+        after.split_t_junctions(&mut Default::default());
+        let used = before.unique_vertices();
+
+        after
+            .triangle_ids()
+            .iter()
+            .filter(|&&t| before.find_triangle(t).is_none())
+            .filter(|t| min_height(t.map(|v| after.vertices[v])) < snap)
+            .flat_map(|t| t.iter().copied())
+            .find(|v| used.contains(v) && !outline.contains(&after.vertices[*v]))
+    }
+
+    /// Covers the part of the polygon `outline` that no triangle covers yet;
+    /// see [`Self::fill`]. New vertices at `corners` get the lowest ids.
+    fn fill_outline(&mut self, corners: [Point; 3], outline: &[Point]) -> bool {
+        let used = self.unique_vertices();
+        let sides: Vec<(Point, Point)> = (0..outline.len())
+            .map(|i| (outline[i], outline[(i + 1) % outline.len()]))
+            .collect();
 
         let mesh: Vec<[Point; 3]> = self.triangles().collect();
         let mut edges: Vec<(Point, Point)> = self
             .edges()
             .map(|(u, v)| (self.vertices[u], self.vertices[v]))
             .collect();
-        let sides = [(a, b), (b, c), (c, a)];
 
         // Where the fill may put corners.
         let mut candidates: Vec<Candidate> = Vec::new();
@@ -60,16 +128,17 @@ impl Document {
             }
         };
 
-        for (corner, point) in corners.into_iter().zip(points) {
-            let vertex = match corner {
-                Corner::Existing(id) => Some(id),
-                Corner::New(_) => None,
-            };
-            add(Candidate { point, vertex });
+        // Corners on existing vertices pick those up below. New vertices
+        // are numbered in the order of `corners`.
+        for &point in corners.iter().chain(outline) {
+            add(Candidate {
+                point,
+                vertex: None,
+            });
         }
-        for id in self.used_vertices() {
+        for &id in &used {
             let point = self.vertices[id];
-            if inside_or_on(outline, point) {
+            if in_polygon(outline, point) {
                 add(Candidate {
                     point,
                     vertex: Some(id),
@@ -77,7 +146,7 @@ impl Document {
             }
         }
         for &(u, v) in &edges {
-            for (s, t) in sides {
+            for &(s, t) in &sides {
                 if let Some(point) = crossing(s, t, u, v) {
                     add(Candidate {
                         point,
@@ -87,10 +156,10 @@ impl Document {
             }
         }
 
-        // Nothing may cross the existing edges or the triangle's sides.
+        // Nothing may cross the existing edges or the outline.
         edges.extend(sides);
         let covered = |p: Point| mesh.iter().any(|&t| strictly_inside(t, p));
-        let in_gap = |p: Point| inside_or_on(outline, p) && !covered(p);
+        let in_gap = |p: Point| in_polygon(outline, p) && !covered(p);
 
         // All usable connections, shortest first.
         let mut connections: Vec<(f32, usize, usize)> = Vec::new();
@@ -147,6 +216,8 @@ impl Document {
         if faces.is_empty() {
             return false;
         }
+        // New corners in the middle of existing edges are joined up when
+        // the document is normalized.
 
         let mut ids: Vec<Option<VertexId>> = candidates.iter().map(|c| c.vertex).collect();
         for face in faces {
@@ -158,10 +229,110 @@ impl Document {
             });
             self.push_triangle(face);
         }
-
-        // New corners in the middle of existing edges split those triangles.
-        self.split_t_junctions()
+        true
     }
+}
+
+impl Document {
+    /// `point`, snapped onto the closest of the `used` vertices within
+    /// `snap`, else onto the closest edge within `snap`.
+    fn snap_point(&self, point: Point, snap: f32, used: &[VertexId]) -> Point {
+        let closest = |candidates: &mut dyn Iterator<Item = Point>| {
+            candidates
+                .map(|p| (p, p.distance(point)))
+                .filter(|&(_, d)| d <= snap)
+                .min_by(|x, y| x.1.total_cmp(&y.1))
+                .map(|(p, _)| p)
+        };
+
+        closest(&mut used.iter().map(|&v| self.vertices[v]))
+            .or_else(|| {
+                closest(
+                    &mut self.edges().map(|(u, v)| {
+                        closest_on_segment(point, self.vertices[u], self.vertices[v]).0
+                    }),
+                )
+            })
+            .unwrap_or(point)
+    }
+}
+
+/// The positively wound `triangle` as a polygon whose sides are bent
+/// through the vertices `through` (at `position`), each on the side it's
+/// nearest to. Vertices within `snap` of a corner are left out: the corner
+/// snapped onto them already.
+fn bent(
+    triangle: [Point; 3],
+    through: &[VertexId],
+    position: impl Fn(VertexId) -> Point,
+    snap: f32,
+) -> Vec<Point> {
+    let mut bends: [Vec<(f32, Point)>; 3] = Default::default();
+    for &id in through {
+        let p = position(id);
+        if triangle.iter().any(|corner| corner.distance(p) <= snap) {
+            continue;
+        }
+        let (i, along) = (0..3)
+            .map(|i| {
+                let (s, t) = (triangle[i], triangle[(i + 1) % 3]);
+                (i, closest_on_segment(p, s, t).1, along_and_off(p, s, t).0)
+            })
+            .min_by(|x, y| x.1.total_cmp(&y.1))
+            .map(|(i, _, along)| (i, along))
+            .unwrap();
+        bends[i].push((along, p));
+    }
+
+    let mut outline = Vec::new();
+    for (i, mut bent) in bends.into_iter().enumerate() {
+        outline.push(triangle[i]);
+        bent.sort_by(|x, y| x.0.total_cmp(&y.0));
+        outline.extend(bent.into_iter().map(|(_, p)| p));
+    }
+    outline
+}
+
+/// The distance from `p` to the nearest side of `triangle`, and how far
+/// along that side (as a fraction) it is.
+fn nearest_side(triangle: [Point; 3], p: Point) -> (f32, f32) {
+    (0..3)
+        .map(|i| {
+            let (s, t) = (triangle[i], triangle[(i + 1) % 3]);
+            let (along, off) = along_and_off(p, s, t);
+            (off, along)
+        })
+        .filter(|&(_, along)| along > 0.0 && along < 1.0)
+        .min_by(|x, y| x.0.total_cmp(&y.0))
+        .unwrap_or((f32::INFINITY, 0.0))
+}
+
+/// How far along `s` → `t` (as a fraction) the projection of `p` is, and
+/// how far `p` is off that line.
+fn along_and_off(p: Point, s: Point, t: Point) -> (f32, f32) {
+    let length = s.distance(t).max(f32::MIN_POSITIVE);
+    let along = ((p - s).x * (t - s).x + (p - s).y * (t - s).y) / (length * length);
+    (along, side(s, t, p).abs())
+}
+
+/// Whether `p` is inside, or on the boundary of, a polygon (any winding).
+fn in_polygon(polygon: &[Point], p: Point) -> bool {
+    let n = polygon.len();
+    let edges = (0..n).map(|i| (polygon[i], polygon[(i + 1) % n]));
+    if edges
+        .clone()
+        .any(|(a, b)| closest_on_segment(p, a, b).1 <= EPSILON)
+    {
+        return true;
+    }
+
+    // Even-odd rule: count the edges a ray to the right crosses.
+    edges
+        .filter(|&(a, b)| (a.y > p.y) != (b.y > p.y))
+        .filter(|&(a, b)| p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x))
+        .count()
+        % 2
+        == 1
 }
 
 fn oriented([a, b, c]: [Point; 3]) -> [Point; 3] {

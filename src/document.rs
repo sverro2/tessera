@@ -3,6 +3,11 @@
 //! This module knows nothing about rendering or input. All mutations go
 //! through [`Edit`] so they can later be recorded for undo/redo or saving.
 //!
+//! After every edit, the connectivity is made to follow the geometry (see
+//! [`Document::normalize`]): vertices at the same spot are one vertex, a
+//! vertex lying on an edge splits it, and flat triangles are dropped. So
+//! edits only need to say where things go; joining up follows from that.
+//!
 //! Invariants, checked after every edit (violating edits are rejected):
 //! - every triangle has positive winding; one whose winding flips has been
 //!   folded over its neighbours,
@@ -27,54 +32,46 @@ pub struct Document {
     triangles: Vec<[VertexId; 3]>,
 }
 
-/// Where the third corner of a triangle comes from.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Corner {
-    New(Point),
-    Existing(VertexId),
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Edit {
-    /// Add a triangle with three new corners. Where it runs into existing
-    /// geometry only the uncovered part is added, joined up with the mesh.
-    AddTriangle([Point; 3]),
-    /// Add a triangle on the edge `a`–`b`, covering (like
-    /// [`Edit::AddTriangle`]) only what isn't covered yet.
-    ExtendEdge {
-        a: VertexId,
-        b: VertexId,
-        apex: Corner,
-    },
-    /// Replace a triangle with three triangles meeting at a new vertex `at`.
-    SplitTriangle { triangle: TriangleId, at: Point },
-    /// Cut the edge `a`–`b` at a new vertex `at` on it: each triangle on
-    /// the edge is split in two, towards its opposite corner.
-    SplitEdge { a: VertexId, b: VertexId, at: Point },
+    /// Add a triangle. Where it runs into existing geometry only the
+    /// uncovered part is added, joined up with the mesh; corners on
+    /// existing vertices use them (e.g. extending an edge). Within `snap`
+    /// (world units) things count as touching, so no thinner pieces are
+    /// made; see [`Document::fill`].
+    AddTriangle { corners: [Point; 3], snap: f32 },
+    /// Add a vertex at `at`, splitting the triangle it lies in into three,
+    /// or the triangles on the edge it lies on into two each.
+    InsertVertex { at: Point },
     /// Remove a triangle, leaving a hole (or a smaller outline).
     RemoveTriangle { triangle: TriangleId },
-    /// Move vertex `id` onto the edge `a`–`b` (to `at`, which lies on it):
-    /// the opposite edge of one of its triangles, or an edge elsewhere (on
-    /// the outline), joining up with the triangle there.
-    /// Triangles squashed flat by this are removed, and triangles that now
-    /// have a vertex in the middle of an edge are split at it, so the mesh
-    /// stays conforming (no vertex sits in the middle of another triangle's
-    /// edge).
-    CollapseOntoEdge {
-        id: VertexId,
-        a: VertexId,
-        b: VertexId,
-        at: Point,
-    },
-    /// Weld vertex `id` onto vertex `into`, which may be a neighbour or
-    /// belong to other triangles entirely (joining them up). Triangles
-    /// squashed by this are removed, and the mesh is kept conforming as for
-    /// [`Edit::CollapseOntoEdge`].
-    MergeVertex { id: VertexId, into: VertexId },
     /// Move a vertex (and thereby every triangle using it). Where the move
     /// would fold a triangle over, the mesh is rearranged around the vertex
-    /// instead; see [`Document::move_vertex`].
+    /// instead; see [`Document::move_vertex`]. Moved onto another vertex it
+    /// welds with it; onto an edge, it splits that edge.
     MoveVertex { id: VertexId, to: Point },
+}
+
+/// What [`Document::normalize`] did to make the connectivity follow the
+/// geometry. Vertex ids are as after the edit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Changes {
+    /// Vertices welded onto another at the same spot, as `(gone, kept)`.
+    pub welded: Vec<(VertexId, VertexId)>,
+    /// Edges `a`–`b` cut at a vertex that lies on them, as `(a, b, at)`.
+    pub cut: Vec<(VertexId, VertexId, VertexId)>,
+    /// Triangles dropped because they became flat.
+    pub squashed: Vec<[VertexId; 3]>,
+}
+
+impl Changes {
+    /// The vertex `v` ended up as, following welds.
+    pub fn kept(&self, mut v: VertexId) -> VertexId {
+        while let Some(&(_, kept)) = self.welded.iter().find(|&&(gone, _)| gone == v) {
+            v = kept;
+        }
+        v
+    }
 }
 
 impl Document {
@@ -104,16 +101,6 @@ impl Document {
         self.triangles.iter().flatten().copied()
     }
 
-    /// Vertices sharing a triangle with `id` (with repeats).
-    pub fn neighbours(&self, id: VertexId) -> impl Iterator<Item = VertexId> + '_ {
-        self.triangles
-            .iter()
-            .filter(move |t| t.contains(&id))
-            .flatten()
-            .copied()
-            .filter(move |&v| v != id)
-    }
-
     /// All edges, as vertex id pairs. Shared edges appear once per triangle.
     pub fn edges(&self) -> impl Iterator<Item = (VertexId, VertexId)> + '_ {
         self.triangles
@@ -129,12 +116,17 @@ impl Document {
         edges
     }
 
-    /// The number of vertices used by triangles.
-    pub fn vertex_count(&self) -> usize {
+    /// Vertices used by triangles, each once, sorted.
+    pub fn unique_vertices(&self) -> Vec<VertexId> {
         let mut used: Vec<_> = self.used_vertices().collect();
         used.sort_unstable();
         used.dedup();
-        used.len()
+        used
+    }
+
+    /// The number of vertices used by triangles.
+    pub fn vertex_count(&self) -> usize {
+        self.unique_vertices().len()
     }
 
     /// Axis-aligned bounds of all vertices used by triangles.
@@ -154,14 +146,7 @@ impl Document {
     /// the edit was rejected, e.g. because it would produce a degenerate,
     /// duplicate, folded-over or overlapping triangle.
     pub fn apply(&mut self, edit: Edit) -> bool {
-        let mut next = self.clone();
-
-        if next.apply_unchecked(edit) && next.is_valid_after(self) {
-            *self = next;
-            true
-        } else {
-            false
-        }
+        self.apply_all(&[edit])
     }
 
     /// Checks the invariants, assuming they held in `before`: only triangles
@@ -192,115 +177,73 @@ impl Document {
 
     /// Applies several edits as one: all of them, or none if any is rejected.
     pub fn apply_all(&mut self, edits: &[Edit]) -> bool {
-        let mut next = self.clone();
-
-        if edits.iter().all(|&edit| next.apply(edit)) {
-            *self = next;
-            true
-        } else {
-            false
+        match self.preview(edits) {
+            Some((next, _)) => {
+                *self = next;
+                true
+            }
+            None => false,
         }
+    }
+
+    /// The document after `edits`, and what normalizing it changed; `None`
+    /// if any of them is rejected.
+    pub fn preview(&self, edits: &[Edit]) -> Option<(Document, Changes)> {
+        let mut changes = Changes::default();
+        let mut document = self.clone();
+
+        for &edit in edits {
+            let mut next = document.clone();
+            let moved = match edit {
+                Edit::MoveVertex { id, .. } => Some(id),
+                _ => None,
+            };
+            let valid = next.apply_unchecked(edit)
+                && next.normalize(moved, &mut changes)
+                && next.is_valid_after(&document);
+            if !valid {
+                return None;
+            }
+            document = next;
+        }
+
+        Some((document, changes))
     }
 
     fn apply_unchecked(&mut self, edit: Edit) -> bool {
         match edit {
-            Edit::AddTriangle(corners) => return self.fill(corners.map(Corner::New)),
-            Edit::ExtendEdge { a, b, apex } => {
-                if apex == Corner::Existing(a) || apex == Corner::Existing(b) {
-                    return false;
-                }
-                return self.fill([Corner::Existing(a), Corner::Existing(b), apex]);
-            }
-            Edit::SplitTriangle { triangle, at } => {
-                let [a, b, c] = self.triangles[triangle];
-                let [pa, pb, pc] = [a, b, c].map(|id| self.vertices[id]);
-
-                if [[pa, pb, at], [pb, pc, at], [pc, pa, at]]
-                    .into_iter()
-                    .any(is_degenerate)
-                {
-                    return false;
-                }
-
-                self.vertices.push(at);
-                let d = self.vertices.len() - 1;
-
-                self.triangles.remove(triangle);
-                for t in [[a, b, d], [b, c, d], [c, a, d]] {
-                    self.push_triangle(t);
-                }
-            }
+            Edit::AddTriangle { corners, snap } => self.fill(corners, snap),
+            Edit::InsertVertex { at } => self.insert_vertex(at),
             Edit::RemoveTriangle { triangle } => {
-                if triangle >= self.triangles.len() {
-                    return false;
-                }
-                self.triangles.remove(triangle);
-            }
-            Edit::SplitEdge { a, b, at } => {
-                let (pa, pb) = (self.vertices[a], self.vertices[b]);
-                if at.distance(pa) < 1e-3 || at.distance(pb) < 1e-3 {
-                    return false;
-                }
-
-                self.vertices.push(at);
-                let d = self.vertices.len() - 1;
-
-                let mut split = Vec::new();
-                self.triangles.retain(|t| {
-                    let on_edge = t.contains(&a) && t.contains(&b);
-                    if on_edge {
-                        let x = t.iter().copied().find(|&v| v != a && v != b).unwrap();
-                        split.extend([[a, d, x], [d, b, x]]);
-                    }
-                    !on_edge
-                });
-
-                if split.is_empty() {
-                    return false;
-                }
-                for t in split {
-                    self.push_triangle(t);
+                triangle < self.triangles.len() && {
+                    self.triangles.remove(triangle);
+                    true
                 }
             }
-            Edit::CollapseOntoEdge { id, a, b, at } => {
-                let on_edge = |t: &[VertexId; 3]| t.contains(&a) && t.contains(&b);
-                if id == a || id == b || !self.triangles.iter().any(on_edge) {
-                    return false;
-                }
-
-                self.vertices[id] = at;
-
-                return self.tidy_after_moving(id);
-            }
-            Edit::MergeVertex { id, into } => {
-                let used = |v| self.triangles.iter().flatten().any(|&u| u == v);
-                if id == into || !used(id) || !used(into) {
-                    return false;
-                }
-
-                self.vertices[id] = self.vertices[into];
-
-                for t in &mut self.triangles {
-                    for v in t.iter_mut().filter(|v| **v == id) {
-                        *v = into;
-                    }
-                }
-
-                // Drop squashed triangles and any duplicates the weld created.
-                let mut seen = Vec::new();
-                self.triangles.retain(|t| {
-                    let mut key = *t;
-                    key.sort_unstable();
-                    let keep = key[0] != key[1] && key[1] != key[2] && !seen.contains(&key);
-                    seen.push(key);
-                    keep
-                });
-
-                return self.tidy_after_moving(into);
-            }
-            Edit::MoveVertex { id, to } => return self.move_vertex(id, to),
+            Edit::MoveVertex { id, to } => self.move_vertex(id, to),
         }
+    }
 
+    /// Splits the triangle containing `at` (on its boundary counts) into
+    /// three at a new vertex there. On an edge, one of the three is flat;
+    /// normalizing drops it and splits the triangle across the edge.
+    fn insert_vertex(&mut self, at: Point) -> bool {
+        let taken = self
+            .used_vertices()
+            .any(|v| self.vertices[v].distance(at) <= tolerance(0.0));
+        let inside = |[a, b, c]: [Point; 3]| {
+            [(a, b), (b, c), (c, a)]
+                .into_iter()
+                .all(|(u, v)| area2(u, v, at) >= -tolerance(u.distance(v)) * u.distance(v))
+        };
+        let Some(triangle) = self.triangles().position(inside).filter(|_| !taken) else {
+            return false;
+        };
+
+        let [a, b, c] = self.triangles.remove(triangle);
+        self.vertices.push(at);
+        let d = self.last_vertex();
+        self.triangles.extend([[a, b, d], [b, c, d], [c, a, d]]);
         true
     }
 
@@ -316,6 +259,10 @@ impl Document {
     /// - Past the end of the edge (say `u` ends up between the vertex and
     ///   `w`): the edge from the vertex to `w` runs through `u`, so it is
     ///   flipped the same way, or the (flat) triangle is dropped.
+    ///
+    /// A triangle that ends up flat, the vertex landing on the line through
+    /// the opposite edge, isn't folded over: normalizing drops it and, if
+    /// the vertex lands on an edge, splits that edge.
     ///
     /// Returns `false` if the rearranging doesn't settle.
     fn move_vertex(&mut self, id: VertexId, to: Point) -> bool {
@@ -334,7 +281,9 @@ impl Document {
                     let (u, w) = opposite(*t, id)?;
                     let (pu, pw) = (self.vertices[u], self.vertices[w]);
                     let (now, then) = (area2(pu, pw, from), area2(pu, pw, to));
-                    (then <= 0.0).then(|| (i, (now / (now - then)).clamp(0.0, 1.0)))
+                    let lands_on_line = is_flat([pu, pw, to]);
+                    (then <= 0.0 && !lands_on_line)
+                        .then(|| (i, (now / (now - then)).clamp(0.0, 1.0)))
                 })
                 .min_by(|x, y| x.1.total_cmp(&y.1));
 
@@ -401,15 +350,52 @@ impl Document {
         }
     }
 
-    /// After vertex `id` moved onto an edge or another vertex: removes the
-    /// triangles around it that are now flat, then makes the mesh conforming
-    /// again (see [`Self::split_t_junctions`]).
-    fn tidy_after_moving(&mut self, id: VertexId) -> bool {
-        let vertices = &self.vertices;
-        self.triangles
-            .retain(|t| !(t.contains(&id) && is_flat(t.map(|v| vertices[v]))));
+    /// Makes the connectivity follow the geometry: welds vertices at the
+    /// same spot (keeping the one that wasn't `moved`), drops triangles that
+    /// are flat, and splits edges that have a vertex lying on them (see
+    /// [`Self::split_t_junctions`]). Records what it did in `changes`.
+    ///
+    /// Returns `false` if that doesn't settle.
+    fn normalize(&mut self, moved: Option<VertexId>, changes: &mut Changes) -> bool {
+        let used = self.unique_vertices();
 
-        self.split_t_junctions()
+        for (i, &u) in used.iter().enumerate() {
+            for &v in &used[i + 1..] {
+                if self.vertices[u].distance(self.vertices[v]) > tolerance(0.0) {
+                    continue;
+                }
+                let (gone, kept) = if Some(u) == moved { (u, v) } else { (v, u) };
+                if changes.welded.iter().any(|&(g, _)| g == gone || g == kept) {
+                    continue; // Already welded away.
+                }
+                self.vertices[gone] = self.vertices[kept];
+                for t in &mut self.triangles {
+                    for c in t.iter_mut().filter(|c| **c == gone) {
+                        *c = kept;
+                    }
+                }
+                changes.welded.push((gone, kept));
+            }
+        }
+
+        // Welding squashes the triangles that had both, and may leave
+        // duplicates (two triangles folded onto each other).
+        let mut seen: Vec<[VertexId; 3]> = Vec::new();
+        let mut squashed = Vec::new();
+        self.triangles.retain(|&t| {
+            let mut key = t;
+            key.sort_unstable();
+            if key[0] == key[1] || key[1] == key[2] {
+                squashed.push(t);
+                return false;
+            }
+            let keep = !seen.contains(&key);
+            seen.push(key);
+            keep
+        });
+        changes.squashed.extend(squashed);
+
+        self.split_t_junctions(changes)
     }
 
     /// Splits every triangle that has a vertex lying in the middle of one of
@@ -421,17 +407,20 @@ impl Document {
     /// The edges such a triangle joined are then repaired like any other.
     ///
     /// Returns `false` if that doesn't settle.
-    fn split_t_junctions(&mut self) -> bool {
+    fn split_t_junctions(&mut self, changes: &mut Changes) -> bool {
         let limit = 4 * (self.triangles.len() + self.vertices.len());
 
         for _ in 0..limit {
             let vertices = &self.vertices;
-            self.triangles.retain(|t| !is_flat(t.map(|v| vertices[v])));
+            self.triangles.retain(|&t| {
+                let flat = is_flat(t.map(|v| vertices[v]));
+                if flat {
+                    changes.squashed.push(t);
+                }
+                !flat
+            });
 
-            let mut used: Vec<VertexId> = self.used_vertices().collect();
-            used.sort_unstable();
-            used.dedup();
-
+            let used = self.unique_vertices();
             let vertices = &self.vertices;
             let junction = self.triangles.iter().enumerate().find_map(|(i, &t)| {
                 (0..3).find_map(|k| {
@@ -442,14 +431,15 @@ impl Document {
                             !t.contains(&w)
                                 && is_inside_segment(vertices[w], vertices[u], vertices[v])
                         })
-                        .map(|w| (i, [u, w, x], [w, v, x]))
+                        .map(|w| (i, (u, v, w), [u, w, x], [w, v, x]))
                 })
             });
 
-            let Some((i, first, second)) = junction else {
+            let Some((i, cut, first, second)) = junction else {
                 return true;
             };
 
+            changes.cut.push(cut);
             self.triangles.remove(i);
             self.push_triangle(first);
             self.push_triangle(second);
@@ -492,7 +482,7 @@ impl Document {
 }
 
 /// The corners of `t` other than `id`, in winding order after it.
-fn opposite(t: [VertexId; 3], id: VertexId) -> Option<(VertexId, VertexId)> {
+pub fn opposite(t: [VertexId; 3], id: VertexId) -> Option<(VertexId, VertexId)> {
     let i = t.iter().position(|&v| v == id)?;
     Some((t[(i + 1) % 3], t[(i + 2) % 3]))
 }
@@ -527,31 +517,29 @@ fn is_inside_segment(p: Point, a: Point, b: Point) -> bool {
     off <= tolerance && along > tolerance && along < length - tolerance
 }
 
-fn is_degenerate([a, b, c]: [Point; 3]) -> bool {
-    area2(a, b, c).abs() < 1e-3
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn doc_with_triangle() -> Document {
         let mut doc = Document::default();
-        assert!(doc.apply(Edit::AddTriangle([
-            Point::new(0.0, 0.0),
-            Point::new(10.0, 0.0),
-            Point::new(5.0, 10.0),
-        ])));
+        assert!(doc.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(5.0, 10.0),
+            ],
+            snap: 0.0
+        }));
         doc
     }
 
     #[test]
     fn extending_shares_the_edge() {
         let mut doc = doc_with_triangle();
-        assert!(doc.apply(Edit::ExtendEdge {
-            a: 0,
-            b: 1,
-            apex: Corner::New(Point::new(5.0, -10.0))
+        assert!(doc.apply(Edit::AddTriangle {
+            corners: [doc.vertex(0), doc.vertex(1), Point::new(5.0, -10.0)],
+            snap: 0.0
         }));
         assert_eq!(sorted(&doc), vec![[0, 1, 2], [0, 1, 3]]);
 
@@ -567,26 +555,23 @@ mod tests {
     fn splitting_replaces_parent() {
         let mut doc = doc_with_triangle();
         let at = Point::new(5.0, 3.0);
-        assert!(doc.apply(Edit::SplitTriangle { triangle: 0, at }));
+        assert!(doc.apply(Edit::InsertVertex { at }));
         assert_eq!(doc.triangle_ids(), &[[0, 1, 3], [1, 2, 3], [2, 0, 3]]);
     }
 
     #[test]
     fn collapsing_a_corner_removes_the_triangle() {
         let mut doc = doc_with_triangle();
-        assert!(doc.apply(Edit::CollapseOntoEdge {
+        assert!(doc.apply(Edit::MoveVertex {
             id: 2,
-            a: 0,
-            b: 1,
-            at: Point::new(5.0, 0.0),
+            to: Point::new(5.0, 0.0)
         }));
         assert!(doc.is_empty());
     }
 
     fn split_triangle() -> Document {
         let mut doc = doc_with_triangle();
-        doc.apply(Edit::SplitTriangle {
-            triangle: 0,
+        doc.apply(Edit::InsertVertex {
             at: Point::new(5.0, 3.0),
         });
         doc
@@ -602,10 +587,9 @@ mod tests {
     #[test]
     fn removing_the_triangle_under_a_point() {
         let mut doc = doc_with_triangle();
-        doc.apply(Edit::ExtendEdge {
-            a: 0,
-            b: 1,
-            apex: Corner::New(Point::new(5.0, -10.0)),
+        doc.apply(Edit::AddTriangle {
+            corners: [doc.vertex(0), doc.vertex(1), Point::new(5.0, -10.0)],
+            snap: 0.0,
         });
 
         assert_eq!(doc.triangle_at(Point::new(50.0, 50.0)), None);
@@ -617,15 +601,12 @@ mod tests {
     #[test]
     fn cutting_an_edge_splits_both_sides() {
         let mut doc = doc_with_triangle();
-        doc.apply(Edit::ExtendEdge {
-            a: 0,
-            b: 1,
-            apex: Corner::New(Point::new(5.0, -10.0)),
+        doc.apply(Edit::AddTriangle {
+            corners: [doc.vertex(0), doc.vertex(1), Point::new(5.0, -10.0)],
+            snap: 0.0,
         });
 
-        assert!(doc.apply(Edit::SplitEdge {
-            a: 0,
-            b: 1,
+        assert!(doc.apply(Edit::InsertVertex {
             at: Point::new(3.0, 0.0),
         }));
         assert_eq!(
@@ -635,9 +616,7 @@ mod tests {
         assert_eq!(area_and_t_junctions(&doc), (100.0, false));
 
         // Right on a corner there's nothing to cut.
-        assert!(!doc.apply(Edit::SplitEdge {
-            a: 0,
-            b: 4,
+        assert!(!doc.apply(Edit::InsertVertex {
             at: Point::new(0.0, 0.0),
         }));
     }
@@ -645,11 +624,9 @@ mod tests {
     #[test]
     fn collapsing_a_split_center_onto_edge_keeps_two() {
         let mut doc = split_triangle();
-        assert!(doc.apply(Edit::CollapseOntoEdge {
+        assert!(doc.apply(Edit::MoveVertex {
             id: 3,
-            a: 0,
-            b: 1,
-            at: Point::new(4.0, 0.0),
+            to: Point::new(4.0, 0.0)
         }));
         assert_eq!(sorted(&doc), vec![[0, 2, 3], [1, 2, 3]]);
     }
@@ -657,7 +634,10 @@ mod tests {
     #[test]
     fn merging_a_split_center_into_corner_restores_parent() {
         let mut doc = split_triangle();
-        assert!(doc.apply(Edit::MergeVertex { id: 3, into: 0 }));
+        assert!(doc.apply(Edit::MoveVertex {
+            id: 3,
+            to: doc.vertex(0)
+        }));
         assert_eq!(sorted(&doc), vec![[0, 1, 2]]);
     }
 
@@ -665,21 +645,17 @@ mod tests {
     fn collapsing_onto_a_shared_edge_splits_the_other_side() {
         // Two triangles sharing edge 0–1, the upper one split at 4.
         let mut doc = doc_with_triangle();
-        doc.apply(Edit::ExtendEdge {
-            a: 0,
-            b: 1,
-            apex: Corner::New(Point::new(5.0, -10.0)),
+        doc.apply(Edit::AddTriangle {
+            corners: [doc.vertex(0), doc.vertex(1), Point::new(5.0, -10.0)],
+            snap: 0.0,
         });
-        doc.apply(Edit::SplitTriangle {
-            triangle: 0,
+        doc.apply(Edit::InsertVertex {
             at: Point::new(5.0, 3.0),
         });
 
-        assert!(doc.apply(Edit::CollapseOntoEdge {
+        assert!(doc.apply(Edit::MoveVertex {
             id: 4,
-            a: 0,
-            b: 1,
-            at: Point::new(4.0, 0.0),
+            to: Point::new(4.0, 0.0)
         }));
 
         // Nothing uses the edge 0–1 any more; 4 is a corner on both sides.
@@ -698,14 +674,15 @@ mod tests {
         // A long, slanted shared edge: the snapped point is never exactly on it.
         let (a, b) = (Point::new(100.3, 300.7), Point::new(407.1, 290.2));
         let mut doc = Document::default();
-        doc.apply(Edit::AddTriangle([a, b, Point::new(250.0, 100.0)]));
-        doc.apply(Edit::ExtendEdge {
-            a: 0,
-            b: 1,
-            apex: Corner::New(Point::new(250.0, 500.0)),
+        doc.apply(Edit::AddTriangle {
+            corners: [a, b, Point::new(250.0, 100.0)],
+            snap: 0.0,
         });
-        doc.apply(Edit::SplitTriangle {
-            triangle: 0,
+        doc.apply(Edit::AddTriangle {
+            corners: [doc.vertex(0), doc.vertex(1), Point::new(250.0, 500.0)],
+            snap: 0.0,
+        });
+        doc.apply(Edit::InsertVertex {
             at: Point::new(250.0, 230.0),
         });
 
@@ -713,12 +690,7 @@ mod tests {
             let t = i as f32 / 40.0;
             let at = a + (b - a) * t;
             let mut doc = doc.clone();
-            assert!(doc.apply(Edit::CollapseOntoEdge {
-                id: 4,
-                a: 0,
-                b: 1,
-                at
-            }));
+            assert!(doc.apply(Edit::MoveVertex { id: 4, to: at }));
             assert_eq!(doc.triangle_ids().len(), 4, "t = {t}");
             assert!(
                 doc.triangle_ids()
@@ -735,13 +707,11 @@ mod tests {
     #[test]
     fn moving_across_an_inner_edge_flips_it() {
         let mut doc = doc_with_triangle();
-        doc.apply(Edit::ExtendEdge {
-            a: 0,
-            b: 1,
-            apex: Corner::New(Point::new(5.0, -10.0)),
+        doc.apply(Edit::AddTriangle {
+            corners: [doc.vertex(0), doc.vertex(1), Point::new(5.0, -10.0)],
+            snap: 0.0,
         });
-        doc.apply(Edit::SplitTriangle {
-            triangle: 0,
+        doc.apply(Edit::InsertVertex {
             at: Point::new(5.0, 3.0),
         });
 
@@ -761,10 +731,9 @@ mod tests {
     #[test]
     fn moving_an_outline_corner_across_an_edge_dents_the_outline() {
         let mut doc = doc_with_triangle();
-        doc.apply(Edit::ExtendEdge {
-            a: 0,
-            b: 1,
-            apex: Corner::New(Point::new(5.0, -10.0)),
+        doc.apply(Edit::AddTriangle {
+            corners: [doc.vertex(0), doc.vertex(1), Point::new(5.0, -10.0)],
+            snap: 0.0,
         });
 
         // The top corner 2 pulled down into the bottom triangle: the peak
@@ -780,8 +749,7 @@ mod tests {
     #[test]
     fn moving_out_through_the_outline_drops_the_crossed_triangle() {
         let mut doc = doc_with_triangle();
-        doc.apply(Edit::SplitTriangle {
-            triangle: 0,
+        doc.apply(Edit::InsertVertex {
             at: Point::new(5.0, 3.0),
         });
 
@@ -813,10 +781,9 @@ mod tests {
 
         // Extending edge 0–1 towards the side the triangle is already on:
         // only the dart-shaped gap around its top corner 2 gets filled.
-        assert!(doc.apply(Edit::ExtendEdge {
-            a: 0,
-            b: 1,
-            apex: Corner::New(Point::new(5.0, 20.0)),
+        assert!(doc.apply(Edit::AddTriangle {
+            corners: [doc.vertex(0), doc.vertex(1), Point::new(5.0, 20.0)],
+            snap: 0.0
         }));
         assert_eq!(sorted(&doc), vec![[0, 1, 2], [0, 2, 3], [1, 2, 3]]);
         assert_eq!(area_and_t_junctions(&doc), (100.0, false));
@@ -828,11 +795,14 @@ mod tests {
 
         // A triangle poking out of the top of the existing one: the part
         // outside it is added, and the existing edges it crosses are split.
-        assert!(doc.apply(Edit::AddTriangle([
-            Point::new(2.0, 2.0),
-            Point::new(8.0, 2.0),
-            Point::new(5.0, 20.0),
-        ])));
+        assert!(doc.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(2.0, 2.0),
+                Point::new(8.0, 2.0),
+                Point::new(5.0, 20.0),
+            ],
+            snap: 0.0
+        }));
         let (area, t_junctions) = area_and_t_junctions(&doc);
         assert!(!t_junctions);
         // The sides cross at y = 5. Above that the new triangle adds 37.5,
@@ -840,11 +810,14 @@ mod tests {
         assert!((area - (50.0 + 37.5 - 12.5)).abs() < 1e-3, "{area}");
 
         // Entirely inside existing geometry: nothing to add.
-        assert!(!doc.apply(Edit::AddTriangle([
-            Point::new(4.0, 1.0),
-            Point::new(6.0, 1.0),
-            Point::new(5.0, 3.0),
-        ])));
+        assert!(!doc.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(4.0, 1.0),
+                Point::new(6.0, 1.0),
+                Point::new(5.0, 3.0),
+            ],
+            snap: 0.0
+        }));
     }
 
     /// Whether a vertex sits in the middle of another triangle's edge.
@@ -871,41 +844,36 @@ mod tests {
     fn collapsing_can_squash_several_triangles() {
         // Two triangles sharing the edge 0–1 (y = 300), each split.
         let mut doc = Document::default();
-        doc.apply(Edit::AddTriangle([
-            Point::new(100.0, 300.0),
-            Point::new(300.0, 300.0),
-            Point::new(200.0, 100.0),
-        ]));
-        doc.apply(Edit::ExtendEdge {
-            a: 0,
-            b: 1,
-            apex: Corner::New(Point::new(200.0, 500.0)),
+        doc.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(100.0, 300.0),
+                Point::new(300.0, 300.0),
+                Point::new(200.0, 100.0),
+            ],
+            snap: 0.0,
         });
-        let split = |doc: &mut Document, corners: [VertexId; 3], at| {
-            let triangle = doc.find_triangle(corners).unwrap();
-            assert!(doc.apply(Edit::SplitTriangle { triangle, at }));
-        };
-        split(&mut doc, [0, 1, 2], Point::new(200.0, 230.0)); // centre 4
-        split(&mut doc, [0, 1, 3], Point::new(200.0, 370.0)); // centre 5
+        doc.apply(Edit::AddTriangle {
+            corners: [doc.vertex(0), doc.vertex(1), Point::new(200.0, 500.0)],
+            snap: 0.0,
+        });
+        let split = |doc: &mut Document, at| assert!(doc.apply(Edit::InsertVertex { at }));
+        split(&mut doc, Point::new(200.0, 230.0)); // centre 4
+        split(&mut doc, Point::new(200.0, 370.0)); // centre 5
 
         // Collapse the top centre onto the shared edge: the bottom side now
         // has four triangles around 5, two of them along the shared line.
-        assert!(doc.apply(Edit::CollapseOntoEdge {
+        assert!(doc.apply(Edit::MoveVertex {
             id: 4,
-            a: 0,
-            b: 1,
-            at: Point::new(200.0, 300.0),
+            to: Point::new(200.0, 300.0)
         }));
         assert_eq!(area_and_t_junctions(&doc), (40_000.0, false));
 
         // Collapse the bottom centre onto the shared line between 0 and 4.
         // That flattens both (0, 4, 5) and (4, 1, 5); the bottom is re-split
         // with a new edge from 4 down to 3.
-        assert!(doc.apply(Edit::CollapseOntoEdge {
+        assert!(doc.apply(Edit::MoveVertex {
             id: 5,
-            a: 0,
-            b: 4,
-            at: Point::new(150.0, 300.0),
+            to: Point::new(150.0, 300.0)
         }));
         assert_eq!(area_and_t_junctions(&doc), (40_000.0, false));
         assert!(doc.edges().any(|e| e == (4, 3) || e == (3, 4)));
@@ -914,14 +882,23 @@ mod tests {
     #[test]
     fn merging_joins_separate_triangles() {
         let mut doc = doc_with_triangle();
-        doc.apply(Edit::AddTriangle([
-            Point::new(20.0, 0.0),
-            Point::new(30.0, 0.0),
-            Point::new(25.0, 10.0),
-        ]));
+        doc.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(20.0, 0.0),
+                Point::new(30.0, 0.0),
+                Point::new(25.0, 10.0),
+            ],
+            snap: 0.0,
+        });
         // Corner to corner, then the second corner: they share an edge.
-        assert!(doc.apply(Edit::MergeVertex { id: 1, into: 3 }));
-        assert!(doc.apply(Edit::MergeVertex { id: 2, into: 5 }));
+        assert!(doc.apply(Edit::MoveVertex {
+            id: 1,
+            to: doc.vertex(3)
+        }));
+        assert!(doc.apply(Edit::MoveVertex {
+            id: 2,
+            to: doc.vertex(5)
+        }));
         assert_eq!(doc.triangle_ids().len(), 2);
         assert_eq!(
             doc.edges()
@@ -934,27 +911,93 @@ mod tests {
     #[test]
     fn merging_rejects_overlap() {
         let mut doc = doc_with_triangle();
-        doc.apply(Edit::AddTriangle([
-            Point::new(20.0, 0.0),
-            Point::new(30.0, 0.0),
-            Point::new(25.0, 10.0),
-        ]));
+        doc.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(20.0, 0.0),
+                Point::new(30.0, 0.0),
+                Point::new(25.0, 10.0),
+            ],
+            snap: 0.0,
+        });
         // The first triangle would be stretched right across the second.
-        assert!(!doc.apply(Edit::MergeVertex { id: 0, into: 4 }));
+        assert!(!doc.apply(Edit::MoveVertex {
+            id: 0,
+            to: doc.vertex(4)
+        }));
+    }
+
+    /// The new triangles in `after` (not in `before`) thinner than `min`.
+    fn thin_new(before: &Document, after: &Document, min: f32) -> Vec<[Point; 3]> {
+        after
+            .triangle_ids()
+            .iter()
+            .filter(|&&t| before.find_triangle(t).is_none())
+            .map(|t| t.map(|v| after.vertex(v)))
+            .filter(|&t| min_height(t) < min)
+            .collect()
+    }
+
+    #[test]
+    fn a_fill_bends_around_a_vertex_close_to_its_side() {
+        // A triangle, and one below it whose right corner (250, 340) ends
+        // up just under 6 from the left side of the extension below.
+        let mut doc = Document::default();
+        for corners in [
+            [(100.0, 300.0), (300.0, 300.0), (200.0, 100.0)],
+            [(150.0, 330.0), (250.0, 340.0), (200.0, 420.0)],
+        ] {
+            let corners = corners.map(|(x, y)| Point::new(x, y));
+            assert!(doc.apply(Edit::AddTriangle { corners, snap: 0.0 }));
+        }
+
+        let corners = [doc.vertex(0), doc.vertex(1), Point::new(360.0, 380.0)];
+        let (plain, _) = doc
+            .preview(&[Edit::AddTriangle { corners, snap: 0.0 }])
+            .unwrap();
+        assert!(!thin_new(&doc, &plain, 5.0).is_empty());
+
+        let (snapped, _) = doc
+            .preview(&[Edit::AddTriangle { corners, snap: 5.0 }])
+            .unwrap();
+        assert_eq!(thin_new(&doc, &snapped, 5.0), Vec::<[Point; 3]>::new());
+    }
+
+    #[test]
+    fn a_fill_bends_rather_than_splitting_off_a_sliver() {
+        // Extending the right edge of a triangle across a separate one, its
+        // side crossing that one's edge close to a corner: splitting there
+        // would leave a sliver of the existing triangle.
+        let mut doc = Document::default();
+        for corners in [
+            [(100.0, 300.0), (300.0, 300.0), (200.0, 100.0)],
+            [(330.0, 280.0), (450.0, 300.0), (400.0, 150.0)],
+        ] {
+            let corners = corners.map(|(x, y)| Point::new(x, y));
+            assert!(doc.apply(Edit::AddTriangle { corners, snap: 0.0 }));
+        }
+
+        let corners = [doc.vertex(1), doc.vertex(2), Point::new(550.0, 260.0)];
+        let (plain, _) = doc
+            .preview(&[Edit::AddTriangle { corners, snap: 0.0 }])
+            .unwrap();
+        assert!(!thin_new(&doc, &plain, 5.0).is_empty());
+
+        let (snapped, _) = doc
+            .preview(&[Edit::AddTriangle { corners, snap: 5.0 }])
+            .unwrap();
+        assert_eq!(thin_new(&doc, &snapped, 5.0), Vec::<[Point; 3]>::new());
     }
 
     #[test]
     fn rejects_degenerate_and_duplicate() {
         let mut doc = doc_with_triangle();
-        assert!(!doc.apply(Edit::ExtendEdge {
-            a: 0,
-            b: 1,
-            apex: Corner::New(Point::new(20.0, 0.0))
+        assert!(!doc.apply(Edit::AddTriangle {
+            corners: [doc.vertex(0), doc.vertex(1), Point::new(20.0, 0.0)],
+            snap: 0.0
         }));
-        assert!(!doc.apply(Edit::ExtendEdge {
-            a: 0,
-            b: 1,
-            apex: Corner::Existing(2)
+        assert!(!doc.apply(Edit::AddTriangle {
+            corners: [doc.vertex(0), doc.vertex(1), doc.vertex(2)],
+            snap: 0.0
         }));
         assert_eq!(doc.triangle_ids().len(), 1);
     }
@@ -978,27 +1021,26 @@ mod fuzz {
         let (mut ok, mut rejected) = (0, 0);
         for _ in 0..200 {
             let mut doc = Document::default();
-            doc.apply(Edit::AddTriangle([
-                Point::new(100.0, 300.0),
-                Point::new(300.0, 300.0),
-                Point::new(200.0, 100.0),
-            ]));
-            doc.apply(Edit::ExtendEdge {
-                a: 0,
-                b: 1,
-                apex: Corner::New(Point::new(200.0, 500.0)),
+            doc.apply(Edit::AddTriangle {
+                corners: [
+                    Point::new(100.0, 300.0),
+                    Point::new(300.0, 300.0),
+                    Point::new(200.0, 100.0),
+                ],
+                snap: 0.0,
             });
-            doc.apply(Edit::ExtendEdge {
-                a: 1,
-                b: 2,
-                apex: Corner::New(Point::new(350.0, 150.0)),
+            doc.apply(Edit::AddTriangle {
+                corners: [doc.vertex(0), doc.vertex(1), Point::new(200.0, 500.0)],
+                snap: 0.0,
             });
-            doc.apply(Edit::SplitTriangle {
-                triangle: 0,
+            doc.apply(Edit::AddTriangle {
+                corners: [doc.vertex(1), doc.vertex(2), Point::new(350.0, 150.0)],
+                snap: 0.0,
+            });
+            doc.apply(Edit::InsertVertex {
                 at: Point::new(200.0, 230.0),
             });
-            doc.apply(Edit::SplitTriangle {
-                triangle: 0,
+            doc.apply(Edit::InsertVertex {
                 at: Point::new(200.0, 370.0),
             });
 
@@ -1046,11 +1088,14 @@ mod fuzz {
         let (mut ok, mut empty, mut rejected) = (0, 0, 0);
         for _ in 0..30 {
             let mut doc = Document::default();
-            doc.apply(Edit::AddTriangle([
-                Point::new(200.0, 300.0),
-                Point::new(300.0, 300.0),
-                Point::new(250.0, 200.0),
-            ]));
+            doc.apply(Edit::AddTriangle {
+                corners: [
+                    Point::new(200.0, 300.0),
+                    Point::new(300.0, 300.0),
+                    Point::new(250.0, 200.0),
+                ],
+                snap: 0.0,
+            });
 
             for _ in 0..15 {
                 let r: Vec<f32> = (0..8).map(|_| rand()).collect();
@@ -1058,13 +1103,15 @@ mod fuzz {
                 let edit = if r[0] < 0.5 {
                     let edges: Vec<_> = doc.edges().collect();
                     let (a, b) = edges[(r[1] * edges.len() as f32) as usize % edges.len()];
-                    Edit::ExtendEdge {
-                        a,
-                        b,
-                        apex: Corner::New(point(2)),
+                    Edit::AddTriangle {
+                        corners: [doc.vertex(a), doc.vertex(b), point(2)],
+                        snap: 0.0,
                     }
                 } else {
-                    Edit::AddTriangle([point(2), point(4), point(6)])
+                    Edit::AddTriangle {
+                        corners: [point(2), point(4), point(6)],
+                        snap: 0.0,
+                    }
                 };
 
                 let started = std::time::Instant::now();
