@@ -53,7 +53,9 @@ pub enum Edit {
     SplitEdge { a: VertexId, b: VertexId, at: Point },
     /// Remove a triangle, leaving a hole (or a smaller outline).
     RemoveTriangle { triangle: TriangleId },
-    /// Move vertex `id` onto the edge `a`–`b` (to `at`, which lies on it).
+    /// Move vertex `id` onto the edge `a`–`b` (to `at`, which lies on it):
+    /// the opposite edge of one of its triangles, or an edge elsewhere (on
+    /// the outline), joining up with the triangle there.
     /// Triangles squashed flat by this are removed, and triangles that now
     /// have a vertex in the middle of an edge are split at it, so the mesh
     /// stays conforming (no vertex sits in the middle of another triangle's
@@ -64,8 +66,9 @@ pub enum Edit {
         b: VertexId,
         at: Point,
     },
-    /// Weld vertex `id` onto its neighbour `into`. Triangles squashed by
-    /// this are removed, and the mesh is kept conforming as for
+    /// Weld vertex `id` onto vertex `into`, which may be a neighbour or
+    /// belong to other triangles entirely (joining them up). Triangles
+    /// squashed by this are removed, and the mesh is kept conforming as for
     /// [`Edit::CollapseOntoEdge`].
     MergeVertex { id: VertexId, into: VertexId },
     /// Move a vertex (and thereby every triangle using it). Where the move
@@ -260,7 +263,8 @@ impl Document {
                 }
             }
             Edit::CollapseOntoEdge { id, a, b, at } => {
-                if !self.has_triangle([id, a, b]) {
+                let on_edge = |t: &[VertexId; 3]| t.contains(&a) && t.contains(&b);
+                if id == a || id == b || !self.triangles.iter().any(on_edge) {
                     return false;
                 }
 
@@ -269,7 +273,8 @@ impl Document {
                 return self.tidy_after_moving(id);
             }
             Edit::MergeVertex { id, into } => {
-                if id == into || !self.neighbours(id).any(|v| v == into) {
+                let used = |v| self.triangles.iter().flatten().any(|&u| u == v);
+                if id == into || !used(id) || !used(into) {
                     return false;
                 }
 
@@ -462,10 +467,6 @@ impl Document {
         } else {
             [a, b, c]
         });
-    }
-
-    fn has_triangle(&self, ids: [VertexId; 3]) -> bool {
-        self.find_triangle(ids).is_some()
     }
 
     /// The triangle containing `point` (on its boundary counts), if any.
@@ -911,14 +912,35 @@ mod tests {
     }
 
     #[test]
-    fn merging_requires_neighbours() {
+    fn merging_joins_separate_triangles() {
         let mut doc = doc_with_triangle();
         doc.apply(Edit::AddTriangle([
             Point::new(20.0, 0.0),
             Point::new(30.0, 0.0),
             Point::new(25.0, 10.0),
         ]));
-        assert!(!doc.apply(Edit::MergeVertex { id: 1, into: 3 }));
+        // Corner to corner, then the second corner: they share an edge.
+        assert!(doc.apply(Edit::MergeVertex { id: 1, into: 3 }));
+        assert!(doc.apply(Edit::MergeVertex { id: 2, into: 5 }));
+        assert_eq!(doc.triangle_ids().len(), 2);
+        assert_eq!(
+            doc.edges()
+                .filter(|&(u, v)| u.min(v) == 3 && u.max(v) == 5)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn merging_rejects_overlap() {
+        let mut doc = doc_with_triangle();
+        doc.apply(Edit::AddTriangle([
+            Point::new(20.0, 0.0),
+            Point::new(30.0, 0.0),
+            Point::new(25.0, 10.0),
+        ]));
+        // The first triangle would be stretched right across the second.
+        assert!(!doc.apply(Edit::MergeVertex { id: 0, into: 4 }));
     }
 
     #[test]

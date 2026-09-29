@@ -46,8 +46,11 @@ const FILL: Color = Color::from_rgba8(0x7a, 0xa2, 0xf7, 0.35);
 const EDGE: Color = Color::from_rgb8(0xc0, 0xca, 0xf5);
 /// What an action would add (and the cursor that creates triangles).
 const ADDED: Color = Color::from_rgb8(0x9e, 0xce, 0x6a);
-/// What an action would remove; also used for problems and cancelling.
+/// What an action would remove.
 const REMOVED: Color = Color::from_rgb8(0xf7, 0x76, 0x8e);
+/// Where an action joins things up: edges that become shared, vertices
+/// welded together.
+const JOINED: Color = Color::from_rgb8(0xe0, 0xaf, 0x68);
 /// The hovered vertex or edge.
 const HOVER: Color = Color::from_rgb8(0x7d, 0xcf, 0xff);
 
@@ -279,10 +282,16 @@ impl canvas::Program<Message> for Editor<'_> {
         let pending = self.pending(state.interaction);
 
         let content = match &pending {
-            Some((_, result)) => {
+            Some((edits, result)) => {
                 let mut frame = Frame::new(renderer, bounds.size());
                 self.draw_document(&mut frame, result);
                 self.draw_changes(&mut frame, result);
+                // Extending always shares its source edge; that's no news.
+                let source = match state.interaction {
+                    Interaction::Extending { a, b, .. } => Some((a.min(b), a.max(b))),
+                    _ => None,
+                };
+                self.draw_joins(&mut frame, edits, result, source);
                 frame.into_geometry()
             }
             None => self.cache.draw(renderer, bounds.size(), |frame| {
@@ -339,12 +348,13 @@ impl canvas::Program<Message> for Editor<'_> {
                     );
                 }
 
-                handle(&mut overlay, at, ADDED);
+                let removes = !self.squashed(result).is_empty();
+                handle(&mut overlay, at, if removes { REMOVED } else { ADDED });
             }
             // Releasing now would do nothing.
             (_, None) => {
                 if let Some(p) = cursor_pos {
-                    handle(&mut overlay, p, REMOVED);
+                    handle(&mut overlay, p, EDGE);
                 }
             }
         }
@@ -521,7 +531,7 @@ impl Editor<'_> {
         })
     }
 
-    /// Dragging vertex `id` to `to`: weld onto a neighbouring vertex, snap onto
+    /// Dragging vertex `id` to `to`: weld onto a nearby vertex, snap onto
     /// the opposite edge of one of its triangles, or just move.
     fn move_edit(&self, id: VertexId, to: Point) -> Edit {
         let camera = self.camera;
@@ -529,6 +539,16 @@ impl Editor<'_> {
 
         if let Some(into) = self.nearest_vertex(screen, self.document.neighbours(id)) {
             return Edit::MergeVertex { id, into };
+        }
+
+        // Any other vertex (e.g. a corner of a separate part), if welding
+        // onto it works out.
+        let others = self.document.used_vertices().filter(|&v| v != id);
+        if let Some(into) = self.nearest_vertex(screen, others) {
+            let edit = Edit::MergeVertex { id, into };
+            if self.check(vec![edit]).is_some() {
+                return edit;
+            }
         }
 
         self.document
@@ -545,8 +565,34 @@ impl Editor<'_> {
             })
             .min_by(|x, y| x.1.total_cmp(&y.1))
             .map(|(edit, _)| edit)
+            .or_else(|| self.snap_onto_outline(id, screen))
             .or_else(|| self.move_across_edge_line(id, screen))
             .unwrap_or(Edit::MoveVertex { id, to })
+    }
+
+    /// Close to an outline edge elsewhere (e.g. of a separate part), put the
+    /// vertex on it so it joins up with the triangle there, if that works
+    /// out.
+    fn snap_onto_outline(&self, id: VertexId, screen: Point) -> Option<Edit> {
+        let camera = self.camera;
+
+        let mut candidates: Vec<_> = outline(self.document)
+            .into_iter()
+            .filter(|&(a, b)| a != id && b != id)
+            .filter_map(|(a, b)| {
+                let pa = camera.to_screen(self.document.vertex(a));
+                let pb = camera.to_screen(self.document.vertex(b));
+                let (closest, d) = closest_on_segment(screen, pa, pb);
+                let at = camera.to_world(closest);
+                (d <= EDGE_HIT).then_some((Edit::CollapseOntoEdge { id, a, b, at }, d))
+            })
+            .collect();
+        candidates.sort_by(|x, y| x.1.total_cmp(&y.1));
+
+        candidates
+            .into_iter()
+            .map(|(edit, _)| edit)
+            .find(|&edit| self.check(vec![edit]).is_some())
     }
 
     /// Close to the line through the opposite edge of one of its triangles
@@ -804,17 +850,20 @@ impl Editor<'_> {
     /// triangles in green; removed edges, and triangles squashed flat by the
     /// edit (as the line they collapse into), in red.
     fn draw_changes(&self, frame: &mut Frame, result: &Document) {
-        let added =
-            self.mesh(new_triangles(self.document, result).map(|t| t.map(|v| result.vertex(v))));
+        let same = welded(result);
+        let added = self
+            .mesh(new_triangles(self.document, result, &same).map(|t| t.map(|v| result.vertex(v))));
         frame.fill(&added, Color { a: 0.2, ..ADDED });
         frame.stroke(&added, stroke(ADDED, 1.5));
 
         // Vertices are never removed, so old edges can be drawn where their
-        // ends are after the edit.
+        // ends are after the edit. An edge whose end was welded elsewhere, or
+        // that was cut at a vertex, is still there.
         let kept = result.unique_edges();
+        let used: Vec<VertexId> = result.used_vertices().collect();
         let removed = Path::new(|p| {
             for (u, v) in self.document.unique_edges() {
-                if kept.binary_search(&(u, v)).is_err() {
+                if !is_kept(result, &kept, &used, same(u), same(v)) {
                     p.move_to(self.camera.to_screen(result.vertex(u)));
                     p.line_to(self.camera.to_screen(result.vertex(v)));
                 }
@@ -825,17 +874,84 @@ impl Editor<'_> {
         // Removed triangles whose corners now (nearly) line up were squashed;
         // other removed ones (e.g. a split parent) were replaced.
         let squashed = Path::new(|p| {
-            for t in new_triangles(result, self.document) {
-                let [a, b, c] = t.map(|v| self.camera.to_screen(result.vertex(v)));
-
-                if min_height([a, b, c]) < 1.0 {
-                    let (from, to) = longest_edge([a, b, c]);
-                    p.move_to(from);
-                    p.line_to(to);
-                }
+            for (from, to) in self.squashed(result) {
+                p.move_to(from);
+                p.line_to(to);
             }
         });
         frame.stroke(&squashed, stroke(REMOVED, 3.0));
+    }
+
+    /// Highlights where `result` joins things up: edges that were on the
+    /// outline and become shared by two triangles (other than `source`), and
+    /// the vertex the edit welds onto, drawn as rings.
+    fn draw_joins(
+        &self,
+        frame: &mut Frame,
+        edits: &[Edit],
+        result: &Document,
+        source: Option<(VertexId, VertexId)>,
+    ) {
+        let uses = |document: &Document, (u, v): (VertexId, VertexId)| {
+            document
+                .edges()
+                .filter(|&(x, y)| (x.min(y), x.max(y)) == (u, v))
+                .count()
+        };
+        let joined: Vec<_> = result
+            .unique_edges()
+            .into_iter()
+            .filter(|&e| Some(e) != source)
+            .filter(|&e| uses(result, e) == 2 && uses(self.document, e) == 1)
+            .collect();
+
+        let mut joined = joined;
+        let mut rings: Vec<VertexId> = joined.iter().flat_map(|&(u, v)| [u, v]).collect();
+        for edit in edits {
+            match *edit {
+                Edit::MergeVertex { into, .. } => rings.push(into),
+                Edit::ExtendEdge {
+                    apex: Corner::Existing(id),
+                    ..
+                } => rings.push(id),
+                // Onto an edge elsewhere (not squashing its own triangle):
+                // the edge it lands on, now cut at the vertex.
+                Edit::CollapseOntoEdge { id, a, b, .. }
+                    if self.document.find_triangle([id, a, b]).is_none() =>
+                {
+                    rings.push(id);
+                    joined.extend([(a, id), (id, b)]);
+                }
+                _ => {}
+            }
+        }
+        rings.sort_unstable();
+        rings.dedup();
+
+        let screen = |v| self.camera.to_screen(result.vertex(v));
+        let edges = Path::new(|p| {
+            for &(u, v) in &joined {
+                p.move_to(screen(u));
+                p.line_to(screen(v));
+            }
+        });
+        frame.stroke(&edges, stroke(JOINED, 4.0));
+
+        for v in rings {
+            frame.stroke(&Path::circle(screen(v), 10.0), stroke(JOINED, 2.5));
+        }
+    }
+
+    /// Triangles `result` no longer has because they were squashed flat, as
+    /// the screen-space line each collapsed onto.
+    fn squashed(&self, result: &Document) -> Vec<(Point, Point)> {
+        let same = welded(result);
+        new_triangles(result, self.document, &same)
+            .filter_map(|t| {
+                let corners = t.map(|v| self.camera.to_screen(result.vertex(v)));
+                (min_height(corners) < 1.0).then(|| longest_edge(corners))
+            })
+            .collect()
     }
 
     fn mesh(&self, triangles: impl Iterator<Item = [Point; 3]>) -> Path {
@@ -905,9 +1021,10 @@ fn cross(a: Vector, b: Vector) -> f32 {
 fn new_triangles<'a>(
     before: &'a Document,
     after: &'a Document,
+    same: &'a impl Fn(VertexId) -> VertexId,
 ) -> impl Iterator<Item = [VertexId; 3]> + 'a {
-    let key = |t: &[VertexId; 3]| {
-        let mut t = *t;
+    let key = move |t: &[VertexId; 3]| {
+        let mut t = t.map(same);
         t.sort_unstable();
         t
     };
@@ -918,6 +1035,63 @@ fn new_triangles<'a>(
         .iter()
         .filter(move |t| !existing.contains(&key(t)))
         .copied()
+}
+
+/// Maps each vertex to the one it was welded onto in `result` (a vertex no
+/// longer used, sitting exactly on one that is), or to itself.
+fn welded(result: &Document) -> impl Fn(VertexId) -> VertexId + '_ {
+    let used: Vec<VertexId> = result.used_vertices().collect();
+    move |v| {
+        if used.contains(&v) {
+            return v;
+        }
+        let at = result.vertex(v);
+        used.iter()
+            .copied()
+            .find(|&w| result.vertex(w) == at)
+            .unwrap_or(v)
+    }
+}
+
+/// Whether `result` still has the edge `u`–`v` (`kept` being its sorted
+/// edges), possibly cut into pieces at vertices along it.
+fn is_kept(
+    result: &Document,
+    kept: &[(VertexId, VertexId)],
+    used: &[VertexId],
+    u: VertexId,
+    v: VertexId,
+) -> bool {
+    if u == v {
+        return false;
+    }
+    if kept.binary_search(&(u.min(v), u.max(v))).is_ok() {
+        return true;
+    }
+    let (pu, pv) = (result.vertex(u), result.vertex(v));
+    // Cut at `w`: the piece from `u` to `w` must be there directly, the
+    // rest may be cut again.
+    used.iter().any(|&w| {
+        w != u
+            && w != v
+            && closest_on_segment(result.vertex(w), pu, pv).1 < 1e-3
+            && kept.binary_search(&(u.min(w), u.max(w))).is_ok()
+            && is_kept(result, kept, used, w, v)
+    })
+}
+
+/// Edges on the outline: used by exactly one triangle, as `(low, high)`.
+fn outline(document: &Document) -> Vec<(VertexId, VertexId)> {
+    let mut edges: Vec<_> = document
+        .edges()
+        .map(|(u, v)| (u.min(v), u.max(v)))
+        .collect();
+    edges.sort_unstable();
+    edges
+        .chunk_by(|x, y| x == y)
+        .filter(|run| run.len() == 1)
+        .map(|run| run[0])
+        .collect()
 }
 
 /// The point the user is placing with `edits`, where its handle is drawn.
@@ -1087,6 +1261,101 @@ mod tests {
                 ..
             }])
         ));
+    }
+
+    #[test]
+    fn dragging_a_corner_onto_a_separate_triangle_welds() {
+        let mut doc = Document::default();
+        doc.apply(Edit::AddTriangle([
+            Point::new(100.0, 300.0),
+            Point::new(200.0, 300.0),
+            Point::new(150.0, 200.0),
+        ]));
+        doc.apply(Edit::AddTriangle([
+            Point::new(250.0, 300.0),
+            Point::new(350.0, 300.0),
+            Point::new(300.0, 200.0),
+        ]));
+        let cache = canvas::Cache::new();
+        let editor = Editor {
+            document: &doc,
+            camera: Camera::default(),
+            cache: &cache,
+        };
+
+        // Corner 1 (200, 300) dropped next to corner 3 (250, 300).
+        assert_eq!(
+            editor.move_edit(1, Point::new(245.0, 302.0)),
+            Edit::MergeVertex { id: 1, into: 3 }
+        );
+    }
+
+    /// Two separate triangles side by side, a gap between corners 1 and 3.
+    fn two_apart() -> Document {
+        let mut doc = Document::default();
+        doc.apply(Edit::AddTriangle([
+            Point::new(100.0, 300.0),
+            Point::new(200.0, 300.0),
+            Point::new(150.0, 200.0),
+        ]));
+        doc.apply(Edit::AddTriangle([
+            Point::new(250.0, 300.0),
+            Point::new(350.0, 300.0),
+            Point::new(300.0, 200.0),
+        ]));
+        doc
+    }
+
+    #[test]
+    fn dragging_a_corner_onto_a_separate_outline_edge_joins() {
+        let doc = two_apart();
+        let cache = canvas::Cache::new();
+        let editor = Editor {
+            document: &doc,
+            camera: Camera::default(),
+            cache: &cache,
+        };
+
+        // Corner 1 dropped near the middle of edge 3–5, (275, 250).
+        let edit = editor.move_edit(1, Point::new(272.0, 250.0));
+        assert!(matches!(
+            edit,
+            Edit::CollapseOntoEdge { id: 1, a, b, .. } if (a.min(b), a.max(b)) == (3, 5)
+        ));
+
+        // The other triangle is cut at the corner, which now joins both.
+        let (_, result) = editor.check(vec![edit]).unwrap();
+        assert_eq!(result.triangle_ids().len(), 3);
+        let edges = result.unique_edges();
+        assert!(edges.contains(&(1, 3)) && edges.contains(&(1, 5)));
+    }
+
+    #[test]
+    fn welding_corners_removes_nothing() {
+        let doc = two_apart();
+        let cache = canvas::Cache::new();
+        let editor = Editor {
+            document: &doc,
+            camera: Camera::default(),
+            cache: &cache,
+        };
+
+        let (_, result) = editor
+            .check(vec![Edit::MergeVertex { id: 1, into: 3 }])
+            .unwrap();
+        let same = welded(&result);
+        let kept = result.unique_edges();
+        let used: Vec<_> = result.used_vertices().collect();
+
+        assert!(editor.squashed(&result).is_empty());
+        assert_eq!(new_triangles(&doc, &result, &same).count(), 0);
+        assert!(doc.unique_edges().into_iter().all(|(u, v)| is_kept(
+            &result,
+            &kept,
+            &used,
+            same(u),
+            same(v)
+        )));
     }
 
     #[test]
