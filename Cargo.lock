@@ -3777,6 +3777,7 @@ dependencies = [
  "base64",
  "iced",
  "image",
+ "rayon",
  "rfd",
  "serde",
  "serde_json",

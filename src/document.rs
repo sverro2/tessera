@@ -19,7 +19,7 @@
 //! pieces of a split face keep its colour. Likewise an edge keeps its style
 //! while it keeps its ends, and pieces of a styled edge (cut, say) keep it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -334,8 +334,9 @@ impl Document {
             return false;
         }
 
+        let existed: HashSet<[VertexId; 3]> = before.triangles.iter().map(|&t| key(t)).collect();
         let changed = |t: &[VertexId; 3]| {
-            before.find_triangle(*t).is_none()
+            !existed.contains(&key(*t))
                 || t.iter()
                     .any(|&v| before.vertices.get(v) != Some(&self.vertices[v]))
         };
@@ -378,6 +379,25 @@ impl Document {
         edits: &[Edit],
         deadline: Option<Instant>,
     ) -> Option<(Document, Changes)> {
+        self.preview_with(edits, deadline, true)
+    }
+
+    /// Like [`Self::preview_until`], but leaving the paint behind: for
+    /// trying out edits that may yet be turned down (it's cheaper).
+    pub fn preview_shape_until(
+        &self,
+        edits: &[Edit],
+        deadline: Option<Instant>,
+    ) -> Option<(Document, Changes)> {
+        self.preview_with(edits, deadline, false)
+    }
+
+    fn preview_with(
+        &self,
+        edits: &[Edit],
+        deadline: Option<Instant>,
+        paint: bool,
+    ) -> Option<(Document, Changes)> {
         let mut changes = Changes::default();
         let mut document = self.clone();
 
@@ -388,13 +408,15 @@ impl Document {
                 _ => None,
             };
             let valid = next.apply_unchecked(edit, &mut changes, deadline)
-                && next.normalize(moved, &mut changes)
+                && next.normalize(moved, &mut changes, &document)
                 && next.is_valid_after(&document);
             if !valid {
                 return None;
             }
-            next.inherit_colors(&document);
-            next.inherit_edge_styles(&document);
+            if paint {
+                next.inherit_colors(&document);
+                next.inherit_edge_styles(&document);
+            }
             document = next;
         }
 
@@ -647,14 +669,25 @@ impl Document {
     /// [`Self::split_t_junctions`]). Records what it did in `changes`.
     ///
     /// Returns `false` if that doesn't settle.
-    fn normalize(&mut self, moved: Option<VertexId>, changes: &mut Changes) -> bool {
+    ///
+    /// `before` is the (normalized) document the edit was made to: only what
+    /// changed since needs checking against the rest.
+    fn normalize(
+        &mut self,
+        moved: Option<VertexId>,
+        changes: &mut Changes,
+        before: &Document,
+    ) -> bool {
         let used = self.unique_vertices();
+        let changed = Changed::since(self, before);
 
-        for (i, &u) in used.iter().enumerate() {
-            for &v in &used[i + 1..] {
-                if self.vertices[u].distance(self.vertices[v]) > tolerance(0.0) {
+        for &u in &changed.vertices {
+            for &v in &used {
+                if u == v || self.vertices[u].distance(self.vertices[v]) > tolerance(0.0) {
                     continue;
                 }
+                // The later one goes, unless the earlier one is the one moved.
+                let (u, v) = (u.min(v), u.max(v));
                 let (gone, kept) = if Some(u) == moved { (u, v) } else { (v, u) };
                 if changes.welded.iter().any(|&(g, _)| g == gone || g == kept) {
                     continue; // Already welded away.
@@ -671,22 +704,19 @@ impl Document {
 
         // Welding squashes the triangles that had both, and may leave
         // duplicates (two triangles folded onto each other).
-        let mut seen: Vec<[VertexId; 3]> = Vec::new();
+        let mut seen: HashSet<[VertexId; 3]> = HashSet::new();
         let mut squashed = Vec::new();
         self.triangles.retain(|&t| {
-            let mut key = t;
-            key.sort_unstable();
+            let key = key(t);
             if key[0] == key[1] || key[1] == key[2] {
                 squashed.push(t);
                 return false;
             }
-            let keep = !seen.contains(&key);
-            seen.push(key);
-            keep
+            seen.insert(key)
         });
         changes.squashed.extend(squashed);
 
-        self.split_t_junctions(changes)
+        self.split_t_junctions(changes, Some(&changed))
     }
 
     /// Splits every triangle that has a vertex lying in the middle of one of
@@ -697,8 +727,16 @@ impl Document {
     /// one a vertex can lie on two edges at once, which would split forever.
     /// The edges such a triangle joined are then repaired like any other.
     ///
+    /// With `changed` (since a document without T-junctions), only what
+    /// changed is checked: its edges against every vertex, and its vertices
+    /// against every edge.
+    ///
     /// Returns `false` if that doesn't settle.
-    fn split_t_junctions(&mut self, changes: &mut Changes) -> bool {
+    pub(super) fn split_t_junctions(
+        &mut self,
+        changes: &mut Changes,
+        changed: Option<&Changed>,
+    ) -> bool {
         let limit = 4 * (self.triangles.len() + self.vertices.len());
 
         for _ in 0..limit {
@@ -714,9 +752,16 @@ impl Document {
             let used = self.unique_vertices();
             let vertices = &self.vertices;
             let junction = self.triangles.iter().enumerate().find_map(|(i, &t)| {
+                // An unchanged triangle can only have gained a changed
+                // vertex on its edges.
+                let candidates: &[VertexId] = match changed {
+                    Some(changed) if !changed.triangle(t) => &changed.vertices,
+                    _ => &used,
+                };
                 (0..3).find_map(|k| {
                     let (u, v, x) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
-                    used.iter()
+                    candidates
+                        .iter()
                         .copied()
                         .find(|&w| {
                             !t.contains(&w)
@@ -769,6 +814,32 @@ impl Document {
             t.sort_unstable();
             t == ids
         })
+    }
+}
+
+/// What changed in a document since `before`: the vertices that are new or
+/// moved, and (to tell the triangles that are new) the triangles before.
+pub(super) struct Changed {
+    vertices: Vec<VertexId>,
+    before: HashSet<[VertexId; 3]>,
+}
+
+impl Changed {
+    fn since(document: &Document, before: &Document) -> Self {
+        let vertices = document
+            .unique_vertices()
+            .into_iter()
+            .filter(|&v| before.vertices.get(v) != Some(&document.vertices[v]))
+            .collect();
+        Changed {
+            vertices,
+            before: before.triangles.iter().map(|&t| key(t)).collect(),
+        }
+    }
+
+    /// Whether triangle `t` is new, or has a changed corner.
+    fn triangle(&self, t: [VertexId; 3]) -> bool {
+        !self.before.contains(&key(t)) || t.iter().any(|v| self.vertices.contains(v))
     }
 }
 

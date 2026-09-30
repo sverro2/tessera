@@ -106,7 +106,7 @@ impl Document {
     /// that piece.
     fn thin_piece(&self, before: &Document, snap: f32, outline: &[Point]) -> Option<VertexId> {
         let mut after = self.clone();
-        after.split_t_junctions(&mut Default::default());
+        after.split_t_junctions(&mut Default::default(), None);
         let used = before.unique_vertices();
 
         after

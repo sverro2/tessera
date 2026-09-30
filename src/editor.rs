@@ -17,6 +17,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+
 use iced::keyboard;
 use iced::mouse;
 use iced::time::{Duration, Instant};
@@ -48,8 +50,10 @@ const MIN_THICKNESS: f32 = 5.0;
 /// How far (screen px) inside a limiting edge a dragged vertex stops: just
 /// clear of making its triangle with that edge a sliver.
 const SLIDE_INSET: f32 = MIN_THICKNESS + 0.5;
-/// How long working out what a drag does may take per mouse move.
-const BUDGET: Duration = Duration::from_millis(12);
+/// How long working out what a drag does may take per frame: 60% of a frame
+/// at 60 Hz, leaving the rest for drawing it. (The rare heavy drag may slow
+/// a faster screen down to 60 frames a second; that's plenty.)
+const BUDGET: Duration = Duration::from_millis(10);
 /// How many snap targets to try (closest first) before giving up on
 /// snapping.
 const MAX_SNAPS: usize = 4;
@@ -262,6 +266,42 @@ impl canvas::Program<Message> for Backdrop<'_> {
             }
             draw_grid(frame, self.camera);
         })]
+    }
+}
+
+/// An editor's view of the drawing, without what can't go to another
+/// thread (its caches): to work out drags on several cores.
+#[derive(Clone, Copy)]
+struct Worker<'a> {
+    document: &'a Document,
+    current: NodeId,
+    crossfade: Crossfade,
+    show_edges: bool,
+    shown: bool,
+    camera: Camera,
+    background: Option<&'a Background>,
+    tool: Tool,
+    deadline: Option<std::time::Instant>,
+}
+
+impl<'a> Worker<'a> {
+    /// An editor to work with, on this thread, drawing into `caches` (none
+    /// is drawn).
+    fn editor(self, caches: &'a Caches) -> Editor<'a> {
+        Editor {
+            document: self.document,
+            current: self.current,
+            crossfade: self.crossfade,
+            show_edges: self.show_edges,
+            shown: self.shown,
+            below: Vec::new(),
+            above: Vec::new(),
+            camera: self.camera,
+            caches,
+            background: self.background,
+            tool: self.tool,
+            deadline: Cell::new(self.deadline),
+        }
     }
 }
 
@@ -1175,7 +1215,10 @@ impl Editor<'_> {
         if self.out_of_time() {
             return None;
         }
-        let (result, changes) = self.document.preview_until(&edits, self.deadline.get())?;
+        // The shape first: the paint only once it's taken (see below).
+        let (result, _) = self
+            .document
+            .preview_shape_until(&edits, self.deadline.get())?;
 
         // Slivers would be invisible and impossible to grab. Triangles that
         // were already that thin (e.g. when zoomed far out) may stay so, as
@@ -1195,6 +1238,8 @@ impl Editor<'_> {
         if has_sliver {
             return None;
         }
+        // Taken: now with its paint (the same again, so it works out).
+        let (result, changes) = self.document.preview_until(&edits, None)?;
         let added = new_triangles(self.document, &result, &|v| changes.kept(v)).collect();
         Some(Pending {
             edits,
@@ -1396,9 +1441,7 @@ impl Editor<'_> {
             })
             .collect();
 
-        self.closest_valid(&lines, to, |p| {
-            self.pending(Interaction::MovingVertex { id, to: p })
-        })
+        self.closest_valid(&lines, to, move |p| Interaction::MovingVertex { id, to: p })
     }
 
     /// Where the new corner of an extension from edge `a`–`b` should be when
@@ -1440,28 +1483,29 @@ impl Editor<'_> {
             None => vec![offset_line(pa, pb, cursor, SLIDE_INSET)],
         };
 
-        self.closest_valid(&lines, to, |p| {
-            self.pending(Interaction::Extending {
-                a,
-                b,
-                start,
-                apex: p,
-            })
+        self.closest_valid(&lines, to, move |p| Interaction::Extending {
+            a,
+            b,
+            start,
+            apex: p,
         })
         .map(|(p, pending)| (p, Some(pending)))
     }
 
     /// The valid position closest to the cursor at `to` (world): the cursor
     /// itself, its projection onto one of `lines` (sliding along a limit) or
-    /// where two of them cross (stuck in a corner), with what `evaluate`
-    /// says releasing there does. `None` if there's none (in time).
+    /// where two of them cross (stuck in a corner), with what releasing the
+    /// drag (`interaction` there) does. `None` if there's none (in time).
+    ///
+    /// The other positions are tried on all cores at once (nearest wins, as
+    /// if tried in turn).
     fn closest_valid(
         &self,
         lines: &[Line],
         to: Point,
-        evaluate: impl Fn(Point) -> Option<Pending>,
+        interaction: impl Fn(Point) -> Interaction + Sync,
     ) -> Option<(Point, Pending)> {
-        if let Some(pending) = evaluate(to) {
+        if let Some(pending) = self.pending(interaction(to)) {
             return Some((to, pending));
         }
 
@@ -1482,10 +1526,30 @@ impl Editor<'_> {
             .collect();
         candidates.sort_by(|x, y| x.1.total_cmp(&y.1));
 
-        candidates
-            .into_iter()
-            .take_while(|_| !self.out_of_time())
-            .find_map(|(p, _)| evaluate(p).map(|pending| (p, pending)))
+        let worker = self.worker();
+        candidates.par_iter().find_map_first(|&(p, _)| {
+            let caches = Caches::default();
+            let editor = worker.editor(&caches);
+            if editor.out_of_time() {
+                return None;
+            }
+            editor.pending(interaction(p)).map(|pending| (p, pending))
+        })
+    }
+
+    /// What working out drags on another thread needs of this editor.
+    fn worker(&self) -> Worker<'_> {
+        Worker {
+            document: self.document,
+            current: self.current,
+            crossfade: self.crossfade,
+            show_edges: self.show_edges,
+            shown: self.shown,
+            camera: self.camera,
+            background: self.background,
+            tool: self.tool,
+            deadline: self.deadline.get(),
+        }
     }
 
     /// Whether clicking and dragging does something: not on a hidden
@@ -3068,6 +3132,42 @@ mod tests {
 mod bench {
     use super::*;
     use std::time::Instant as T;
+
+    /// The candidates tried on all cores give what trying them in turn
+    /// (on one thread) does.
+    #[test]
+    fn parallel_search_finds_what_a_sequential_one_does() {
+        let doc = grid(6, 40.0);
+        let cache = Caches::default();
+        let editor = super::tests::editor(&doc, &cache);
+        let one_thread = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let mut moved = 0;
+        for v in doc.unique_vertices() {
+            let from = doc.vertex(v);
+            // Far across the grid, where most positions are blocked.
+            for to in [
+                Point::new(250.0, 250.0),
+                Point::new(-50.0, 120.0),
+                Point::new(400.0, 20.0),
+            ] {
+                let target = from + (to - from) * 0.8;
+                let parallel = editor.limit_move(v, target).map(|(p, _)| p);
+                let worker = editor.worker();
+                let sequential = one_thread.install(|| {
+                    let caches = Caches::default();
+                    let editor = worker.editor(&caches);
+                    editor.limit_move(v, target).map(|(p, _)| p)
+                });
+                assert_eq!(parallel, sequential, "vertex {v} to {target:?}");
+                moved += usize::from(parallel.is_some_and(|p| p != target));
+            }
+        }
+        // Some moves were held back, so candidates were tried.
+        assert!(moved > 0);
+    }
 
     fn grid(n: usize, size: f32) -> Document {
         let mut doc = Document::default();
