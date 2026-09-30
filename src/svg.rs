@@ -1,11 +1,12 @@
 //! SVG export of the [`Layers`]: each layer and group an Inkscape layer,
 //! each face a path of its own, painted edges paths over them.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::document::Document;
+use crate::fade;
 use crate::joints;
-use crate::layers::{Layers, Node};
+use crate::layers::{Layer, Layers, Node};
 use crate::paint;
 
 const PADDING: f32 = 10.0;
@@ -66,7 +67,7 @@ fn write_node(svg: &mut String, node: &Node, depth: usize, count: &mut usize) {
         escape(name)
     );
     match node {
-        Node::Layer(layer) => write_drawing(svg, &layer.document, &format!("l{n}-"), depth + 1),
+        Node::Layer(layer) => write_drawing(svg, layer, &format!("l{n}-"), depth + 1),
         Node::Group(group) => {
             for child in group.children.iter().rev() {
                 write_node(svg, child, depth + 1, count);
@@ -79,7 +80,13 @@ fn write_node(svg: &mut String, node: &Node, depth: usize, count: &mut usize) {
 /// One path per face, outlined; painted edges over them. Every element
 /// styled itself, so editors (e.g. Inkscape) can pick and node-edit each
 /// directly. Ids start with `prefix`.
-fn write_drawing(svg: &mut String, document: &Document, prefix: &str, depth: usize) {
+///
+/// Crossfaded edges keep their own colour but at their ends, which fade into
+/// the average colour of the painted edges meeting there (see [`fade`]): a
+/// linear gradient, exactly as drawn.
+fn write_drawing(svg: &mut String, layer: &Layer, prefix: &str, depth: usize) {
+    let document = &layer.document;
+    let crossfade_edges = layer.crossfade.edges;
     let indent = "  ".repeat(depth);
     for (i, ([a, b, c], color)) in document.triangles().zip(document.colors()).enumerate() {
         // Painted faces are solid.
@@ -92,6 +99,10 @@ fn write_drawing(svg: &mut String, document: &Document, prefix: &str, depth: usi
             r#"{indent}<path id="{prefix}face{i}" d="M {},{} L {},{} L {},{} Z" {fill}/>"#,
             a.x, a.y, b.x, b.y, c.x, c.y
         );
+    }
+
+    if !layer.show_edges {
+        return;
     }
 
     // The edges over them, each its own outline, so edges of different
@@ -111,16 +122,41 @@ fn write_drawing(svg: &mut String, document: &Document, prefix: &str, depth: usi
             .collect::<Vec<_>>(),
         |v| document.vertex(v),
     );
-    for (i, ((.., color), outline)) in edges.iter().zip(&outlines).enumerate() {
+    let fades = if crossfade_edges {
+        fade::edge_fades(document, layer.crossfade.width, |v| document.vertex(v))
+    } else {
+        HashMap::new()
+    };
+
+    for (i, ((a, b, _, color), outline)) in edges.iter().zip(&outlines).enumerate() {
         let mut d = String::new();
         for (j, p) in outline.iter().enumerate() {
             let _ = write!(d, "{} {},{} ", if j == 0 { "M" } else { "L" }, p.x, p.y);
         }
         d.push('Z');
-        let _ = writeln!(
-            svg,
-            r#"{indent}<path id="{prefix}edge{i}" d="{d}" fill="{color}"/>"#
-        );
+        let id = format!("{prefix}edge{i}");
+        let fill = if let Some(stops) = fades.get(&(*a, *b)) {
+            // Its own colour, fading at the ends into the mix there.
+            let (p, q) = (document.vertex(*a), document.vertex(*b));
+            let length = stops[3].0;
+            let mut gradient = format!(
+                r#"<linearGradient id="{id}-fade" gradientUnits="userSpaceOnUse" x1="{}" y1="{}" x2="{}" y2="{}">"#,
+                p.x, p.y, q.x, q.y
+            );
+            for &(at, color) in stops {
+                let _ = write!(
+                    gradient,
+                    r#"<stop offset="{}" stop-color="{}"/>"#,
+                    at / length,
+                    paint::to_hex(color)
+                );
+            }
+            let _ = writeln!(svg, "{indent}{gradient}</linearGradient>");
+            format!("url(#{id}-fade)")
+        } else {
+            color.clone()
+        };
+        let _ = writeln!(svg, r#"{indent}<path id="{id}" d="{d}" fill="{fill}"/>"#);
     }
 }
 
@@ -135,8 +171,73 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::Document;
     use crate::document::{EdgeStyle, Edit};
     use iced::{Color, Point};
+
+    #[test]
+    fn hidden_edges_are_left_out() {
+        let mut document = Document::default();
+        document.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(5.0, 10.0),
+            ],
+            snap: 0.0,
+        });
+        let mut layers = Layers::default();
+        let first = layers.first_layer();
+        layers.layer_mut(first).unwrap().document = std::sync::Arc::new(document);
+        assert_eq!(export(&layers).matches("-edge").count(), 3);
+        layers.set_show_edges(first, false);
+        let svg = export(&layers);
+        assert_eq!(svg.matches("-edge").count(), 0, "{svg}");
+        assert_eq!(svg.matches("-face").count(), 1, "{svg}");
+    }
+
+    #[test]
+    fn crossfaded_edges_fade_along_them() {
+        let mut document = Document::default();
+        document.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(5.0, 10.0),
+            ],
+            snap: 0.0,
+        });
+        let (red, blue) = (Color::from_rgb8(255, 0, 0), Color::from_rgb8(0, 0, 255));
+        for ((a, b), color) in [((0, 1), red), ((1, 2), blue)] {
+            assert!(document.apply(Edit::PaintEdge {
+                a,
+                b,
+                style: Some(EdgeStyle { color, width: 2.0 }),
+            }));
+        }
+        let mut layers = Layers::default();
+        let first = layers.first_layer();
+        layers.layer_mut(first).unwrap().document = std::sync::Arc::new(document);
+        let solid = export(&layers);
+        assert!(!solid.contains("linearGradient"), "{solid}");
+
+        layers.set_crossfade(
+            first,
+            crate::layers::Crossfade {
+                edges: true,
+                width: 2.0,
+            },
+        );
+        let svg = export(&layers);
+        // Two painted edges, 10 long: their own colour but for the last 2
+        // at an end where they meet, fading into the blend there.
+        assert_eq!(svg.matches("<linearGradient").count(), 2, "{svg}");
+        assert!(
+            svg.contains(r##"<stop offset="0" stop-color="#ff0000"/><stop offset="0.2" stop-color="#ff0000"/><stop offset="0.8" stop-color="#ff0000"/><stop offset="1" stop-color="#800080"/>"##),
+            "{svg}"
+        );
+        assert_eq!(svg.matches("url(#l1-edge").count(), 2, "{svg}");
+    }
 
     #[test]
     fn layers_hold_plain_paths() {

@@ -23,7 +23,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crate::background::Background;
 use crate::camera::Camera;
 use crate::document::{Document, EdgeStyle};
-use crate::layers::{Group, Layer, Layers, Node};
+use crate::layers::{Crossfade, Group, Layer, Layers, Node};
 use crate::paint;
 
 /// The file name extension.
@@ -80,6 +80,18 @@ enum NodeV2 {
         name: String,
         #[serde(default = "shown")]
         visible: bool,
+        /// Whether painted edges blend into their neighbours' colours at
+        /// their ends. Added later; files without it don't.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        crossfade_edges: bool,
+        /// How far edges fade at their ends (world units); if not given,
+        /// the default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        crossfade_edge_width: Option<f32>,
+        /// Whether its edges are hidden when painted and exported (their
+        /// paint kept). Added later; files without it show them.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        hide_edges: bool,
         #[serde(flatten)]
         drawing: DrawingV1,
     },
@@ -152,6 +164,10 @@ pub fn save(layers: &Layers, camera: Camera, background: Option<&Background>) ->
             Node::Layer(layer) => NodeV2::Layer {
                 name: layer.name.clone(),
                 visible: layer.visible,
+                crossfade_edges: layer.crossfade.edges,
+                crossfade_edge_width: (layer.crossfade.width != Crossfade::WIDTH)
+                    .then_some(layer.crossfade.width),
+                hide_edges: !layer.show_edges,
                 drawing: save_drawing(&layer.document),
             },
             Node::Group(group) => NodeV2::Group {
@@ -221,6 +237,9 @@ pub fn open(text: &str) -> Result<Contents, String> {
             let layer = NodeV2::Layer {
                 name: "Layer 1".to_string(),
                 visible: true,
+                crossfade_edges: false,
+                crossfade_edge_width: None,
+                hide_edges: false,
                 drawing: file.drawing,
             };
             (file.view, vec![layer], file.background)
@@ -242,12 +261,20 @@ pub fn open(text: &str) -> Result<Contents, String> {
             NodeV2::Layer {
                 name,
                 visible,
+                crossfade_edges,
+                crossfade_edge_width,
+                hide_edges,
                 drawing,
             } => Node::Layer(Layer {
                 // Made unique by `Layers::from_nodes`.
                 id: 0,
                 name,
                 visible,
+                crossfade: Crossfade {
+                    edges: crossfade_edges,
+                    width: fade_width(crossfade_edge_width),
+                },
+                show_edges: !hide_edges,
                 document: Arc::new(open_drawing(drawing)?),
             }),
             NodeV2::Group {
@@ -288,6 +315,13 @@ pub fn open(text: &str) -> Result<Contents, String> {
         camera,
         background,
     })
+}
+
+/// A saved fade width, if it's a usable one; else the default.
+fn fade_width(saved: Option<f32>) -> f32 {
+    saved
+        .filter(|width| width.is_finite() && *width > 0.0)
+        .unwrap_or(Crossfade::WIDTH)
 }
 
 fn open_drawing(drawing: DrawingV1) -> Result<Document, String> {
@@ -396,6 +430,14 @@ mod tests {
         let front = layers.add_layer(first);
         layers.rename(front, "Front <&>".into());
         layers.set_visible(front, false);
+        layers.set_crossfade(
+            first,
+            Crossfade {
+                edges: true,
+                width: 3.0,
+            },
+        );
+        layers.set_show_edges(first, false);
         let group = layers.group(first).unwrap();
         layers.rename(group, "Back".into());
         let camera = Camera {
@@ -414,6 +456,22 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(rows(&opened.layers), rows(&layers));
+        let crossfades = |layers: &Layers| {
+            layers
+                .layers()
+                .iter()
+                .map(|layer| layer.crossfade)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(crossfades(&opened.layers), crossfades(&layers));
+        let edges_shown = |layers: &Layers| {
+            layers
+                .layers()
+                .iter()
+                .map(|layer| layer.show_edges)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(edges_shown(&opened.layers), [true, false]);
         let (document, saved) = (
             &opened.layers.layers()[1].document,
             &layers.layers()[1].document,

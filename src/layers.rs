@@ -17,8 +17,36 @@ pub struct Layer {
     pub id: NodeId,
     pub name: String,
     pub visible: bool,
+    /// Whether painted edges blend into their neighbours' colours at their
+    /// ends.
+    pub crossfade: Crossfade,
+    /// Whether its edges are drawn when painting (and exported); hidden,
+    /// their paint is kept.
+    pub show_edges: bool,
     /// Shared between undo steps until changed.
     pub document: Arc<Document>,
+}
+
+/// Whether a layer's painted edges blend into their neighbours'.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Crossfade {
+    pub edges: bool,
+    /// How far (world units) from its ends an edge fades into the edges
+    /// meeting there; in between, it's its own colour.
+    pub width: f32,
+}
+
+impl Crossfade {
+    pub const WIDTH: f32 = 6.0;
+}
+
+impl Default for Crossfade {
+    fn default() -> Self {
+        Crossfade {
+            edges: false,
+            width: Crossfade::WIDTH,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -264,7 +292,7 @@ impl Layers {
 
     /// The visible layers behind layer `current` and those in front of it,
     /// each back to front: the order to draw them in.
-    pub fn around<'a>(&'a self, current: NodeId) -> (Vec<&'a Document>, Vec<&'a Document>) {
+    pub fn around<'a>(&'a self, current: NodeId) -> (Vec<&'a Layer>, Vec<&'a Layer>) {
         // Back to front, with whether each is shown.
         fn walk<'a>(nodes: &'a [Node], shown: bool, out: &mut Vec<(&'a Layer, bool)>) {
             for node in nodes.iter().rev() {
@@ -281,10 +309,10 @@ impl Layers {
             .iter()
             .position(|(layer, _)| layer.id == current)
             .unwrap_or(stack.len());
-        let shown = |part: &[(&'a Layer, bool)]| -> Vec<&'a Document> {
+        let shown = |part: &[(&'a Layer, bool)]| -> Vec<&'a Layer> {
             part.iter()
                 .filter(|(_, shown)| *shown)
-                .map(|(layer, _)| &*layer.document)
+                .map(|(layer, _)| *layer)
                 .collect()
         };
         (
@@ -411,6 +439,20 @@ impl Layers {
         }
     }
 
+    pub fn set_crossfade(&mut self, id: NodeId, crossfade: Crossfade) {
+        if let Some(layer) = self.layer_mut(id) {
+            layer.crossfade = crossfade;
+            self.changed();
+        }
+    }
+
+    pub fn set_show_edges(&mut self, id: NodeId, show: bool) {
+        if let Some(layer) = self.layer_mut(id) {
+            layer.show_edges = show;
+            self.changed();
+        }
+    }
+
     pub fn set_visible(&mut self, id: NodeId, visible: bool) {
         if let Some((siblings, i)) = self.siblings_mut(id) {
             *siblings[i].visible_mut() = visible;
@@ -438,6 +480,8 @@ impl Layers {
                 self.count(|node| matches!(node, Node::Layer(_))) + 1
             ),
             visible: true,
+            crossfade: Crossfade::default(),
+            show_edges: true,
             document: Arc::new(Document::default()),
         })
     }
@@ -553,10 +597,7 @@ mod tests {
         layers.set_visible(group, true);
         let (below, above) = layers.around(two);
         assert_eq!((below.len(), above.len()), (1, 1));
-        assert!(std::ptr::eq(
-            below[0],
-            &*layers.layer(one).unwrap().document
-        ));
+        assert_eq!(below[0].id, one);
 
         assert!(layers.move_to(one, Place::After(group)));
         assert!(layers.ungroup(group));

@@ -1,6 +1,7 @@
 [package]
 name = "tessera"
 version = "0.1.0"
+authors = ["Sven Brettschneider"]
 edition = "2024"
 
 [dependencies]

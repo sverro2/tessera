@@ -3,11 +3,14 @@ mod camera;
 mod compass;
 mod document;
 mod editor;
+mod fade;
 mod file;
 mod geometry;
+mod icons;
 mod joints;
 mod layers;
 mod paint;
+mod recent;
 mod svg;
 mod wheel;
 
@@ -17,8 +20,8 @@ use std::sync::Arc;
 use iced::keyboard::{self, Key};
 use iced::time::{Duration, Instant};
 use iced::widget::{
-    button, center, column, container, mouse_area, opaque, row, scrollable, slider, space, stack,
-    text, text_input, tooltip,
+    button, center, checkbox, column, container, mouse_area, opaque, row, scrollable, slider,
+    space, stack, text, text_input, tooltip,
 };
 use iced::window;
 use iced::{Center, Color, Element, Fill, Padding, Subscription, Task, Theme};
@@ -65,11 +68,6 @@ const LAYERS_WIDTH: f32 = 250.0;
 const LAYER_ROW: f32 = 26.0;
 /// The layer name field, to focus when renaming.
 const NAME_FIELD: &str = "layer-name";
-/// Icons for the background's visibility toggle.
-const EYE_OPEN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>"#;
-const ERASER: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/></svg>"#;
-const PIPETTE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 22 1-1h3l9-9"/><path d="M3 21v-3l9-9"/><path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.4.4a2.1 2.1 0 1 1-3 3l-3.8-3.8a2.1 2.1 0 1 1 3-3l.4.4Z"/></svg>"#;
-const EYE_CLOSED: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/><path d="M3 3l18 18"/></svg>"#;
 
 #[derive(Default)]
 struct Tessera {
@@ -105,6 +103,8 @@ struct Tessera {
     saved: Option<Signature>,
     /// The menu that is open, if any.
     menu: Option<Menu>,
+    /// Whether the about box is open.
+    about: bool,
     /// Asking what to do with unsaved changes before doing this.
     confirming: Option<Replace>,
     /// A short message about what just happened, fading out.
@@ -124,6 +124,8 @@ struct Tessera {
     mode: Mode,
     /// What painting a face does, in the paint mode.
     brush: Brush,
+    /// Files opened or saved lately, most recent first.
+    recent_files: recent::Recent,
     /// Colours painted with lately, most recent first.
     recent: Vec<Color>,
     /// The paint panel's colour field: as typed, or the colour picked.
@@ -134,6 +136,9 @@ struct Tessera {
     target: Target,
     /// How wide painted edges are (world units).
     edge_width: f32,
+    /// The layers before the fade width slider was dragged: the drag is one
+    /// undo step.
+    fading_from: Option<Layers>,
     /// Whether the next click on the canvas picks up a brush (the pipette).
     picking: bool,
     /// The modifier keys held (Shift turns painting a layer into painting
@@ -196,14 +201,17 @@ enum Menu {
     File,
     Edit,
     View,
+    Help,
 }
 
 /// Things that replace (or close) the document, so unsaved changes would be
 /// lost.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Replace {
     New,
     Open,
+    /// Open this file (a recent one).
+    OpenPath(PathBuf),
     Quit(window::Id),
 }
 
@@ -233,6 +241,15 @@ enum Message {
     /// Turns the pipette on (in the paint mode) or off.
     TogglePicking,
     EdgeWidth(f32),
+    /// Whether the current layer's painted faces or edges (whichever is
+    /// being painted) blend into their neighbours.
+    Crossfade(bool),
+    /// How wide the current layer's faces fade into each other; and the
+    /// slider let go.
+    FadeWidth(f32),
+    FadeWidthDone,
+    /// Whether the current layer's edges show when painting (non-destructive).
+    ShowEdges(bool),
     WindowResized(iced::Size),
     ToggleMenu(Menu),
     /// The pointer moved onto a menu's button.
@@ -246,11 +263,18 @@ enum Message {
     Redo,
     ExportSvg,
     ResetView,
+    /// Show (`true`) or close the about box.
+    About(bool),
     /// Do it: confirmed, or there was nothing to lose.
     Replace(Replace),
     Confirm(Choice),
     /// A file was picked and read: its path and text.
     Opened(Result<Option<(PathBuf, String)>, String>),
+    /// Open a recently opened file.
+    OpenRecent(PathBuf),
+    /// A recent file couldn't be read (it's gone, say): why.
+    RecentFailed(PathBuf, String),
+    ClearRecent,
     /// Saving this revision finished (to this path, unless cancelled);
     /// then this was to happen.
     Saved(Result<Option<PathBuf>, String>, Versions, Option<Replace>),
@@ -377,7 +401,6 @@ impl Tessera {
         self.renaming = None;
         self.naming = None;
         self.dragging = None;
-        self.caches.clear_layers();
     }
 
     fn layer_action(&mut self, action: LayerAction) -> Task<Message> {
@@ -534,7 +557,6 @@ impl Tessera {
             paint::remember(&mut self.recent, color);
         }
         self.push_undo(before);
-        self.caches.clear_layers();
     }
 
     /// Paints with `brush` from now on; the colour controls follow.
@@ -551,7 +573,6 @@ impl Tessera {
         self.selected = id;
         if self.layers.layer(id).is_some() && id != self.current() {
             self.current = id;
-            self.caches.clear_layers();
         }
     }
 
@@ -592,6 +613,7 @@ impl Tessera {
             hsv: Hsv::from_color(color, 0.0),
             edge_width: 2.0,
             brush,
+            recent_files: recent::Recent::load(),
             ..Tessera::default()
         }
     }
@@ -619,7 +641,6 @@ impl Tessera {
                     }
                     self.push_undo(before);
                 }
-                self.caches.current.clear();
                 return Task::none();
             }
             Message::Layers(action) => return self.layer_action(action),
@@ -662,8 +683,6 @@ impl Tessera {
                 }
                 if mode != self.mode {
                     self.mode = mode;
-                    // Colours show in the paint mode only.
-                    self.caches.clear_layers();
                 }
                 return Task::none();
             }
@@ -693,6 +712,11 @@ impl Tessera {
                 self.hex = paint::to_hex(color);
                 return Task::none();
             }
+            Message::Editor(editor::Message::TweakWidth(across)) => {
+                // In proportion: fine when thin, quicker when thick.
+                self.edge_width = (self.edge_width * (across * 0.01).exp()).clamp(0.5, 12.0);
+                return Task::none();
+            }
             Message::Editor(editor::Message::Pick(picked)) => {
                 // Brushes that paint just like what was picked.
                 let color = match picked {
@@ -717,7 +741,6 @@ impl Tessera {
                 } else {
                     self.picking = true;
                     self.mode = Mode::Paint;
-                    self.caches.clear_layers();
                 }
                 return Task::none();
             }
@@ -729,12 +752,53 @@ impl Tessera {
                 self.target = target;
                 return Task::none();
             }
+            Message::Crossfade(on) => {
+                let current = self.current();
+                let before = self.layers.clone();
+                let crossfade = self.layers.layer(current).expect("current layer").crossfade;
+                self.layers.set_crossfade(
+                    current,
+                    layers::Crossfade {
+                        edges: on,
+                        ..crossfade
+                    },
+                );
+                self.push_undo(before);
+                return Task::none();
+            }
+            Message::FadeWidth(width) => {
+                let current = self.current();
+                if self.fading_from.is_none() {
+                    self.fading_from = Some(self.layers.clone());
+                }
+                let crossfade = self.layers.layer(current).expect("current layer").crossfade;
+                self.layers
+                    .set_crossfade(current, layers::Crossfade { width, ..crossfade });
+                return Task::none();
+            }
+            Message::ShowEdges(show) => {
+                let before = self.layers.clone();
+                self.layers.set_show_edges(self.current(), show);
+                self.push_undo(before);
+                return Task::none();
+            }
+            Message::FadeWidthDone => {
+                if let Some(before) = self.fading_from.take() {
+                    self.push_undo(before);
+                }
+                return Task::none();
+            }
             Message::EdgeWidth(width) => {
                 self.edge_width = width;
                 return Task::none();
             }
             Message::WindowResized(size) => {
                 self.window_size = Some(size);
+                return Task::none();
+            }
+            Message::About(open) => {
+                self.menu = None;
+                self.about = open;
                 return Task::none();
             }
             Message::ResetView => {
@@ -766,6 +830,27 @@ impl Tessera {
             Message::Open => {
                 self.menu = None;
                 return self.replace(Replace::Open);
+            }
+            Message::OpenRecent(path) => {
+                self.menu = None;
+                return self.replace(Replace::OpenPath(path));
+            }
+            Message::Replace(Replace::OpenPath(path)) => {
+                return Task::perform(read_file(path), |result| match result {
+                    Ok(opened) => Message::Opened(Ok(Some(opened))),
+                    Err((path, error)) => Message::RecentFailed(path, error),
+                });
+            }
+            Message::RecentFailed(path, error) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                self.notify(format!("Could not open {name}: {error}"), true);
+                self.recent_files.remove(&path);
+                return Task::none();
+            }
+            Message::ClearRecent => {
+                self.menu = None;
+                self.recent_files.clear();
+                return Task::none();
             }
             Message::Replace(Replace::New) => {
                 self.layers = Layers::default();
@@ -818,6 +903,7 @@ impl Tessera {
                     self.background_version += 1;
                     self.saved_background = self.background_version;
                     self.refresh_fields();
+                    self.recent_files.add(path.clone());
                     self.path = Some(path);
                     self.notify(format!("Opened {}", self.name()), false);
                 }
@@ -842,6 +928,7 @@ impl Tessera {
             Message::Saved(result, versions, then) => {
                 match result {
                     Ok(Some(path)) => {
+                        self.recent_files.add(path.clone());
                         self.path = Some(path);
                         self.notify(format!("Saved {}", self.name()), false);
                         self.saved = Some(versions.layers);
@@ -882,11 +969,12 @@ impl Tessera {
                 if key == Key::Named(keyboard::key::Named::Escape) {
                     self.menu = None;
                     self.confirming = None;
+                    self.about = false;
                     self.editing_background = false;
                     self.picking = false;
                     return Task::none();
                 }
-                if self.confirming.is_some() {
+                if self.confirming.is_some() || self.about {
                     return Task::none();
                 }
                 if !modifiers.command() {
@@ -1050,7 +1138,7 @@ impl Tessera {
         }
 
         // Everything else above moves the camera or replaces the document.
-        self.caches.clear_all();
+        self.caches.grid.clear();
         Task::none()
     }
 
@@ -1137,11 +1225,12 @@ impl Tessera {
             menu_button("File", Menu::File),
             menu_button("Edit", Menu::Edit),
             menu_button("View", Menu::View),
+            menu_button("Help", Menu::Help),
             self.mode_switch(),
             space::horizontal(),
             text(match self.mode {
                 Mode::Shape => "Tab/P: paint · Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
-                Mode::Paint => "Tab/S: shape · F/E: faces/edges · Click or drag: paint · I/Ctrl+click: pick · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+                Mode::Paint => "Tab/S: shape · F/E: faces/edges · Click or drag: paint · I/Ctrl+click: pick · Alt+move: edge width · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
             })
             .size(12),
         ]
@@ -1176,10 +1265,10 @@ impl Tessera {
                 let current = self.current();
                 let (below, above) = self.layers.around(current);
                 let scene = editor::Scene {
-                    document: self.document(),
+                    current: scene_layer(self.layers.layer(current).expect("current layer")),
                     shown: self.layers.shown(current),
-                    below,
-                    above,
+                    below: below.into_iter().map(scene_layer).collect(),
+                    above: above.into_iter().map(scene_layer).collect(),
                 };
                 editor::view(
                     scene,
@@ -1216,6 +1305,9 @@ impl Tessera {
         ]];
         if let Some(menu) = self.menu {
             screen = screen.push(self.dropdown(menu));
+        }
+        if self.about {
+            screen = screen.push(self.about_box());
         }
         if self.confirming.is_some() {
             screen = screen.push(self.confirmation());
@@ -1303,7 +1395,7 @@ impl Tessera {
                     ..container::Style::default()
                 })
                 .into(),
-            Brush::Eraser => container(icon(ERASER, button::secondary))
+            Brush::Eraser => container(icon(icons::ERASER, button::secondary))
                 .center_x(24)
                 .into(),
         };
@@ -1312,7 +1404,7 @@ impl Tessera {
         } else {
             button::secondary
         };
-        let eraser = button(icon(ERASER, eraser_style))
+        let eraser = button(icon(icons::ERASER, eraser_style))
             .padding([4, 6])
             .style(eraser_style)
             .on_press(Message::PickBrush(Brush::Eraser));
@@ -1322,7 +1414,7 @@ impl Tessera {
             button::secondary
         };
         let pipette = tooltip(
-            button(icon(PIPETTE, pipette_style))
+            button(icon(icons::PIPETTE, pipette_style))
                 .padding([4, 6])
                 .style(pipette_style)
                 .on_press(Message::TogglePicking),
@@ -1346,6 +1438,58 @@ impl Tessera {
                     Message::SetTarget(Target::Edges)
                 ),
             ]),
+            {
+                let layer = self.layers.layer(self.current()).expect("current layer");
+                // Showing the edges first: it matters more than how they fade.
+                let mut options = column![tooltip(
+                    checkbox(layer.show_edges)
+                        .label("Show edges")
+                        .size(14)
+                        .text_size(13)
+                        .on_toggle(Message::ShowEdges),
+                    container(
+                        text("Hide this layer's edges when painting and exporting; their paint is kept")
+                            .size(12),
+                    )
+                    .padding([4, 8])
+                    .style(container::dark),
+                    tooltip::Position::Bottom,
+                )]
+                .spacing(6);
+                // Painting edges: whether they fade into each other at their
+                // ends, and how far.
+                let crossfade = layer.crossfade;
+                if self.target == Target::Edges {
+                    options = options.push(tooltip(
+                        checkbox(crossfade.edges)
+                            .label("Crossfade")
+                            .size(14)
+                            .text_size(13)
+                            .on_toggle(Message::Crossfade),
+                        container(
+                            text("Fade the ends of this layer's painted edges into the edges they meet")
+                                .size(12),
+                        )
+                        .padding([4, 8])
+                        .style(container::dark),
+                        tooltip::Position::Bottom,
+                    ));
+                    if crossfade.edges {
+                        options = options.push(
+                            row![
+                                small("Fade").width(44),
+                                slider(1.0..=40.0, crossfade.width, Message::FadeWidth)
+                                    .step(0.5)
+                                    .on_release(Message::FadeWidthDone),
+                                text(format!("{:.1}", crossfade.width)).size(13).width(28),
+                            ]
+                            .spacing(8)
+                            .align_y(Center),
+                        );
+                    }
+                }
+                options
+            },
             row![
                 current,
                 text_input("#rrggbb", &self.hex)
@@ -1453,7 +1597,11 @@ impl Tessera {
                 None => space().width(17).into(),
             };
             let eye = button(icon(
-                if row.visible { EYE_OPEN } else { EYE_CLOSED },
+                if row.visible {
+                    icons::EYE
+                } else {
+                    icons::EYE_OFF
+                },
                 button::text,
             ))
             .padding([2, 4])
@@ -1611,8 +1759,8 @@ impl Tessera {
 
         let mut buttons = row![].spacing(1);
         if let Some(visible) = visible {
-            let icon = if visible { EYE_OPEN } else { EYE_CLOSED };
-            let eye = iced::widget::svg(iced::widget::svg::Handle::from_memory(icon))
+            let icon = if visible { icons::EYE } else { icons::EYE_OFF };
+            let eye = iced::widget::svg(iced::widget::svg::Handle::from_memory(icons::svg(icon)))
                 .width(16)
                 .height(Fill)
                 // The same colour as the button's label.
@@ -1777,16 +1925,63 @@ impl Tessera {
         let has_content = !self.layers.is_empty();
 
         let (offset, items) = match menu {
-            Menu::File => (
-                0.0,
-                column![
+            Menu::File => {
+                let mut items = column![
                     item("New", "Ctrl+N", has_content.then_some(Message::New)),
                     item("Open…", "Ctrl+O", Some(Message::Open)),
-                    item("Save", "Ctrl+S", Some(Message::Save)),
-                    item("Save As…", "Ctrl+Shift+S", Some(Message::SaveAs)),
-                    item("Export SVG…", "", has_content.then_some(Message::ExportSvg)),
-                ],
-            ),
+                ];
+                // The recent files: their names, their folders dimmed.
+                let recent = self.recent_files.paths();
+                if !recent.is_empty() {
+                    items = items.push(
+                        container(text("Recent").size(11).style(text::secondary)).padding(
+                            Padding {
+                                top: 6.0,
+                                left: 12.0,
+                                ..Padding::ZERO
+                            },
+                        ),
+                    );
+                    for path in recent {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        let folder = path
+                            .parent()
+                            .and_then(Path::file_name)
+                            .unwrap_or_default()
+                            .to_string_lossy();
+                        items = items.push(
+                            button(
+                                row![
+                                    text(name).size(14).wrapping(text::Wrapping::None),
+                                    space::horizontal(),
+                                    text(folder)
+                                        .size(12)
+                                        .style(text::secondary)
+                                        .wrapping(text::Wrapping::None),
+                                ]
+                                .spacing(12),
+                            )
+                            .width(Fill)
+                            .padding([6, 12])
+                            .style(button::text)
+                            .on_press(Message::OpenRecent(path.clone())),
+                        );
+                    }
+                    items = items.push(item("Clear recent", "", Some(Message::ClearRecent)));
+                    items = items.push(iced::widget::rule::horizontal(1));
+                }
+                (
+                    0.0,
+                    items
+                        .push(item("Save", "Ctrl+S", Some(Message::Save)))
+                        .push(item("Save As…", "Ctrl+Shift+S", Some(Message::SaveAs)))
+                        .push(item(
+                            "Export SVG…",
+                            "",
+                            has_content.then_some(Message::ExportSvg),
+                        )),
+                )
+            }
             Menu::Edit => (
                 MENU_WIDTH + 10.0,
                 column![
@@ -1806,9 +2001,13 @@ impl Tessera {
                 2.0 * (MENU_WIDTH + 10.0),
                 column![item("Reset view", "", Some(Message::ResetView))],
             ),
+            Menu::Help => (
+                3.0 * (MENU_WIDTH + 10.0),
+                column![item("About Tessera…", "", Some(Message::About(true)))],
+            ),
         };
 
-        let panel = container(items.width(220))
+        let panel = container(items.width(260))
             .padding(4)
             .style(container::bordered_box);
 
@@ -1830,6 +2029,67 @@ impl Tessera {
     }
 
     /// Asks what to do with unsaved changes, over the dimmed window.
+    /// What Tessera is, its version, and whose work it builds on (with
+    /// their licences).
+    fn about_box(&self) -> Element<'_, Message> {
+        let dialog = container(
+            column![
+                row![
+                    text("Tessera").size(24),
+                    text(format!("version {}", env!("CARGO_PKG_VERSION")))
+                        .size(13)
+                        .style(text::secondary),
+                ]
+                .spacing(10)
+                .align_y(iced::Bottom),
+                text(
+                    "Draw with triangles: shape a mesh of them, over a background \
+                     image if you like, paint its faces and edges, in layers, and \
+                     export it to SVG."
+                )
+                .size(14),
+                column![
+                    text("Idea and UI/UX design by Bibi Brettschneider").size(13),
+                    text(format!(
+                        "Made by {}",
+                        env!("CARGO_PKG_AUTHORS").replace(':', ", ")
+                    ))
+                    .size(13),
+                ]
+                .spacing(4),
+                text("Built with iced (iced.rs).").size(13),
+                text("Icons from Lucide (lucide.dev), under the ISC licence:").size(13),
+                container(
+                    scrollable(
+                        text(include_str!("../THIRD_PARTY_LICENSES"))
+                            .size(11)
+                            .font(iced::Font::MONOSPACE),
+                    )
+                    .height(200),
+                )
+                .padding(8)
+                .style(container::bordered_box),
+                row![
+                    space::horizontal(),
+                    button("Close").on_press(Message::About(false)),
+                ],
+            ]
+            .spacing(12)
+            .width(480),
+        )
+        .padding(20)
+        .style(container::bordered_box);
+
+        let backdrop = center(opaque(dialog)).style(|_| {
+            container::Style::default().background(Color {
+                a: 0.5,
+                ..Color::BLACK
+            })
+        });
+
+        opaque(mouse_area(backdrop).on_press(Message::About(false)))
+    }
+
     fn confirmation(&self) -> Element<'_, Message> {
         let dialog = container(
             column![
@@ -1861,6 +2121,16 @@ impl Tessera {
         });
 
         opaque(mouse_area(backdrop).on_press(Message::Confirm(Choice::Cancel)))
+    }
+}
+
+/// A layer as the canvas gets it.
+fn scene_layer(layer: &layers::Layer) -> editor::SceneLayer<'_> {
+    editor::SceneLayer {
+        id: layer.id,
+        document: &layer.document,
+        crossfade: layer.crossfade,
+        show_edges: layer.show_edges,
     }
 }
 
@@ -1899,15 +2169,23 @@ fn joined<'a>(parts: Vec<(&'a str, bool, Message)>) -> Element<'a, Message> {
 
 /// A 16 px icon, coloured as the label of a button in `style`.
 fn icon<'a>(
-    svg: &'static [u8],
+    shapes: &str,
     style: fn(&Theme, button::Status) -> button::Style,
 ) -> iced::widget::Svg<'a> {
-    iced::widget::svg(iced::widget::svg::Handle::from_memory(svg))
+    iced::widget::svg(iced::widget::svg::Handle::from_memory(icons::svg(shapes)))
         .width(16)
         .height(16)
         .style(move |theme: &Theme, _| iced::widget::svg::Style {
             color: Some(style(theme, button::Status::Active).text_color),
         })
+}
+
+/// Reads the file at `path`; if it can't, says why (with the path).
+async fn read_file(path: PathBuf) -> Result<(PathBuf, String), (PathBuf, String)> {
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok((path, text)),
+        Err(error) => Err((path, error.to_string())),
+    }
 }
 
 async fn open_file() -> Result<Option<(PathBuf, String)>, String> {
@@ -2181,6 +2459,115 @@ mod tests {
         let _ = app.update(Message::TogglePicking);
         let _ = app.update(Message::SetMode(Mode::Shape));
         assert!(!app.picking);
+    }
+
+    #[test]
+    fn crossfading_edges_is_per_layer_and_undoable() {
+        let mut app = Tessera::default();
+        let back = app.current();
+        let _ = app.update(Message::Layers(LayerAction::Add));
+        let front = app.current();
+        let crossfade = |app: &Tessera, id| app.layers.layer(id).unwrap().crossfade;
+
+        let _ = app.update(Message::SetTarget(Target::Edges));
+        let _ = app.update(Message::Crossfade(true));
+        assert!(crossfade(&app, front).edges);
+        assert_eq!(crossfade(&app, back), layers::Crossfade::default());
+
+        let _ = app.update(Message::Undo);
+        assert!(!crossfade(&app, front).edges);
+    }
+
+    #[test]
+    fn the_fade_width_and_hiding_edges_are_undoable() {
+        let mut app = Tessera::default();
+        let layer = app.current();
+        let look = |app: &Tessera| {
+            let layer = app.layers.layer(layer).unwrap();
+            (layer.crossfade.width, layer.show_edges)
+        };
+        let _ = app.update(Message::SetTarget(Target::Edges));
+        let _ = app.update(Message::Crossfade(true));
+        // Dragging the slider: one step.
+        for width in [8.0, 12.0, 20.0] {
+            let _ = app.update(Message::FadeWidth(width));
+        }
+        let _ = app.update(Message::FadeWidthDone);
+        assert_eq!(look(&app), (20.0, true));
+        let _ = app.update(Message::ShowEdges(false));
+        assert_eq!(look(&app), (20.0, false));
+
+        let _ = app.update(Message::Undo);
+        assert_eq!(look(&app), (20.0, true));
+        let _ = app.update(Message::Undo);
+        assert_eq!(look(&app), (layers::Crossfade::WIDTH, true));
+    }
+
+    #[test]
+    fn recent_files() {
+        let mut app = Tessera::default();
+        let text = file::save(&app.layers, app.camera, None);
+        let path = PathBuf::from("/drawings/flower.tessera");
+        let _ = app.update(Message::Opened(Ok(Some((path.clone(), text)))));
+        assert_eq!(app.recent_files.paths(), std::slice::from_ref(&path));
+
+        // With unsaved changes, opening a recent file asks first.
+        edit(&mut app, 0.0);
+        let _ = app.update(Message::OpenRecent(path.clone()));
+        assert!(matches!(&app.confirming, Some(Replace::OpenPath(p)) if *p == path));
+
+        // Gone: said so, and forgotten.
+        let _ = app.update(Message::RecentFailed(path, "No such file".into()));
+        assert!(app.recent_files.paths().is_empty());
+        assert!(app.notice.as_ref().unwrap().error);
+
+        // Saving (as) remembers it too.
+        let saved = PathBuf::from("/drawings/copy.tessera");
+        let _ = app.update(Message::Saved(
+            Ok(Some(saved.clone())),
+            app.versions(),
+            None,
+        ));
+        assert_eq!(app.recent_files.paths(), [saved]);
+    }
+
+    #[test]
+    fn alt_and_moving_tweaks_the_edge_width() {
+        let mut app = Tessera {
+            edge_width: 2.0,
+            ..Tessera::default()
+        };
+        let start = app.edge_width;
+        let _ = app.update(Message::Editor(editor::Message::TweakWidth(100.0)));
+        assert!((app.edge_width - start * 1f32.exp()).abs() < 1e-4);
+        let _ = app.update(Message::Editor(editor::Message::TweakWidth(-100.0)));
+        assert!((app.edge_width - start).abs() < 1e-4);
+        // Within the slider's range.
+        let _ = app.update(Message::Editor(editor::Message::TweakWidth(10_000.0)));
+        assert_eq!(app.edge_width, 12.0);
+        let _ = app.update(Message::Editor(editor::Message::TweakWidth(-10_000.0)));
+        assert_eq!(app.edge_width, 0.5);
+    }
+
+    #[test]
+    fn the_about_box_opens_and_closes() {
+        let mut app = Tessera::default();
+        let _ = app.update(Message::ToggleMenu(Menu::Help));
+        let _ = app.update(Message::About(true));
+        assert!(app.about);
+        assert_eq!(app.menu, None);
+        let _ = app.update(Message::Key(keyboard::Event::KeyPressed {
+            key: Key::Named(keyboard::key::Named::Escape),
+            modified_key: Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }));
+        assert!(!app.about);
     }
 
     #[test]
