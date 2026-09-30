@@ -4,10 +4,13 @@
 use std::fmt::Write;
 
 use crate::document::Document;
+use crate::joints;
 use crate::layers::{Layers, Node};
 use crate::paint;
 
 const PADDING: f32 = 10.0;
+/// How wide unpainted edges are drawn.
+const PLAIN_EDGE: f32 = 1.5;
 
 pub fn export(layers: &Layers) -> String {
     let bounds = layers
@@ -86,21 +89,37 @@ fn write_drawing(svg: &mut String, document: &Document, prefix: &str, depth: usi
         };
         let _ = writeln!(
             svg,
-            r##"{indent}<path id="{prefix}face{i}" d="M {},{} L {},{} L {},{} Z" {fill} stroke="#c0caf5" stroke-width="1.5" stroke-linejoin="round"/>"##,
+            r#"{indent}<path id="{prefix}face{i}" d="M {},{} L {},{} L {},{} Z" {fill}/>"#,
             a.x, a.y, b.x, b.y, c.x, c.y
         );
     }
-    for (i, (a, b, style)) in document.edge_styles().enumerate() {
-        let (p, q) = (document.vertex(a), document.vertex(b));
+
+    // The edges over them, each its own outline, so edges of different
+    // widths meet without lying over each other.
+    let edges: Vec<_> = document
+        .unique_edges()
+        .into_iter()
+        .map(|(a, b)| match document.edge_style(a, b) {
+            Some(style) => (a, b, style.width, paint::to_hex(style.color)),
+            None => (a, b, PLAIN_EDGE, "#c0caf5".to_string()),
+        })
+        .collect();
+    let outlines = joints::outlines(
+        &edges
+            .iter()
+            .map(|(a, b, width, _)| (*a, *b, *width))
+            .collect::<Vec<_>>(),
+        |v| document.vertex(v),
+    );
+    for (i, ((.., color), outline)) in edges.iter().zip(&outlines).enumerate() {
+        let mut d = String::new();
+        for (j, p) in outline.iter().enumerate() {
+            let _ = write!(d, "{} {},{} ", if j == 0 { "M" } else { "L" }, p.x, p.y);
+        }
+        d.push('Z');
         let _ = writeln!(
             svg,
-            r#"{indent}<path id="{prefix}edge{i}" d="M {},{} L {},{}" fill="none" stroke="{}" stroke-width="{}" stroke-linecap="round"/>"#,
-            p.x,
-            p.y,
-            q.x,
-            q.y,
-            paint::to_hex(style.color),
-            style.width
+            r#"{indent}<path id="{prefix}edge{i}" d="{d}" fill="{color}"/>"#
         );
     }
 }
@@ -156,15 +175,18 @@ mod tests {
         layers.set_visible(hidden, false);
 
         let svg = export(&layers);
-        assert_eq!(svg.matches("<path ").count(), 3 + 1, "{svg}");
+        // Three faces, and six edges (each its own outline, painted or not).
+        assert_eq!(svg.matches("<path ").count(), 3 + 6, "{svg}");
+        assert!(!svg.contains("stroke"), "{svg}");
         // Back to front; the hidden layer hidden.
         let back = svg.find(r#"inkscape:label="Layer 1""#).unwrap();
         let front = svg
             .find(r#"inkscape:label="A &quot;quote&quot;" style="display:none""#)
             .unwrap();
         assert!(back < front, "{svg}");
-        assert_eq!(svg.matches(r##"fill="#ff0000""##).count(), 1, "{svg}");
-        assert_eq!(svg.matches(r#"stroke-width="3""#).count(), 1, "{svg}");
+        // The red face and the red edge.
+        assert_eq!(svg.matches(r##"fill="#ff0000""##).count(), 2, "{svg}");
+        assert_eq!(svg.matches(r#"id="l1-edge"#).count(), 6, "{svg}");
         for other in ["<polygon", "<line"] {
             assert!(!svg.contains(other), "{svg}");
         }

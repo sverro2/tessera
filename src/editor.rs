@@ -30,6 +30,7 @@ use crate::camera::Camera;
 use crate::document::EdgeStyle;
 use crate::document::{Changes, Document, Edit, TriangleId, VertexId, opposite};
 use crate::geometry::{area2, closest_on_line, closest_on_segment, min_height};
+use crate::joints;
 use crate::paint::{self, Brush};
 
 /// Screen-space distance within which a corner is grabbed.
@@ -1388,52 +1389,85 @@ impl Editor<'_> {
     fn draw_layer(&self, frame: &mut Frame, document: &Document, look: Look) {
         match look {
             Look::Painted => {}
+            // Both with a hint of the colours, to still tell what's
+            // painted; other layers fainter.
             Look::Plain => {
-                let mesh = self.mesh(document.triangles());
-                frame.fill(&mesh, FILL);
-                frame.stroke(&mesh, stroke(EDGE, 1.5));
+                self.draw_hinted(frame, document, 1.0, 1.5);
                 return;
             }
             Look::Faded => {
-                let mesh = self.mesh(document.triangles());
-                frame.fill(&mesh, Color { a: 0.12, ..FILL });
-                frame.stroke(&mesh, stroke(Color { a: 0.3, ..EDGE }, 1.0));
+                self.draw_hinted(frame, document, 0.35, 1.0);
                 return;
             }
         }
 
         // Unpainted faces, then the painted ones by colour.
-        let mut unpainted = Vec::new();
-        let mut painted: Vec<(Color, Vec<[Point; 3]>)> = Vec::new();
-        for (t, color) in document.triangles().zip(document.colors()) {
-            match color {
-                None => unpainted.push(t),
-                Some(color) => match painted.iter_mut().find(|(c, _)| *c == color) {
-                    Some((_, group)) => group.push(t),
-                    None => painted.push((color, vec![t])),
-                },
-            }
-        }
-        frame.fill(&self.mesh(unpainted.into_iter()), FILL);
-        for (color, triangles) in painted {
+        let unpainted = document
+            .triangles()
+            .zip(document.colors())
+            .filter(|(_, color)| color.is_none())
+            .map(|(t, _)| t);
+        frame.fill(&self.mesh(unpainted), FILL);
+        for (color, triangles) in painted_faces(document) {
             frame.fill(&self.mesh(triangles.into_iter()), color);
         }
 
-        // Plain edges, then the painted ones over them.
-        let screen = |v| self.camera.to_screen(document.vertex(v));
-        let plain = Path::new(|p| {
-            for (a, b) in document.unique_edges() {
-                if document.edge_style(a, b).is_none() {
-                    p.move_to(screen(a));
-                    p.line_to(screen(b));
-                }
+        // The edges, each its own outline, so edges of different widths
+        // meet without lying over each other.
+        let edges: Vec<_> = document
+            .unique_edges()
+            .into_iter()
+            .map(|(a, b)| match document.edge_style(a, b) {
+                Some(style) => (a, b, self.edge_width(style.width), style.color),
+                None => (a, b, 1.5, EDGE),
+            })
+            .collect();
+        let outlines = joints::outlines(
+            &edges
+                .iter()
+                .map(|&(a, b, width, _)| (a, b, width))
+                .collect::<Vec<_>>(),
+            |v| self.camera.to_screen(document.vertex(v)),
+        );
+        let mut by_color: Vec<(Color, Vec<&Vec<Point>>)> = Vec::new();
+        for (&(.., color), outline) in edges.iter().zip(&outlines) {
+            match by_color.iter_mut().find(|(c, _)| *c == color) {
+                Some((_, group)) => group.push(outline),
+                None => by_color.push((color, vec![outline])),
             }
-        });
-        frame.stroke(&plain, stroke(EDGE, 1.5));
+        }
+        for (color, outlines) in by_color {
+            let path = Path::new(|p| {
+                for outline in outlines {
+                    p.move_to(outline[0]);
+                    for &point in &outline[1..] {
+                        p.line_to(point);
+                    }
+                    p.close();
+                }
+            });
+            frame.fill(&path, color);
+        }
+    }
+
+    /// The plain look, `strength` strong (1: full), edges `width` wide, with
+    /// a hint of the face colours and edge colours.
+    fn draw_hinted(&self, frame: &mut Frame, document: &Document, strength: f32, width: f32) {
+        let faint = |color: Color, alpha: f32| Color {
+            a: color.a * alpha * strength,
+            ..color
+        };
+        let mesh = self.mesh(document.triangles());
+        frame.fill(&mesh, faint(FILL, 1.0));
+        for (color, triangles) in painted_faces(document) {
+            frame.fill(&self.mesh(triangles.into_iter()), faint(color, 0.25));
+        }
+        frame.stroke(&mesh, stroke(faint(EDGE, 1.0), width));
+        let screen = |v| self.camera.to_screen(document.vertex(v));
         for (a, b, style) in document.edge_styles() {
             frame.stroke(
                 &Path::line(screen(a), screen(b)),
-                stroke(style.color, self.edge_width(style.width)),
+                stroke(faint(style.color, 0.5), width),
             );
         }
     }
@@ -1959,10 +1993,24 @@ fn pipette_cursor() -> (String, Vector) {
     (icon, Vector::new(2.0, 22.0) * (CURSOR_SIZE / 24.0))
 }
 
+/// The painted faces, by colour.
+fn painted_faces(document: &Document) -> Vec<(Color, Vec<[Point; 3]>)> {
+    let mut painted: Vec<(Color, Vec<[Point; 3]>)> = Vec::new();
+    for (t, color) in document.triangles().zip(document.colors()) {
+        if let Some(color) = color {
+            match painted.iter_mut().find(|(c, _)| *c == color) {
+                Some((_, group)) => group.push(t),
+                None => painted.push((color, vec![t])),
+            }
+        }
+    }
+    painted
+}
+
 /// How a layer is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Look {
-    /// One colour for all faces and edges.
+    /// One colour for all faces and edges, with a hint of their paint.
     Plain,
     /// With its face colours and edge styles.
     Painted,

@@ -5,6 +5,7 @@ mod document;
 mod editor;
 mod file;
 mod geometry;
+mod joints;
 mod layers;
 mod paint;
 mod svg;
