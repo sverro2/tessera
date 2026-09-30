@@ -47,6 +47,12 @@ impl Camera {
         self.keep(world, anchor);
     }
 
+    /// Rotates to `rotation` (clockwise, radians), keeping the world point
+    /// under `anchor` fixed.
+    pub fn rotate_to(&mut self, anchor: Point, rotation: f32) {
+        self.rotate_at(anchor, rotation - self.rotation);
+    }
+
     /// Pans so that `world` is back at `anchor`.
     fn keep(&mut self, world: Point, anchor: Point) {
         let moved = self.to_screen(world);
@@ -100,5 +106,15 @@ mod tests {
         camera.rotate_at(anchor, 3.0);
         assert!(camera.to_screen(world).distance(anchor) < 1e-3);
         assert!((camera.rotation - (3.4 - TAU)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rotate_to_sets_the_rotation() {
+        let mut camera = camera();
+        let anchor = Point::new(200.0, 150.0);
+        let world = camera.to_world(anchor);
+        camera.rotate_to(anchor, -1.0);
+        assert!(camera.to_screen(world).distance(anchor) < 1e-3);
+        assert!((camera.rotation + 1.0).abs() < 1e-5);
     }
 }

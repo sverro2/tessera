@@ -12,8 +12,13 @@
 use iced::{Point, Vector};
 use serde::{Deserialize, Serialize};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+
+use crate::background::Background;
 use crate::camera::Camera;
-use crate::document::Document;
+use crate::document::{Document, EdgeStyle};
+use crate::paint;
 
 /// The file name extension.
 pub const EXTENSION: &str = "tessera";
@@ -28,6 +33,7 @@ const VERSION: u32 = 1;
 pub struct Contents {
     pub document: Document,
     pub camera: Camera,
+    pub background: Option<Background>,
 }
 
 /// Just enough to tell which version a file is.
@@ -46,6 +52,47 @@ struct V1 {
     vertices: Vec<[f32; 2]>,
     /// Corners, as indices into `vertices`.
     triangles: Vec<[usize; 3]>,
+    /// Each triangle's colour (`#rrggbb`), or `null` if unpainted; in the
+    /// order of `triangles`. Added later; files without them are unpainted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    colors: Vec<Option<String>>,
+    /// The painted edges. Added later; files without them have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    edges: Vec<EdgeV1>,
+    /// Added after the first release; files without one have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    background: Option<BackgroundV1>,
+}
+
+/// A painted edge.
+#[derive(Serialize, Deserialize)]
+struct EdgeV1 {
+    /// Its ends, as indices into `vertices`.
+    ends: [usize; 2],
+    /// `#rrggbb`.
+    color: String,
+    /// In world units.
+    width: f32,
+}
+
+/// A background image, embedded.
+#[derive(Serialize, Deserialize)]
+struct BackgroundV1 {
+    /// The image file (PNG, JPEG, …), base64 encoded.
+    image: String,
+    /// Where its centre is (world).
+    center: [f32; 2],
+    /// World units per image pixel.
+    scale: f32,
+    /// Clockwise, in radians.
+    rotation: f32,
+    opacity: f32,
+    #[serde(default = "shown")]
+    visible: bool,
+}
+
+fn shown() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize)]
@@ -56,7 +103,7 @@ struct View {
     rotation: f32,
 }
 
-pub fn save(document: &Document, camera: Camera) -> String {
+pub fn save(document: &Document, camera: Camera, background: Option<&Background>) -> String {
     let (vertices, triangles) = document.to_parts();
     let file = V1 {
         format: FORMAT.to_string(),
@@ -68,6 +115,31 @@ pub fn save(document: &Document, camera: Camera) -> String {
         },
         vertices: vertices.iter().map(|p| [p.x, p.y]).collect(),
         triangles,
+        colors: if document.colors().any(|c| c.is_some()) {
+            document.colors().map(|c| c.map(paint::to_hex)).collect()
+        } else {
+            Vec::new()
+        },
+        edges: {
+            let used = document.unique_vertices();
+            let index = |v| used.binary_search(&v).expect("used vertex");
+            document
+                .edge_styles()
+                .map(|(a, b, style)| EdgeV1 {
+                    ends: [index(a), index(b)],
+                    color: paint::to_hex(style.color),
+                    width: style.width,
+                })
+                .collect()
+        },
+        background: background.map(|background| BackgroundV1 {
+            image: BASE64.encode(background.bytes()),
+            center: [background.center.x, background.center.y],
+            scale: background.scale,
+            rotation: background.rotation,
+            opacity: background.opacity,
+            visible: background.visible,
+        }),
     };
 
     serde_json::to_string(&file).expect("serializable")
@@ -95,8 +167,34 @@ pub fn open(text: &str) -> Result<Contents, String> {
         .iter()
         .map(|&[x, y]| Point::new(x, y))
         .collect();
-    let document =
+    let mut document =
         Document::from_parts(vertices, file.triangles).map_err(|e| format!("Damaged file: {e}"))?;
+    let colors = file
+        .colors
+        .iter()
+        .map(|hex| match hex {
+            Some(hex) => paint::from_hex(hex)
+                .map(Some)
+                .ok_or_else(|| format!("Damaged file: colour {hex:?}")),
+            None => Ok(None),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    document.set_colors(colors);
+    let edges = file
+        .edges
+        .iter()
+        .map(|edge| {
+            let color = paint::from_hex(&edge.color)
+                .ok_or_else(|| format!("Damaged file: colour {:?}", edge.color))?;
+            let [a, b] = edge.ends;
+            let valid = edge.width.is_finite() && edge.width > 0.0;
+            Ok((a, b, EdgeStyle {
+                color,
+                width: if valid { edge.width } else { 1.0 },
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    document.set_edge_styles(edges);
 
     let View {
         pan: [x, y],
@@ -114,7 +212,36 @@ pub fn open(text: &str) -> Result<Contents, String> {
         Camera::default()
     };
 
-    Ok(Contents { document, camera })
+    let background = file.background.map(open_background).transpose()?;
+
+    Ok(Contents {
+        document,
+        camera,
+        background,
+    })
+}
+
+fn open_background(saved: BackgroundV1) -> Result<Background, String> {
+    let damaged = |e: String| format!("Damaged background image: {e}");
+    let bytes = BASE64
+        .decode(saved.image)
+        .map_err(|e| damaged(e.to_string()))?;
+    let mut background = Background::load(bytes).map_err(damaged)?;
+
+    let [x, y] = saved.center;
+    if [x, y, saved.scale, saved.rotation, saved.opacity]
+        .iter()
+        .all(|n| n.is_finite())
+    {
+        background.center = Point::new(x, y);
+        background.scale = saved
+            .scale
+            .clamp(Background::MIN_SCALE, Background::MAX_SCALE);
+        background.rotation = saved.rotation;
+        background.opacity = saved.opacity.clamp(0.0, 1.0);
+    }
+    background.visible = saved.visible;
+    Ok(background)
 }
 
 #[cfg(test)]
@@ -136,18 +263,60 @@ mod tests {
         document.apply(Edit::InsertVertex {
             at: Point::new(200.0, 230.0),
         });
+        document.apply(Edit::Paint {
+            triangle: 1,
+            color: Some(paint::PALETTE[3]),
+        });
+        let (a, b) = document.unique_edges()[2];
+        assert!(document.apply(Edit::PaintEdge {
+            a,
+            b,
+            style: Some(EdgeStyle {
+                color: paint::PALETTE[0],
+                width: 2.5,
+            }),
+        }));
         let camera = Camera {
             pan: Vector::new(12.5, -3.0),
             zoom: 1.75,
             rotation: 0.5,
         };
 
-        let opened = open(&save(&document, camera)).unwrap();
+        let opened = open(&save(&document, camera, None)).unwrap();
 
         assert_eq!(opened.document.to_parts(), document.to_parts());
+        assert_eq!(
+            opened.document.colors().collect::<Vec<_>>(),
+            document.colors().collect::<Vec<_>>()
+        );
+        assert!(opened.document.color(1).is_some());
+        assert_eq!(
+            opened.document.edge_styles().collect::<Vec<_>>(),
+            document.edge_styles().collect::<Vec<_>>()
+        );
         assert_eq!(opened.camera.pan, camera.pan);
         assert_eq!(opened.camera.zoom, camera.zoom);
         assert_eq!(opened.camera.rotation, camera.rotation);
+    }
+
+    #[test]
+    fn keeps_the_background_image() {
+        let mut background = Background::load(crate::background::tests::pixel()).unwrap();
+        background.center = Point::new(5.0, 6.0);
+        background.scale = 2.5;
+        background.rotation = -0.25;
+        background.opacity = 0.3;
+        background.visible = false;
+
+        let text = save(&Document::default(), Camera::default(), Some(&background));
+        let opened = open(&text).unwrap().background.unwrap();
+
+        assert_eq!(opened.bytes(), background.bytes());
+        assert_eq!(opened.center, background.center);
+        assert_eq!(opened.scale, 2.5);
+        assert_eq!(opened.rotation, -0.25);
+        assert_eq!(opened.opacity, 0.3);
+        assert!(!opened.visible);
     }
 
     #[test]

@@ -1,8 +1,12 @@
+mod background;
 mod camera;
+mod compass;
 mod document;
 mod editor;
 mod file;
 mod geometry;
+mod paint;
+mod wheel;
 mod svg;
 
 use std::path::{Path, PathBuf};
@@ -10,22 +14,37 @@ use std::path::{Path, PathBuf};
 use iced::keyboard::{self, Key};
 use iced::time::{Duration, Instant};
 use iced::widget::{
-    button, canvas, center, column, container, mouse_area, opaque, row, space, stack, text,
+    button, canvas, center, column, container, mouse_area, opaque, row, slider, space, stack, text,
+    text_input,
 };
 use iced::window;
 use iced::{Center, Color, Element, Fill, Padding, Subscription, Task, Theme};
 
+use background::Background;
 use camera::Camera;
-use document::Document;
+use document::{Document, Edit};
+use editor::Tool;
+use paint::{Brush, Hsv, Target};
 
 pub fn main() -> iced::Result {
-    iced::application(Tessera::default, Tessera::update, Tessera::view)
+    iced::application(Tessera::new, Tessera::update, Tessera::view)
         .title(Tessera::title)
         .subscription(Tessera::subscription)
         .theme(Theme::TokyoNight)
         .exit_on_close_request(false)
+        .window_size(WINDOW_SIZE)
         .centered()
         .run()
+}
+
+/// The window's size when it opens.
+const WINDOW_SIZE: iced::Size = iced::Size::new(1152.0, 768.0);
+/// What the canvas is for: changing the shape, or painting it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Mode {
+    #[default]
+    Shape,
+    Paint,
 }
 
 /// Width of a menu's button in the menu bar.
@@ -36,6 +55,10 @@ const MAX_UNDO: usize = 200;
 const NOTICE_FADE: Duration = Duration::from_millis(600);
 /// The menu bar's height: where menus drop down from.
 const MENU_BAR_HEIGHT: f32 = 34.0;
+/// Icons for the background's visibility toggle.
+const EYE_OPEN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>"#;
+const ERASER: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/></svg>"#;
+const EYE_CLOSED: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/><path d="M3 3l18 18"/></svg>"#;
 
 #[derive(Default)]
 struct Tessera {
@@ -64,6 +87,54 @@ struct Tessera {
     confirming: Option<Replace>,
     /// A short message about what just happened, fading out.
     notice: Option<Notice>,
+    /// An image to draw over, kept with the document (not part of undo).
+    background: Option<Background>,
+    /// Counts changes to the background, like the document's revision.
+    background_version: u64,
+    /// The background version last saved or opened.
+    saved_background: u64,
+    /// Whether the background mode is on: its panel is open and the canvas
+    /// adjusts the image rather than edits the drawing.
+    editing_background: bool,
+    /// The background panel's number fields as typed.
+    fields: Fields,
+    /// What dragging on the canvas does.
+    mode: Mode,
+    /// What painting a face does, in the paint mode.
+    brush: Brush,
+    /// Colours painted with lately, most recent first.
+    recent: Vec<Color>,
+    /// The paint panel's colour field: as typed, or the colour picked.
+    hex: String,
+    /// The brush's colour on the colour wheel (keeping the hue of greys).
+    hsv: Hsv,
+    /// Whether painting paints faces or edges.
+    target: Target,
+    /// How wide painted edges are (world units).
+    edge_width: f32,
+    /// The window's size, once it has been resized (or first laid out);
+    /// until then, the size it opens at.
+    window_size: Option<iced::Size>,
+}
+
+/// The background panel's number fields, as typed (so half-typed numbers
+/// aren't overwritten).
+#[derive(Default)]
+struct Fields {
+    x: String,
+    y: String,
+    scale: String,
+    rotation: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Field {
+    X,
+    Y,
+    /// In percent.
+    Scale,
+    /// In degrees.
+    Rotation,
 }
 
 /// A short message shown at the bottom right for a while, then fading out.
@@ -120,6 +191,15 @@ enum Choice {
 #[derive(Debug, Clone)]
 enum Message {
     Editor(editor::Message),
+    Compass(compass::Message),
+    SetMode(Mode),
+    PickBrush(Brush),
+    HexTyped(String),
+    /// Picked on the colour wheel, or its brightness slider.
+    WheelPicked(Hsv),
+    SetTarget(Target),
+    EdgeWidth(f32),
+    WindowResized(iced::Size),
     ToggleMenu(Menu),
     /// The pointer moved onto a menu's button.
     HoverMenu(Menu),
@@ -139,12 +219,31 @@ enum Message {
     Opened(Result<Option<(PathBuf, String)>, String>),
     /// Saving this revision finished (to this path, unless cancelled);
     /// then this was to happen.
-    Saved(Result<Option<PathBuf>, String>, u64, Option<Replace>),
+    Saved(Result<Option<PathBuf>, String>, Versions, Option<Replace>),
     Exported(Result<Option<PathBuf>, String>),
     CloseRequested(window::Id),
     Key(keyboard::Event),
     /// A frame, while a notice fades.
     Frame(Instant),
+    ToggleBackgroundMode,
+    /// Pick a (new) background image.
+    PickBackground,
+    /// A background image file was picked and read.
+    BackgroundPicked(Result<Option<Vec<u8>>, String>),
+    /// Fit the background image to the view (of this window size).
+    FitBackground,
+    BackgroundFitted(iced::Size),
+    ToggleBackgroundVisible,
+    RemoveBackground,
+    BackgroundField(Field, String),
+    BackgroundOpacity(f32),
+}
+
+/// What was saved: the document revision and background version.
+#[derive(Debug, Clone, Copy)]
+struct Versions {
+    revision: u64,
+    background: u64,
 }
 
 impl Tessera {
@@ -168,19 +267,37 @@ impl Tessera {
         let edited = self
             .saved
             .is_some_and(|saved| saved != self.document.revision());
-        edited && !self.document.is_empty()
+        (edited && !self.document.is_empty()) || self.background_version != self.saved_background
+    }
+
+    /// Nothing drawn, no background: nothing a new document would change.
+    fn is_blank(&self) -> bool {
+        self.document.is_empty() && self.background.is_none()
     }
 
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             keyboard::listen().map(Message::Key),
             window::close_requests().map(Message::CloseRequested),
+            window::resize_events().map(|(_, size)| Message::WindowResized(size)),
             if self.notice.is_some() {
                 window::frames().map(Message::Frame)
             } else {
                 Subscription::none()
             },
         ])
+    }
+
+    fn new() -> Self {
+        let brush = Brush::default();
+        let color = brush.color().unwrap_or(Color::WHITE);
+        Tessera {
+            hex: paint::to_hex(color),
+            hsv: Hsv::from_color(color, 0.0),
+            edge_width: 2.0,
+            brush,
+            ..Tessera::default()
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -193,6 +310,16 @@ impl Tessera {
                 self.saved.get_or_insert(revision);
                 let before = self.document.clone();
                 if self.document.apply_all(&edits) {
+                    for edit in &edits {
+                        let color = match *edit {
+                            Edit::Paint { color, .. } => color,
+                            Edit::PaintEdge { style, .. } => style.map(|style| style.color),
+                            _ => None,
+                        };
+                        if let Some(color) = color {
+                            paint::remember(&mut self.recent, color);
+                        }
+                    }
                     self.undo.push(before);
                     if self.undo.len() > MAX_UNDO {
                         self.undo.remove(0);
@@ -230,6 +357,58 @@ impl Tessera {
             Message::Editor(editor::Message::Rotate { anchor, angle }) => {
                 self.camera.rotate_at(anchor, angle);
             }
+            Message::Compass(compass::Message::TurnTo(rotation)) => {
+                // Around the middle of the canvas.
+                let window = self.window_size.unwrap_or(WINDOW_SIZE);
+                let anchor = iced::Point::new(
+                    window.width / 2.0,
+                    (window.height - MENU_BAR_HEIGHT) / 2.0,
+                );
+                self.camera.rotate_to(anchor, rotation);
+            }
+            Message::SetMode(mode) => {
+                if mode != self.mode {
+                    self.mode = mode;
+                    // Colours show in the paint mode only.
+                    self.cache.clear();
+                }
+                return Task::none();
+            }
+            Message::PickBrush(brush) => {
+                self.brush = brush;
+                if let Brush::Color(color) = brush {
+                    self.hsv = Hsv::from_color(color, self.hsv.hue);
+                    self.hex = paint::to_hex(color);
+                }
+                return Task::none();
+            }
+            Message::HexTyped(typed) => {
+                if let Some(color) = paint::from_hex(&typed) {
+                    self.brush = Brush::Color(color);
+                    self.hsv = Hsv::from_color(color, self.hsv.hue);
+                }
+                self.hex = typed;
+                return Task::none();
+            }
+            Message::WheelPicked(hsv) => {
+                let color = hsv.to_color();
+                self.hsv = hsv;
+                self.brush = Brush::Color(color);
+                self.hex = paint::to_hex(color);
+                return Task::none();
+            }
+            Message::SetTarget(target) => {
+                self.target = target;
+                return Task::none();
+            }
+            Message::EdgeWidth(width) => {
+                self.edge_width = width;
+                return Task::none();
+            }
+            Message::WindowResized(size) => {
+                self.window_size = Some(size);
+                return Task::none();
+            }
             Message::ResetView => {
                 self.menu = None;
                 self.camera = Camera::default();
@@ -251,7 +430,7 @@ impl Tessera {
             Message::New => {
                 self.menu = None;
                 // A blank canvas is new already.
-                if self.document.is_empty() {
+                if self.is_blank() {
                     return Task::none();
                 }
                 return self.replace(Replace::New);
@@ -268,6 +447,9 @@ impl Tessera {
                 self.path = None;
                 self.saved = None;
                 self.notice = None;
+                self.background = None;
+                self.editing_background = false;
+                self.saved_background = self.background_version;
             }
             Message::Replace(Replace::Open) => {
                 return Task::perform(open_file(), Message::Opened);
@@ -287,10 +469,20 @@ impl Tessera {
             Message::Opened(Ok(Some((path, text)))) => match file::open(&text) {
                 Ok(contents) => {
                     self.saved = Some(contents.document.revision());
+                    // Its colours, to pick again.
+                    let colors: Vec<_> = contents.document.colors().flatten().collect();
+                    for color in colors.into_iter().rev() {
+                        paint::remember(&mut self.recent, color);
+                    }
                     self.document = contents.document;
                     self.undo.clear();
                     self.redo.clear();
                     self.camera = contents.camera;
+                    self.background = contents.background;
+                    self.editing_background = false;
+                    self.background_version += 1;
+                    self.saved_background = self.background_version;
+                    self.refresh_fields();
                     self.path = Some(path);
                     self.notify(format!("Opened {}", self.name()), false);
                 }
@@ -312,12 +504,13 @@ impl Tessera {
                 self.menu = None;
                 return self.save(true, None);
             }
-            Message::Saved(result, revision, then) => {
+            Message::Saved(result, versions, then) => {
                 match result {
                     Ok(Some(path)) => {
                         self.path = Some(path);
                         self.notify(format!("Saved {}", self.name()), false);
-                        self.saved = Some(revision);
+                        self.saved = Some(versions.revision);
+                        self.saved_background = versions.background;
                         if let Some(then) = then {
                             return Task::done(Message::Replace(then));
                         }
@@ -354,10 +547,21 @@ impl Tessera {
                 if key == Key::Named(keyboard::key::Named::Escape) {
                     self.menu = None;
                     self.confirming = None;
+                    self.editing_background = false;
                     return Task::none();
                 }
-                if !modifiers.command() || self.confirming.is_some() {
+                if self.confirming.is_some() {
                     return Task::none();
+                }
+                if !modifiers.command() {
+                    let message = match key.to_latin(physical_key) {
+                        Some('s') => Message::SetMode(Mode::Shape),
+                        Some('p') => Message::SetMode(Mode::Paint),
+                        Some('f') if self.mode == Mode::Paint => Message::SetTarget(Target::Faces),
+                        Some('e') if self.mode == Mode::Paint => Message::SetTarget(Target::Edges),
+                        _ => return Task::none(),
+                    };
+                    return Task::done(message);
                 }
                 let message = match key.to_latin(physical_key) {
                     Some('n') => Message::New,
@@ -372,6 +576,124 @@ impl Tessera {
                 return Task::done(message);
             }
             Message::Key(_) => return Task::none(),
+            Message::ToggleBackgroundMode => {
+                self.editing_background = !self.editing_background;
+                self.refresh_fields();
+                return Task::none();
+            }
+            Message::PickBackground => {
+                return Task::perform(pick_image(), Message::BackgroundPicked);
+            }
+            Message::BackgroundPicked(Ok(None)) => return Task::none(),
+            Message::BackgroundPicked(Ok(Some(bytes))) => {
+                let picked = match Background::load(bytes) {
+                    Ok(picked) => picked,
+                    Err(error) => {
+                        self.notify(format!("Could not use the image: {error}"), true);
+                        return Task::none();
+                    }
+                };
+                // A new image takes the old one's place; a first one fills
+                // the view.
+                let first = self.background.is_none();
+                self.background = Some(match &self.background {
+                    Some(old) => old.replaced_by(picked),
+                    None => picked,
+                });
+                self.background_changed();
+                if first {
+                    return Task::done(Message::FitBackground);
+                }
+                return Task::none();
+            }
+            Message::BackgroundPicked(Err(error)) => {
+                self.notify(format!("Could not open the image: {error}"), true);
+                return Task::none();
+            }
+            Message::FitBackground => {
+                return window::latest()
+                    .and_then(window::size)
+                    .map(Message::BackgroundFitted);
+            }
+            Message::BackgroundFitted(window) => {
+                let viewport = iced::Size::new(window.width, window.height - MENU_BAR_HEIGHT);
+                if let Some(background) = &mut self.background {
+                    background.fit(self.camera, viewport);
+                    self.background_changed();
+                }
+                return Task::none();
+            }
+            Message::ToggleBackgroundVisible => {
+                if let Some(background) = &mut self.background {
+                    background.visible = !background.visible;
+                    self.background_changed();
+                }
+                return Task::none();
+            }
+            Message::RemoveBackground => {
+                if self.background.take().is_some() {
+                    self.background_changed();
+                }
+                return Task::none();
+            }
+            Message::BackgroundOpacity(opacity) => {
+                if let Some(background) = &mut self.background {
+                    background.opacity = opacity;
+                    self.background_changed();
+                }
+                return Task::none();
+            }
+            Message::BackgroundField(field, typed) => {
+                let value = typed.trim().replace(',', ".").parse::<f32>().ok();
+                let draft = match field {
+                    Field::X => &mut self.fields.x,
+                    Field::Y => &mut self.fields.y,
+                    Field::Scale => &mut self.fields.scale,
+                    Field::Rotation => &mut self.fields.rotation,
+                };
+                *draft = typed;
+                if let (Some(background), Some(value)) = (&mut self.background, value)
+                    && value.is_finite()
+                {
+                    match field {
+                        Field::X => background.center.x = value,
+                        Field::Y => background.center.y = value,
+                        Field::Scale if value > 0.0 => {
+                            background.scale =
+                                (value / 100.0).clamp(Background::MIN_SCALE, Background::MAX_SCALE);
+                        }
+                        Field::Scale => return Task::none(),
+                        Field::Rotation => {
+                            background.rotation = background::normalize(value.to_radians());
+                        }
+                    }
+                    // Not `background_changed`: that would retype the field.
+                    self.background_version += 1;
+                    self.grid.clear();
+                }
+                return Task::none();
+            }
+            Message::Editor(editor::Message::MoveBackground(delta)) => {
+                if let Some(background) = &mut self.background {
+                    background.center += delta;
+                    self.background_changed();
+                }
+                return Task::none();
+            }
+            Message::Editor(editor::Message::ScaleBackground { anchor, factor }) => {
+                if let Some(background) = &mut self.background {
+                    background.scale_at(anchor, factor);
+                    self.background_changed();
+                }
+                return Task::none();
+            }
+            Message::Editor(editor::Message::RotateBackground { anchor, angle }) => {
+                if let Some(background) = &mut self.background {
+                    background.rotate_at(anchor, angle);
+                    self.background_changed();
+                }
+                return Task::none();
+            }
             Message::Frame(now) => {
                 if let Some(notice) = &mut self.notice {
                     notice.shown = now.saturating_duration_since(notice.since);
@@ -387,6 +709,35 @@ impl Tessera {
         self.cache.clear();
         self.grid.clear();
         Task::none()
+    }
+
+    /// What saving now would save.
+    fn versions(&self) -> Versions {
+        Versions {
+            revision: self.document.revision(),
+            background: self.background_version,
+        }
+    }
+
+    /// After the background changed: it's unsaved, and needs drawing.
+    fn background_changed(&mut self) {
+        self.background_version += 1;
+        self.grid.clear();
+        self.refresh_fields();
+    }
+
+    /// Fills the background panel's fields in from the background.
+    fn refresh_fields(&mut self) {
+        let Some(background) = &self.background else {
+            self.fields = Fields::default();
+            return;
+        };
+        self.fields = Fields {
+            x: format!("{:.1}", background.center.x),
+            y: format!("{:.1}", background.center.y),
+            scale: format!("{:.2}", background.scale * 100.0),
+            rotation: format!("{:.1}", background.rotation.to_degrees()),
+        };
     }
 
     fn notify(&mut self, text: String, error: bool) {
@@ -411,8 +762,8 @@ impl Tessera {
     /// Saves to where the document came from, or (if `choose`, or it never
     /// was saved) to a file picked first; then does `then`.
     fn save(&mut self, choose: bool, then: Option<Replace>) -> Task<Message> {
-        let text = file::save(&self.document, self.camera);
-        let revision = self.document.revision();
+        let text = file::save(&self.document, self.camera, self.background.as_ref());
+        let versions = self.versions();
         let path = self.path.clone().filter(|_| !choose);
         let name = match &self.path {
             Some(_) => self.name(),
@@ -420,7 +771,7 @@ impl Tessera {
         };
 
         Task::perform(save_file(path, name, text), move |result| {
-            Message::Saved(result, revision, then)
+            Message::Saved(result, versions, then)
         })
     }
 
@@ -443,9 +794,13 @@ impl Tessera {
             menu_button("File", Menu::File),
             menu_button("Edit", Menu::Edit),
             menu_button("View", Menu::View),
+            self.mode_switch(),
             space::horizontal(),
-            text("Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate")
-                .size(12),
+            text(match self.mode {
+                Mode::Shape => "Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+                Mode::Paint => "Click or drag over faces: paint · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+            })
+            .size(12),
         ]
         .spacing(10)
         .padding([2, 8])
@@ -474,7 +829,15 @@ impl Tessera {
         .style(container::dark);
 
         let canvas = stack![
-            editor::view(&self.document, self.camera, &self.cache, &self.grid).map(Message::Editor),
+            editor::view(
+                &self.document,
+                self.camera,
+                &self.cache,
+                &self.grid,
+                self.background.as_ref(),
+                self.tool(),
+            )
+            .map(Message::Editor),
             container(
                 column![self.notice(), stats]
                     .spacing(6)
@@ -483,6 +846,8 @@ impl Tessera {
             .align_right(Fill)
             .align_bottom(Fill)
             .padding(10),
+            self.background_panel(),
+            self.paint_panel(),
         ];
 
         let mut screen = stack![column![
@@ -504,6 +869,297 @@ impl Tessera {
             screen = screen.push(self.confirmation());
         }
         screen.into()
+    }
+
+    /// What the canvas does: the background mode takes over from the mode
+    /// while it's on.
+    fn tool(&self) -> Tool {
+        match self.mode {
+            _ if self.editing_background => Tool::Background {
+                painted: self.mode == Mode::Paint,
+            },
+            Mode::Shape => Tool::Shape,
+            Mode::Paint => Tool::Paint {
+                target: self.target,
+                brush: self.brush,
+                width: self.edge_width,
+            },
+        }
+    }
+
+    /// Shape and paint, side by side as one control.
+    fn mode_switch(&self) -> Element<'_, Message> {
+        joined(vec![
+            ("Shape", self.mode == Mode::Shape, Message::SetMode(Mode::Shape)),
+            ("Paint", self.mode == Mode::Paint, Message::SetMode(Mode::Paint)),
+        ])
+    }
+
+    /// In the paint mode: what to paint (faces or edges) and the brush to
+    /// paint with: a colour (from the wheel, the palette, recently used ones,
+    /// or typed) or the eraser; for edges also how wide.
+    fn paint_panel(&self) -> Element<'_, Message> {
+        if self.mode != Mode::Paint {
+            return space().into();
+        }
+        /// The panel's width inside its padding.
+        const INNER: f32 = 180.0;
+        const SWATCH: f32 = 24.0;
+        let gap = (INNER - 6.0 * SWATCH) / 5.0;
+        let small = |label| text(label).size(13);
+        let swatch = |color: Color| {
+            let picked = self.brush == Brush::Color(color);
+            button(space().width(SWATCH).height(SWATCH))
+                .padding(0)
+                .style(move |theme: &Theme, status| button::Style {
+                    background: Some(color.into()),
+                    border: iced::Border {
+                        color: if picked {
+                            theme.palette().primary.base.color
+                        } else if status == button::Status::Hovered {
+                            theme.palette().background.base.text
+                        } else {
+                            Color::TRANSPARENT
+                        },
+                        width: 2.0,
+                        radius: 3.0.into(),
+                    },
+                    ..button::Style::default()
+                })
+                .on_press(Message::PickBrush(Brush::Color(color)))
+        };
+        let swatches =
+            |colors: &[Color]| row(colors.iter().map(|&color| swatch(color).into())).spacing(gap);
+
+        let current: Element<'_, Message> = match self.brush {
+            Brush::Color(color) => container(space().width(24).height(24))
+                .style(move |_| container::Style {
+                    background: Some(color.into()),
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        ..iced::Border::default()
+                    },
+                    ..container::Style::default()
+                })
+                .into(),
+            Brush::Eraser => container(icon(ERASER, button::secondary))
+                .center_x(24)
+                .into(),
+        };
+        let eraser_style = if self.brush == Brush::Eraser {
+            button::primary
+        } else {
+            button::secondary
+        };
+        let eraser = button(icon(ERASER, eraser_style))
+            .padding([4, 6])
+            .style(eraser_style)
+            .on_press(Message::PickBrush(Brush::Eraser));
+
+        let hsv = self.hsv;
+        let mut body = column![
+            joined(vec![
+                (
+                    "Faces",
+                    self.target == Target::Faces,
+                    Message::SetTarget(Target::Faces)
+                ),
+                (
+                    "Edges",
+                    self.target == Target::Edges,
+                    Message::SetTarget(Target::Edges)
+                ),
+            ]),
+            row![
+                current,
+                text_input("#rrggbb", &self.hex)
+                    .size(13)
+                    .padding([3, 6])
+                    .on_input(Message::HexTyped),
+                eraser,
+            ]
+            .spacing(8)
+            .align_y(Center),
+            container(wheel::view(hsv, INNER - 20.0).map(Message::WheelPicked)).center_x(Fill),
+            row![
+                small("Light").width(44),
+                slider(0.0..=1.0, hsv.value, move |value| {
+                    Message::WheelPicked(Hsv { value, ..hsv })
+                })
+                .step(0.01),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        ]
+        .spacing(8);
+        if self.target == Target::Edges {
+            body = body.push(
+                row![
+                    small("Width").width(44),
+                    slider(0.5..=12.0, self.edge_width, Message::EdgeWidth).step(0.5),
+                    text(format!("{:.1}", self.edge_width)).size(13).width(28),
+                ]
+                .spacing(8)
+                .align_y(Center),
+            );
+        }
+        body = body
+            .push(swatches(&paint::PALETTE[..6]))
+            .push(swatches(&paint::PALETTE[6..]));
+        if !self.recent.is_empty() {
+            body = body.push(text("Recent").size(11).style(text::secondary));
+            for chunk in self.recent.chunks(6) {
+                body = body.push(swatches(chunk));
+            }
+        }
+
+        container(opaque(
+            container(body)
+                .padding(10)
+                .width(INNER + 20.0)
+                .style(container::bordered_box),
+        ))
+        .padding(12)
+        .into()
+    }
+
+    /// The compass and, below it, the background button and (in the
+    /// background mode) the panel to set up the image with.
+    fn background_panel(&self) -> Element<'_, Message> {
+        let small = |label| text(label).size(13);
+        // The background button, joined on its left by the eye to show or
+        // hide the image without opening the panel: one control, split in
+        // two, styled alike.
+        let base = if self.editing_background {
+            button::primary
+        } else {
+            button::secondary
+        };
+        let visible = self.background.as_ref().map(|background| background.visible);
+        let toggle = button(small("Background"))
+            .padding([4, 10])
+            .style(move |theme: &Theme, status| {
+                let mut style = base(theme, status);
+                if visible.is_some() {
+                    let radius = style.border.radius;
+                    style.border.radius = radius.top_left(0).bottom_left(0);
+                }
+                style
+            })
+            .on_press(Message::ToggleBackgroundMode);
+
+        let mut buttons = row![].spacing(1);
+        if let Some(visible) = visible {
+            let icon = if visible { EYE_OPEN } else { EYE_CLOSED };
+            let eye = iced::widget::svg(iced::widget::svg::Handle::from_memory(icon))
+                .width(16)
+                .height(Fill)
+                // The same colour as the button's label.
+                .style(move |theme: &Theme, _| iced::widget::svg::Style {
+                    color: Some(base(theme, button::Status::Active).text_color),
+                });
+            buttons = buttons.push(
+                button(eye)
+                    .padding([4, 8])
+                    .height(Fill)
+                    .style(move |theme: &Theme, status| {
+                        let mut style = base(theme, status);
+                        let radius = style.border.radius;
+                        style.border.radius = radius.top_right(0).bottom_right(0);
+                        style
+                    })
+                    .on_press(Message::ToggleBackgroundVisible),
+            );
+        }
+        let buttons = buttons.push(toggle).height(iced::Shrink);
+
+        let mut panel = column![
+            compass::view(self.camera.rotation).map(Message::Compass),
+            buttons,
+        ]
+        .spacing(6)
+        .align_x(iced::Right);
+
+        if self.editing_background {
+            let body: Element<'_, Message> = match &self.background {
+                None => column![
+                    small("No background image yet."),
+                    row![
+                        button(small("Choose image…")).on_press(Message::PickBackground),
+                        space::horizontal(),
+                        button(small("Done"))
+                            .style(button::secondary)
+                            .on_press(Message::ToggleBackgroundMode),
+                    ],
+                ]
+                .spacing(10)
+                .into(),
+                Some(background) => {
+                    let field = |label, field| {
+                        let value = match field {
+                            Field::X => &self.fields.x,
+                            Field::Y => &self.fields.y,
+                            Field::Scale => &self.fields.scale,
+                            Field::Rotation => &self.fields.rotation,
+                        };
+                        row![
+                            small(label).width(80),
+                            text_input("", value)
+                                .size(13)
+                                .padding([3, 6])
+                                .on_input(move |typed| Message::BackgroundField(field, typed)),
+                        ]
+                        .spacing(8)
+                        .align_y(Center)
+                    };
+                    column![
+                        row![
+                            button(small("Change…")).on_press(Message::PickBackground),
+                            space::horizontal(),
+                            button(small("Remove"))
+                                .style(button::danger)
+                                .on_press(Message::RemoveBackground),
+                        ]
+                        .spacing(6),
+                        field("X", Field::X),
+                        field("Y", Field::Y),
+                        field("Scale %", Field::Scale),
+                        field("Rotation °", Field::Rotation),
+                        row![
+                            small("Opacity").width(80),
+                            slider(0.0..=1.0, background.opacity, Message::BackgroundOpacity)
+                                .step(0.01),
+                        ]
+                        .spacing(8)
+                        .align_y(Center),
+                        text("Drag: move · Wheel: scale · Shift+wheel: rotate")
+                            .size(11)
+                            .style(text::secondary),
+                        row![
+                            button(small("Fit to view"))
+                                .style(button::secondary)
+                                .on_press(Message::FitBackground),
+                            space::horizontal(),
+                            button(small("Done")).on_press(Message::ToggleBackgroundMode),
+                        ],
+                    ]
+                    .spacing(8)
+                    .into()
+                }
+            };
+            panel = panel.push(
+                container(body)
+                    .padding(10)
+                    .width(280)
+                    .style(container::bordered_box),
+            );
+        }
+
+        // In the top right corner.
+        container(opaque(panel))
+            .align_right(Fill)
+            .padding(12)
+            .into()
     }
 
     /// The current notice, if any, fading as it goes.
@@ -647,6 +1303,52 @@ impl Tessera {
     }
 }
 
+/// Buttons side by side as one control, split in parts, the active ones
+/// highlighted.
+fn joined<'a>(parts: Vec<(&'a str, bool, Message)>) -> Element<'a, Message> {
+    let last = parts.len().saturating_sub(1);
+    row(parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, (label, active, message))| {
+            button(text(label).size(13))
+                .padding([4, 12])
+                .style(move |theme: &Theme, status| {
+                    let mut style = if active {
+                        button::primary(theme, status)
+                    } else {
+                        button::secondary(theme, status)
+                    };
+                    let mut radius = style.border.radius;
+                    if i > 0 {
+                        radius = radius.top_left(0).bottom_left(0);
+                    }
+                    if i < last {
+                        radius = radius.top_right(0).bottom_right(0);
+                    }
+                    style.border.radius = radius;
+                    style
+                })
+                .on_press(message)
+                .into()
+        }))
+    .spacing(1)
+    .into()
+}
+
+/// A 16 px icon, coloured as the label of a button in `style`.
+fn icon<'a>(
+    svg: &'static [u8],
+    style: fn(&Theme, button::Status) -> button::Style,
+) -> iced::widget::Svg<'a> {
+    iced::widget::svg(iced::widget::svg::Handle::from_memory(svg))
+        .width(16)
+        .height(16)
+        .style(move |theme: &Theme, _| iced::widget::svg::Style {
+            color: Some(style(theme, button::Status::Active).text_color),
+        })
+}
+
 async fn open_file() -> Result<Option<(PathBuf, String)>, String> {
     let Some(file) = rfd::AsyncFileDialog::new()
         .add_filter("Tessera", &[file::EXTENSION])
@@ -690,6 +1392,20 @@ async fn save_file(
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
 
     Ok(Some(path))
+}
+
+async fn pick_image() -> Result<Option<Vec<u8>>, String> {
+    let Some(file) = rfd::AsyncFileDialog::new()
+        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
+        .pick_file()
+        .await
+    else {
+        return Ok(None);
+    };
+
+    std::fs::read(file.path())
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 async fn save_svg(svg: String) -> Result<Option<PathBuf>, String> {
@@ -750,9 +1466,8 @@ mod tests {
     fn notices_fade_out() {
         let mut app = Tessera::default();
         edit(&mut app, 0.0);
-        let revision = app.document.revision();
         let path = PathBuf::from("/tmp/drawing.tessera");
-        let _ = app.update(Message::Saved(Ok(Some(path)), revision, None));
+        let _ = app.update(Message::Saved(Ok(Some(path)), app.versions(), None));
 
         let since = app.notice.as_ref().unwrap().since;
         assert_eq!(app.notice.as_ref().unwrap().text, "Saved drawing.tessera");
@@ -806,9 +1521,8 @@ mod tests {
     fn undoing_to_what_was_saved_is_saved() {
         let mut app = Tessera::default();
         edit(&mut app, 0.0);
-        let revision = app.document.revision();
         let path = PathBuf::from("/tmp/drawing.tessera");
-        let _ = app.update(Message::Saved(Ok(Some(path)), revision, None));
+        let _ = app.update(Message::Saved(Ok(Some(path)), app.versions(), None));
 
         edit(&mut app, 500.0);
         assert!(app.is_unsaved());
@@ -842,6 +1556,128 @@ mod tests {
         edit(&mut app, 0.0);
         let _ = app.update(Message::Replace(Replace::New));
         assert!(app.undo.is_empty() && app.redo.is_empty());
+    }
+
+    #[test]
+    fn painting_remembers_the_colour_and_undoes() {
+        let mut app = Tessera::default();
+        let _ = app.update(Message::Editor(editor::Message::Edit {
+            edits: vec![Edit::AddTriangle {
+                corners: [
+                    Point::new(0.0, 0.0),
+                    Point::new(10.0, 0.0),
+                    Point::new(5.0, 10.0),
+                ],
+                snap: 0.0,
+            }],
+            revision: app.document.revision(),
+        }));
+        let _ = app.update(Message::SetMode(Mode::Paint));
+        let _ = app.update(Message::HexTyped("#ff0000".into()));
+        let red = Color::from_rgb8(255, 0, 0);
+        assert_eq!(app.brush, Brush::Color(red));
+
+        let _ = app.update(Message::Editor(editor::Message::Edit {
+            edits: vec![Edit::Paint {
+                triangle: 0,
+                color: Some(red),
+            }],
+            revision: app.document.revision(),
+        }));
+        assert_eq!(app.document.color(0), Some(red));
+        assert_eq!(app.recent, vec![red]);
+
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.document.color(0), None);
+        assert_eq!(app.document.triangle_ids().len(), 1);
+    }
+
+    fn with_background() -> Tessera {
+        let mut app = Tessera::default();
+        let _ = app.update(Message::BackgroundPicked(Ok(Some(
+            background::tests::pixel(),
+        ))));
+        app
+    }
+
+    #[test]
+    fn a_background_image_fills_the_view() {
+        let mut app = with_background();
+        assert!(app.background.is_some());
+        assert!(app.is_unsaved());
+
+        // The window, less the menu bar: 800×600 for a 4×2 image.
+        let _ = app.update(Message::BackgroundFitted(iced::Size::new(
+            800.0,
+            600.0 + MENU_BAR_HEIGHT,
+        )));
+        let background = app.background.as_ref().unwrap();
+        assert!((background.scale - 200.0).abs() < 1e-3);
+        assert_eq!(background.center, Point::new(400.0, 300.0));
+    }
+
+    #[test]
+    fn the_background_panel_adjusts_the_image() {
+        let mut app = with_background();
+        let _ = app.update(Message::ToggleBackgroundMode);
+        assert!(app.editing_background);
+        assert_eq!(app.fields.scale, "100.00");
+
+        let _ = app.update(Message::BackgroundField(Field::X, "12.5".into()));
+        let _ = app.update(Message::BackgroundField(Field::Scale, "50".into()));
+        let _ = app.update(Message::BackgroundField(Field::Rotation, "90".into()));
+        // Half typed: kept as typed, the image left alone.
+        let _ = app.update(Message::BackgroundField(Field::Y, "-".into()));
+        let background = app.background.as_ref().unwrap();
+        assert_eq!(background.center, Point::new(12.5, 0.0));
+        assert_eq!(background.scale, 0.5);
+        assert!((background.rotation - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        assert_eq!(app.fields.y, "-");
+
+        // Dragging on the canvas updates the fields.
+        let _ = app.update(Message::Editor(editor::Message::MoveBackground(
+            iced::Vector::new(1.0, 2.0),
+        )));
+        assert_eq!(app.fields.x, "13.5");
+        assert_eq!(app.fields.y, "2.0");
+
+        let _ = app.update(Message::ToggleBackgroundVisible);
+        assert!(!app.background.as_ref().unwrap().visible);
+        let _ = app.update(Message::RemoveBackground);
+        assert!(app.background.is_none());
+    }
+
+    #[test]
+    fn changing_the_image_keeps_its_place() {
+        let mut app = with_background();
+        let _ = app.update(Message::BackgroundField(Field::X, "40".into()));
+        let _ = app.update(Message::ToggleBackgroundVisible);
+        let _ = app.update(Message::BackgroundPicked(Ok(Some(
+            background::tests::pixel(),
+        ))));
+        assert_eq!(app.background.as_ref().unwrap().center.x, 40.0);
+        // A new image is always shown.
+        assert!(app.background.as_ref().unwrap().visible);
+    }
+
+    #[test]
+    fn the_background_counts_as_content() {
+        let mut app = with_background();
+        let _ = app.update(Message::Saved(
+            Ok(Some(PathBuf::from("/tmp/traced.tessera"))),
+            app.versions(),
+            None,
+        ));
+        assert!(!app.is_unsaved());
+        let _ = app.update(Message::BackgroundOpacity(0.9));
+        assert!(app.is_unsaved());
+
+        // New asks, and clears it.
+        let _ = app.update(Message::New);
+        assert!(matches!(app.confirming, Some(Replace::New)));
+        let _ = app.update(Message::Replace(Replace::New));
+        assert!(app.background.is_none());
+        assert!(!app.is_unsaved());
     }
 
     #[test]
@@ -879,9 +1715,8 @@ mod tests {
     fn saved_changes_need_no_asking() {
         let mut app = Tessera::default();
         edit(&mut app, 0.0);
-        let revision = app.document.revision();
         let path = PathBuf::from("/tmp/drawing.tessera");
-        let _ = app.update(Message::Saved(Ok(Some(path)), revision, None));
+        let _ = app.update(Message::Saved(Ok(Some(path)), app.versions(), None));
 
         assert!(!app.is_unsaved());
         assert_eq!(app.title(), "drawing.tessera — Tessera");
@@ -890,7 +1725,7 @@ mod tests {
 
         // A cancelled save leaves new changes unsaved.
         edit(&mut app, 500.0);
-        let _ = app.update(Message::Saved(Ok(None), app.document.revision(), None));
+        let _ = app.update(Message::Saved(Ok(None), app.versions(), None));
         assert!(app.is_unsaved());
     }
 
@@ -899,7 +1734,7 @@ mod tests {
         let mut source = Tessera::default();
         edit(&mut source, 0.0);
         source.camera.zoom = 3.0;
-        let text = file::save(&source.document, source.camera);
+        let text = file::save(&source.document, source.camera, None);
 
         let mut app = Tessera::default();
         let path = PathBuf::from("/tmp/drawing.tessera");

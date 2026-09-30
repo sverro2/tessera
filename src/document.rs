@@ -12,11 +12,18 @@
 //! - every triangle has positive winding; one whose winding flips has been
 //!   folded over its neighbours,
 //! - no two triangles overlap.
+//!
+//! Faces can be painted a colour, and edges a colour and width. A face
+//! keeps its colour while it keeps its corners (even as they move); a face
+//! an edit makes anew takes the colour of the face it lay in before, so
+//! pieces of a split face keep its colour. Likewise an edge keeps its style
+//! while it keeps its ends, and pieces of a styled edge (cut, say) keep it.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use iced::Point;
+use iced::{Color, Point};
 
 use crate::geometry::{area2, min_height, overlap};
 
@@ -33,6 +40,10 @@ pub type TriangleId = usize;
 pub struct Document {
     vertices: Vec<Point>,
     triangles: Vec<[VertexId; 3]>,
+    /// The painted faces' colours, by their corners (sorted, see [`key`]).
+    colors: BTreeMap<[VertexId; 3], Color>,
+    /// The painted edges' styles, by their ends (lowest first).
+    edge_styles: BTreeMap<(VertexId, VertexId), EdgeStyle>,
     /// Changes with every edit, and differs between documents, so views
     /// can tell when to redo what they derived from it.
     revision: u64,
@@ -43,6 +54,8 @@ impl Default for Document {
         Document {
             vertices: Vec::new(),
             triangles: Vec::new(),
+            colors: BTreeMap::new(),
+            edge_styles: BTreeMap::new(),
             revision: next_revision(),
         }
     }
@@ -52,6 +65,14 @@ impl Default for Document {
 fn next_revision() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// How a painted edge is drawn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EdgeStyle {
+    pub color: Color,
+    /// In world units.
+    pub width: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -72,6 +93,17 @@ pub enum Edit {
     /// instead; see [`Document::move_vertex`]. Moved onto another vertex it
     /// welds with it; onto an edge, it splits that edge.
     MoveVertex { id: VertexId, to: Point },
+    /// Paint a face this colour; `None` clears it.
+    Paint {
+        triangle: TriangleId,
+        color: Option<Color>,
+    },
+    /// Paint edge `a`–`b` this style; `None` clears it.
+    PaintEdge {
+        a: VertexId,
+        b: VertexId,
+        style: Option<EdgeStyle>,
+    },
 }
 
 /// What [`Document::normalize`] did to make the connectivity follow the
@@ -123,6 +155,51 @@ impl Document {
 
     pub fn triangles(&self) -> impl Iterator<Item = [Point; 3]> + '_ {
         self.triangles.iter().map(|t| t.map(|id| self.vertices[id]))
+    }
+
+    /// The colour face `t` is painted, if any.
+    pub fn color(&self, t: TriangleId) -> Option<Color> {
+        self.colors.get(&key(self.triangles[t])).copied()
+    }
+
+    /// Each face's colour, in the order of [`Self::triangle_ids`].
+    pub fn colors(&self) -> impl Iterator<Item = Option<Color>> + '_ {
+        self.triangles.iter().map(|&t| self.colors.get(&key(t)).copied())
+    }
+
+    /// Paints the faces, in the order of [`Self::triangle_ids`] (e.g. as
+    /// read from a file); extra colours are ignored. Not an edit.
+    pub fn set_colors(&mut self, colors: impl IntoIterator<Item = Option<Color>>) {
+        self.colors = self
+            .triangles
+            .iter()
+            .zip(colors)
+            .filter_map(|(&t, color)| Some((key(t), color?)))
+            .collect();
+    }
+
+    /// The style edge `a`–`b` is painted, if any.
+    pub fn edge_style(&self, a: VertexId, b: VertexId) -> Option<EdgeStyle> {
+        self.edge_styles.get(&(a.min(b), a.max(b))).copied()
+    }
+
+    /// The painted edges (lowest end first) and their styles.
+    pub fn edge_styles(&self) -> impl Iterator<Item = (VertexId, VertexId, EdgeStyle)> + '_ {
+        self.edge_styles.iter().map(|(&(a, b), &style)| (a, b, style))
+    }
+
+    /// Paints edges (e.g. as read from a file); those that aren't edges
+    /// are ignored. Not an edit.
+    pub fn set_edge_styles(
+        &mut self,
+        styles: impl IntoIterator<Item = (VertexId, VertexId, EdgeStyle)>,
+    ) {
+        let edges = self.unique_edges();
+        self.edge_styles = styles
+            .into_iter()
+            .map(|(a, b, style)| ((a.min(b), a.max(b)), style))
+            .filter(|(edge, _)| edges.binary_search(edge).is_ok())
+            .collect();
     }
 
     /// Vertices used by at least one triangle (with repeats).
@@ -308,6 +385,8 @@ impl Document {
             if !valid {
                 return None;
             }
+            next.inherit_colors(&document);
+            next.inherit_edge_styles(&document);
             document = next;
         }
 
@@ -330,7 +409,84 @@ impl Document {
                 }
             }
             Edit::MoveVertex { id, to } => self.move_vertex(id, to),
+            Edit::Paint { triangle, color } => {
+                let Some(&t) = self.triangles.get(triangle) else {
+                    return false;
+                };
+                match color {
+                    Some(color) => self.colors.insert(key(t), color),
+                    None => self.colors.remove(&key(t)),
+                };
+                true
+            }
+            Edit::PaintEdge { a, b, style } => {
+                let edge = (a.min(b), a.max(b));
+                if self.unique_edges().binary_search(&edge).is_err() {
+                    return false;
+                }
+                match style {
+                    Some(style) => self.edge_styles.insert(edge, style),
+                    None => self.edge_styles.remove(&edge),
+                };
+                true
+            }
         }
+    }
+
+    /// After an edit from `before`: edges that kept their ends keep their
+    /// style; new edges lying along a styled edge from before (a piece of
+    /// it) take its style. Styles of edges gone are dropped.
+    fn inherit_edge_styles(&mut self, before: &Document) {
+        if self.edge_styles.is_empty() && before.edge_styles.is_empty() {
+            return;
+        }
+        let existed = before.unique_edges();
+        let on = |p: Point, a: Point, b: Point| {
+            crate::geometry::closest_on_segment(p, a, b).1 <= tolerance(a.distance(b))
+        };
+
+        self.edge_styles = self
+            .unique_edges()
+            .into_iter()
+            .filter_map(|edge| {
+                let style = if existed.binary_search(&edge).is_ok() {
+                    self.edge_styles.get(&edge).copied()
+                } else {
+                    let (p, q) = (self.vertices[edge.0], self.vertices[edge.1]);
+                    before.edge_styles().find_map(|(a, b, style)| {
+                        let (a, b) = (before.vertices[a], before.vertices[b]);
+                        (on(p, a, b) && on(q, a, b)).then_some(style)
+                    })
+                };
+                Some((edge, style?))
+            })
+            .collect();
+    }
+
+    /// After an edit from `before`: faces that kept their corners keep
+    /// their colour; new faces take that of the face they lay in before
+    /// (by their centre), if painted. Colours of faces gone are dropped.
+    fn inherit_colors(&mut self, before: &Document) {
+        if self.colors.is_empty() && before.colors.is_empty() {
+            return;
+        }
+        let existed: BTreeSet<_> = before.triangles.iter().map(|&t| key(t)).collect();
+
+        self.colors = self
+            .triangles
+            .iter()
+            .filter_map(|&t| {
+                let k = key(t);
+                let color = if existed.contains(&k) {
+                    self.colors.get(&k).copied()
+                } else {
+                    let [a, b, c] = t.map(|v| self.vertices[v]);
+                    let centre = Point::new((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0);
+                    before.triangle_at(centre).and_then(|u| before.color(u))
+                };
+                Some((k, color?))
+            })
+            .collect();
     }
 
     /// Splits the triangle containing `at` (on its boundary counts) into
@@ -590,6 +746,13 @@ impl Document {
     }
 }
 
+/// A face's corners in a fixed order, to tell it by whichever corner comes
+/// first.
+fn key(mut t: [VertexId; 3]) -> [VertexId; 3] {
+    t.sort_unstable();
+    t
+}
+
 /// The corners of `t` other than `id`, in winding order after it.
 pub fn opposite(t: [VertexId; 3], id: VertexId) -> Option<(VertexId, VertexId)> {
     let i = t.iter().position(|&v| v == id)?;
@@ -641,6 +804,91 @@ mod tests {
             snap: 0.0
         }));
         doc
+    }
+
+    #[test]
+    fn faces_keep_their_colour_through_edits() {
+        let red = Color::from_rgb8(255, 0, 0);
+        let mut doc = doc_with_triangle();
+        assert!(doc.apply(Edit::Paint {
+            triangle: 0,
+            color: Some(red),
+        }));
+        assert_eq!(doc.color(0), Some(red));
+
+        // Moving a corner keeps it; splitting gives every piece its colour.
+        assert!(doc.apply(Edit::MoveVertex {
+            id: 2,
+            to: Point::new(5.0, 12.0),
+        }));
+        assert_eq!(doc.color(0), Some(red));
+        assert!(doc.apply(Edit::InsertVertex {
+            at: Point::new(5.0, 4.0),
+        }));
+        assert_eq!(doc.triangle_ids().len(), 3);
+        assert!(doc.colors().all(|c| c == Some(red)));
+
+        // A face added beside it is unpainted.
+        assert!(doc.apply(Edit::AddTriangle {
+            corners: [doc.vertex(0), doc.vertex(1), Point::new(5.0, -10.0)],
+            snap: 0.0
+        }));
+        assert_eq!(doc.colors().filter(|c| c.is_none()).count(), 1);
+
+        // Clearing.
+        assert!(doc.apply(Edit::Paint {
+            triangle: 0,
+            color: None,
+        }));
+        assert_eq!(doc.color(0), None);
+        assert_eq!(doc.colors().filter(|c| c.is_none()).count(), 2);
+    }
+
+    #[test]
+    fn edges_keep_their_style_through_edits() {
+        let style = EdgeStyle {
+            color: Color::from_rgb8(255, 0, 0),
+            width: 3.0,
+        };
+        let mut doc = doc_with_triangle();
+        assert!(doc.apply(Edit::PaintEdge {
+            a: 1,
+            b: 0,
+            style: Some(style),
+        }));
+        assert_eq!(doc.edge_style(0, 1), Some(style));
+        // Not an edge.
+        assert!(!doc.apply(Edit::PaintEdge {
+            a: 0,
+            b: 7,
+            style: Some(style),
+        }));
+
+        // Moving an end keeps it.
+        assert!(doc.apply(Edit::MoveVertex {
+            id: 1,
+            to: Point::new(12.0, 0.0),
+        }));
+        assert_eq!(doc.edge_style(0, 1), Some(style));
+
+        // Cut: both pieces keep it; the new edge inside doesn't get it.
+        assert!(doc.apply(Edit::InsertVertex {
+            at: Point::new(6.0, 0.0),
+        }));
+        let cut = doc.last_vertex();
+        assert_eq!(doc.edge_style(0, 1), None);
+        assert_eq!(doc.edge_style(0, cut), Some(style));
+        assert_eq!(doc.edge_style(cut, 1), Some(style));
+        assert_eq!(doc.edge_style(cut, 2), None);
+        assert_eq!(doc.edge_styles().count(), 2);
+
+        // Clearing.
+        assert!(doc.apply(Edit::PaintEdge {
+            a: 0,
+            b: cut,
+            style: None,
+        }));
+        assert_eq!(doc.edge_styles().count(), 1);
     }
 
     #[test]

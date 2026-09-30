@@ -1,9 +1,14 @@
 //! The interactive canvas: renders a [`Document`] through a [`Camera`] and
 //! turns mouse input into [`Message`]s. It never mutates the document itself.
 //!
-//! Left-drag on blank canvas creates a triangle. Only middle-drag pans; the
+//! In the shape mode, left-drag on blank canvas creates a triangle; from
+//! inside a face, it
+//! extends from the last edge the cursor crossed. Only middle-drag pans; the
 //! wheel zooms around the cursor, Shift+wheel rotates around it. C cuts the
 //! hovered edge at the cursor; D removes the triangle under it.
+//!
+//! In the paint mode, clicking a face or dragging over faces paints them
+//! with the brush; the shape can't be changed.
 //!
 //! A dragged point snaps onto nearby vertices and edges (see
 //! [`Editor::snaps`]); the document then joins things up by itself, so the
@@ -20,9 +25,12 @@ use iced::widget::canvas::{
 use iced::window;
 use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Theme, Vector};
 
+use crate::background::Background;
 use crate::camera::Camera;
 use crate::document::{Changes, Document, Edit, TriangleId, VertexId, opposite};
 use crate::geometry::{area2, closest_on_line, closest_on_segment, min_height};
+use crate::document::EdgeStyle;
+use crate::paint::{self, Brush};
 
 /// Screen-space distance within which a corner is grabbed.
 const VERTEX_HIT: f32 = 10.0;
@@ -45,16 +53,14 @@ const SHAPE_FADE: Duration = Duration::from_millis(200);
 const GRID: f32 = 50.0;
 /// Rotation per wheel notch with Shift held.
 const ROTATE_STEP: f32 = 5.0 * std::f32::consts::PI / 180.0;
-/// Radius and margin (screen px) of the compass showing the rotation.
-const COMPASS: f32 = 16.0;
-const COMPASS_MARGIN: f32 = 12.0;
 
-const BACKGROUND: Color = Color::from_rgb8(0x1a, 0x1b, 0x26);
-const GRID_DOT: Color = Color::from_rgb8(0x2f, 0x33, 0x4d);
+pub const BACKGROUND: Color = Color::from_rgb8(0x1a, 0x1b, 0x26);
+pub const GRID_DOT: Color = Color::from_rgb8(0x2f, 0x33, 0x4d);
 const FILL: Color = Color::from_rgba8(0x7a, 0xa2, 0xf7, 0.35);
-const EDGE: Color = Color::from_rgb8(0xc0, 0xca, 0xf5);
-/// Washed over the shapes other than the highlighted one.
-const UNFOCUSED: Color = Color::from_rgb8(0x3b, 0x3e, 0x4f);
+pub const EDGE: Color = Color::from_rgb8(0xc0, 0xca, 0xf5);
+/// Washed over the shapes other than the highlighted one: fading them
+/// into the background keeps their colour, just dimmer.
+const UNFOCUSED: Color = BACKGROUND;
 /// What an action would add (and the cursor that creates triangles).
 const ADDED: Color = Color::from_rgb8(0x9e, 0xce, 0x6a);
 /// What an action would remove.
@@ -63,7 +69,24 @@ const REMOVED: Color = Color::from_rgb8(0xf7, 0x76, 0x8e);
 /// welded together (and the cursor, when it lands on such a join).
 const JOINED: Color = Color::from_rgb8(0xe0, 0xaf, 0x68);
 /// The hovered vertex or edge.
-const HOVER: Color = Color::from_rgb8(0x7d, 0xcf, 0xff);
+pub const HOVER: Color = Color::from_rgb8(0x7d, 0xcf, 0xff);
+
+/// What dragging (and the wheel) on the canvas does.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum Tool {
+    /// Change the shape: create, extend, move, cut, delete.
+    #[default]
+    Shape,
+    /// Paint faces or edges with the brush (edges `width` wide, in world
+    /// units); the shape can't be changed.
+    Paint {
+        target: paint::Target,
+        brush: Brush,
+        width: f32,
+    },
+    /// Adjust the background image; the drawing rests, `painted` or not.
+    Background { painted: bool },
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -74,6 +97,19 @@ pub enum Message {
     },
     /// Rotate clockwise by `angle` radians around `anchor`.
     Rotate {
+        anchor: Point,
+        angle: f32,
+    },
+    /// Move the background image by this much (world).
+    MoveBackground(Vector),
+    /// Scale the background image by `factor` around `anchor` (world).
+    ScaleBackground {
+        anchor: Point,
+        factor: f32,
+    },
+    /// Rotate the background image clockwise by `angle` radians around
+    /// `anchor` (world).
+    RotateBackground {
         anchor: Point,
         angle: f32,
     },
@@ -91,12 +127,16 @@ pub fn view<'a>(
     camera: Camera,
     cache: &'a canvas::Cache,
     grid: &'a canvas::Cache,
+    background: Option<&'a Background>,
+    tool: Tool,
 ) -> Element<'a, Message> {
     Canvas::new(Editor {
         document,
         camera,
         cache,
         grid,
+        background,
+        tool,
         deadline: Cell::new(None),
     })
     .width(Fill)
@@ -111,6 +151,8 @@ struct Editor<'a> {
     /// The background and grid, drawn apart so a drag's preview only needs
     /// to draw the document afresh.
     grid: &'a canvas::Cache,
+    background: Option<&'a Background>,
+    tool: Tool,
     /// When working out what a drag does should give up, so a heavy case
     /// (e.g. a fill through crowded geometry) can't make it crawl.
     deadline: Cell<Option<std::time::Instant>>,
@@ -129,6 +171,10 @@ pub struct State {
     /// What releasing the current drag would do, worked out when the mouse
     /// last moved: drawn, and applied on release.
     pending: Option<Pending>,
+    /// The faces or edges painted so far in this drag (paint mode): drawn,
+    /// and painted on release.
+    stroke: Vec<TriangleId>,
+    edge_stroke: Vec<(VertexId, VertexId)>,
 }
 
 /// An in-progress drag. Positions are in world coordinates.
@@ -153,6 +199,24 @@ enum Interaction {
         /// Where on the edge the drag started.
         start: Point,
         apex: Point,
+    },
+    /// Dragging from inside a face: nothing until the cursor crosses an
+    /// edge, then extending from the last edge crossed (`edge`: its ends
+    /// and where it was crossed). Back in the face, nothing again.
+    LeavingFace {
+        face: TriangleId,
+        /// Where the cursor was at the last move.
+        last: Point,
+        edge: Option<(VertexId, VertexId, Point)>,
+        apex: Point,
+    },
+    /// Painting faces, the cursor last at `last` (world).
+    Painting {
+        last: Point,
+    },
+    /// Dragging the background image (screen position).
+    MovingBackground {
+        last: Point,
     },
 }
 
@@ -236,7 +300,10 @@ impl canvas::Program<Message> for Editor<'_> {
                 physical_key,
                 modifiers,
                 ..
-            }) if !modifiers.command() && matches!(state.interaction, Interaction::Idle) => {
+            }) if !modifiers.command()
+                && self.tool == Tool::Shape
+                && matches!(state.interaction, Interaction::Idle) =>
+            {
                 let pos = inside?;
 
                 let edit = match key.to_latin(*physical_key)? {
@@ -262,6 +329,15 @@ impl canvas::Program<Message> for Editor<'_> {
 
                 state.interaction = match button {
                     mouse::Button::Middle => Interaction::Panning { last: pos },
+                    mouse::Button::Left if matches!(self.tool, Tool::Background { .. }) => {
+                        Interaction::MovingBackground { last: pos }
+                    }
+                    mouse::Button::Left if matches!(self.tool, Tool::Paint { .. }) => {
+                        state.stroke.clear();
+                        state.edge_stroke.clear();
+                        self.paint_at(state, pos);
+                        Interaction::Painting { last: world }
+                    }
                     mouse::Button::Left => match self.hit_test(pos) {
                         Some(Hover::Vertex(id)) => Interaction::MovingVertex {
                             id,
@@ -273,7 +349,13 @@ impl canvas::Program<Message> for Editor<'_> {
                             start: at,
                             apex: at,
                         },
-                        Some(Hover::Face(_)) | None => Interaction::Creating {
+                        Some(Hover::Face(face)) => Interaction::LeavingFace {
+                            face,
+                            last: world,
+                            edge: None,
+                            apex: world,
+                        },
+                        None => Interaction::Creating {
                             from: world,
                             to: world,
                         },
@@ -291,6 +373,26 @@ impl canvas::Program<Message> for Editor<'_> {
                 let world = self.camera.to_world(pos);
 
                 match &mut state.interaction {
+                    Interaction::Idle if self.tool != Tool::Shape => {
+                        return Some(canvas::Action::request_redraw());
+                    }
+                    Interaction::Painting { last } => {
+                        // Everything along the way, however fast the move.
+                        let from = self.camera.to_screen(*last);
+                        *last = world;
+                        let steps = (from.distance(pos) / 3.0).ceil().max(1.0) as usize;
+                        for i in 1..=steps {
+                            self.paint_at(state, from + (pos - from) * (i as f32 / steps as f32));
+                        }
+                        return Some(canvas::Action::request_redraw().and_capture());
+                    }
+                    Interaction::MovingBackground { last } => {
+                        let delta = self.camera.to_world(pos) - self.camera.to_world(*last);
+                        *last = pos;
+                        return Some(
+                            canvas::Action::publish(Message::MoveBackground(delta)).and_capture(),
+                        );
+                    }
                     Interaction::Idle => {
                         if let Some(hover) = self.hit_test(pos) {
                             let vertex = self.hover_vertex(hover);
@@ -332,7 +434,39 @@ impl canvas::Program<Message> for Editor<'_> {
                             state.pending = pending;
                         }
                     }
-                    Interaction::Idle | Interaction::Panning { .. } => {}
+                    Interaction::LeavingFace {
+                        face,
+                        last,
+                        edge,
+                        apex,
+                    } => {
+                        let crossed = self.last_crossed(*last, world);
+                        *last = world;
+                        if crossed.is_some() {
+                            *edge = crossed;
+                            // What the previous edge would do is moot.
+                            state.pending = None;
+                        }
+                        if self.document.triangle_at(world) == Some(*face) {
+                            *edge = None;
+                        }
+                        match *edge {
+                            Some((a, b, start)) => {
+                                if let Some((p, pending)) = self.limit_extend(a, b, start, world) {
+                                    *apex = p;
+                                    state.pending = pending;
+                                }
+                            }
+                            None => {
+                                *apex = world;
+                                state.pending = None;
+                            }
+                        }
+                    }
+                    Interaction::Idle
+                    | Interaction::Panning { .. }
+                    | Interaction::MovingBackground { .. }
+                    | Interaction::Painting { .. } => {}
                 }
                 self.deadline.set(None);
 
@@ -346,6 +480,43 @@ impl canvas::Program<Message> for Editor<'_> {
 
                 if let Interaction::Idle = finished {
                     return None;
+                }
+                if let Interaction::Painting { .. } = finished {
+                    let faces = std::mem::take(&mut state.stroke);
+                    let edges = std::mem::take(&mut state.edge_stroke);
+                    // The tool changed mid-stroke: dropped.
+                    let Tool::Paint {
+                        target,
+                        brush,
+                        width,
+                    } = self.tool
+                    else {
+                        return Some(canvas::Action::request_redraw().and_capture());
+                    };
+                    // Only what changes.
+                    let edits: Vec<_> = match target {
+                        paint::Target::Faces => {
+                            let color = brush.color();
+                            faces
+                                .into_iter()
+                                .filter(|&t| self.document.color(t) != color)
+                                .map(|triangle| Edit::Paint { triangle, color })
+                                .collect()
+                        }
+                        paint::Target::Edges => {
+                            let style = brush.color().map(|color| EdgeStyle { color, width });
+                            edges
+                                .into_iter()
+                                .filter(|&(a, b)| self.document.edge_style(a, b) != style)
+                                .map(|(a, b)| Edit::PaintEdge { a, b, style })
+                                .collect()
+                        }
+                    };
+                    if edits.is_empty() {
+                        return Some(canvas::Action::request_redraw().and_capture());
+                    }
+                    let revision = self.document.revision();
+                    return Some(canvas::Action::publish(Message::Edit { edits, revision }).and_capture());
                 }
 
                 // Exactly what was shown.
@@ -370,17 +541,27 @@ impl canvas::Program<Message> for Editor<'_> {
                         mouse::ScrollDelta::Pixels { x, y } => (x, y, 50.0),
                     };
                     let angle = if y != 0.0 { y } else { x } / per_notch * ROTATE_STEP;
-                    return Some(
-                        canvas::Action::publish(Message::Rotate { anchor, angle }).and_capture(),
-                    );
+                    let message = if matches!(self.tool, Tool::Background { .. }) {
+                        let anchor = self.camera.to_world(anchor);
+                        Message::RotateBackground { anchor, angle }
+                    } else {
+                        Message::Rotate { anchor, angle }
+                    };
+                    return Some(canvas::Action::publish(message).and_capture());
                 }
 
                 let factor = match *delta {
                     mouse::ScrollDelta::Lines { y, .. } => 1.15f32.powf(y),
                     mouse::ScrollDelta::Pixels { y, .. } => (y / 200.0).exp(),
                 };
+                let message = if matches!(self.tool, Tool::Background { .. }) {
+                    let anchor = self.camera.to_world(anchor);
+                    Message::ScaleBackground { anchor, factor }
+                } else {
+                    Message::Zoom { anchor, factor }
+                };
 
-                Some(canvas::Action::publish(Message::Zoom { anchor, factor }).and_capture())
+                Some(canvas::Action::publish(message).and_capture())
             }
             Event::Mouse(mouse::Event::CursorLeft) => Some(canvas::Action::request_redraw()),
             // Keep drawing frames while the shape highlight moves over.
@@ -407,17 +588,27 @@ impl canvas::Program<Message> for Editor<'_> {
 
         // While dragging, draw the document as it will be after release.
         let pending = match state.interaction {
-            Interaction::Idle | Interaction::Panning { .. } => None,
+            Interaction::Idle
+            | Interaction::Panning { .. }
+            | Interaction::MovingBackground { .. }
+            | Interaction::Painting { .. } => None,
             _ => state.pending.as_ref(),
         };
         // Extending always shares its source edge; that's no news.
         let source = match state.interaction {
-            Interaction::Extending { a, b, .. } => Some((a, b)),
+            Interaction::Extending { a, b, .. }
+            | Interaction::LeavingFace {
+                edge: Some((a, b, _)),
+                ..
+            } => Some((a, b)),
             _ => None,
         };
 
         let grid = self.grid.draw(renderer, bounds.size(), |frame| {
             frame.fill_rectangle(Point::ORIGIN, frame.size(), BACKGROUND);
+            if let Some(background) = self.background {
+                background.draw(frame, camera);
+            }
             draw_grid(frame, camera);
         });
         let content = match &pending {
@@ -433,8 +624,42 @@ impl canvas::Program<Message> for Editor<'_> {
         };
 
         let mut overlay = Frame::new(renderer, bounds.size());
-        draw_compass(&mut overlay, camera);
         let cursor_pos = cursor.position_in(bounds);
+
+        // Adjusting the background: just its outline; the drawing rests.
+        if matches!(self.tool, Tool::Background { .. }) {
+            if let Some(background) = self.background {
+                let corners = background.corners().map(|p| camera.to_screen(p));
+                let outline = Path::new(|p| {
+                    p.move_to(corners[0]);
+                    for &corner in &corners[1..] {
+                        p.line_to(corner);
+                    }
+                    p.close();
+                });
+                let dashed = Stroke {
+                    line_dash: LineDash {
+                        segments: &[6.0, 4.0],
+                        offset: 0,
+                    },
+                    ..stroke(HOVER, 2.0)
+                };
+                overlay.stroke(&outline, dashed);
+            }
+            return vec![grid, content, overlay.into_geometry()];
+        }
+
+        // Painting: what the stroke paints so far, what clicking would
+        // paint, and the brush as the cursor.
+        if let Tool::Paint {
+            target,
+            brush,
+            width,
+        } = self.tool
+        {
+            self.draw_painting(&mut overlay, state, target, brush, width, cursor_pos);
+            return vec![grid, content, overlay.into_geometry()];
+        }
 
         let hover = cursor_pos.and_then(|p| self.hit_test(p));
 
@@ -463,7 +688,7 @@ impl canvas::Program<Message> for Editor<'_> {
             (state.shape.as_ref().filter(current), shown),
         ];
 
-        // Everything else is grayed out, so the highlighted shape stands
+        // Everything else is dimmed, so the highlighted shape stands
         // apart. What the pending edit adds never is.
         if highlighted[1].0.is_some() {
             let added = pending.map_or(&[][..], |pending| &pending.added);
@@ -491,12 +716,12 @@ impl canvas::Program<Message> for Editor<'_> {
             for (dim, triangles) in dimmed {
                 if dim > 0.0 {
                     let wash = self.mesh(triangles.into_iter());
-                    let gray = Color {
-                        a: 0.55 * dim,
+                    let wash_color = Color {
+                        a: 0.45 * dim,
                         ..UNFOCUSED
                     };
-                    overlay.fill(&wash, gray);
-                    overlay.stroke(&wash, stroke(gray, 1.5));
+                    overlay.fill(&wash, wash_color);
+                    overlay.stroke(&wash, stroke(wash_color, 1.5));
                 }
             }
         }
@@ -589,8 +814,13 @@ impl canvas::Program<Message> for Editor<'_> {
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
         match state.interaction {
-            Interaction::Panning { .. } => mouse::Interaction::Grabbing,
+            Interaction::Panning { .. } | Interaction::MovingBackground { .. } => {
+                mouse::Interaction::Grabbing
+            }
             Interaction::Idle if !cursor.is_over(bounds) => mouse::Interaction::default(),
+            Interaction::Idle if matches!(self.tool, Tool::Background { .. }) => {
+                mouse::Interaction::Grab
+            }
             // Our own cursor/handles are drawn on the canvas.
             _ => mouse::Interaction::Hidden,
         }
@@ -675,7 +905,10 @@ impl Editor<'_> {
     /// What releasing `interaction` now would do. `None` if nothing.
     fn pending(&self, interaction: Interaction) -> Option<Pending> {
         match interaction {
-            Interaction::Idle | Interaction::Panning { .. } => None,
+            Interaction::Idle
+            | Interaction::Panning { .. }
+            | Interaction::MovingBackground { .. }
+            | Interaction::Painting { .. } => None,
             Interaction::Creating { from, to } => self.check(
                 vec![Edit::AddTriangle {
                     corners: equilateral(from, to),
@@ -684,6 +917,10 @@ impl Editor<'_> {
                 to,
             ),
             Interaction::MovingVertex { id, to } => self.move_to(id, to),
+            Interaction::LeavingFace { edge, apex, .. } => {
+                let (a, b, start) = edge?;
+                self.pending(Interaction::Extending { a, b, start, apex })
+            }
             Interaction::Extending { a, b, start, apex } => {
                 // Back on the source edge, the drag reads as cancelled.
                 if self.is_near_edge(apex, a, b) {
@@ -847,8 +1084,34 @@ impl Editor<'_> {
             camera: self.camera,
             cache: self.cache,
             grid: self.grid,
+            background: self.background,
+            tool: self.tool,
             deadline: self.deadline.clone(),
         }
+    }
+
+    /// The last edge the cursor crossed going from `from` to `to` (world),
+    /// and where: its ends and the crossing point. `None` if it crossed
+    /// none.
+    fn last_crossed(&self, from: Point, to: Point) -> Option<(VertexId, VertexId, Point)> {
+        let d = to - from;
+        self.document
+            .unique_edges()
+            .into_iter()
+            .filter_map(|(a, b)| {
+                let (pa, pb) = (self.document.vertex(a), self.document.vertex(b));
+                let e = pb - pa;
+                let den = cross(d, e);
+                if den.abs() < 1e-9 {
+                    return None;
+                }
+                let t = cross(pa - from, e) / den;
+                let u = cross(pa - from, d) / den;
+                ((0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u))
+                    .then(|| (t, (a, b, pa + e * u)))
+            })
+            .max_by(|(t1, _), (t2, _)| t1.total_cmp(t2))
+            .map(|(_, crossed)| crossed)
     }
 
     /// The triangle on edge `a`–`b` lying on the same side as `point`.
@@ -983,9 +1246,157 @@ impl Editor<'_> {
     }
 
     fn draw_document(&self, frame: &mut Frame, document: &Document) {
-        let mesh = self.mesh(document.triangles());
-        frame.fill(&mesh, FILL);
-        frame.stroke(&mesh, stroke(EDGE, 1.5));
+        // The shape mode keeps to the plain look.
+        let painted = matches!(
+            self.tool,
+            Tool::Paint { .. } | Tool::Background { painted: true }
+        );
+        if !painted {
+            let mesh = self.mesh(document.triangles());
+            frame.fill(&mesh, FILL);
+            frame.stroke(&mesh, stroke(EDGE, 1.5));
+            return;
+        }
+
+        // Unpainted faces, then the painted ones by colour.
+        let mut unpainted = Vec::new();
+        let mut painted: Vec<(Color, Vec<[Point; 3]>)> = Vec::new();
+        for (t, color) in document.triangles().zip(document.colors()) {
+            match color {
+                None => unpainted.push(t),
+                Some(color) => match painted.iter_mut().find(|(c, _)| *c == color) {
+                    Some((_, group)) => group.push(t),
+                    None => painted.push((color, vec![t])),
+                },
+            }
+        }
+        frame.fill(&self.mesh(unpainted.into_iter()), FILL);
+        for (color, triangles) in painted {
+            frame.fill(&self.mesh(triangles.into_iter()), color);
+        }
+
+        // Plain edges, then the painted ones over them.
+        let screen = |v| self.camera.to_screen(document.vertex(v));
+        let plain = Path::new(|p| {
+            for (a, b) in document.unique_edges() {
+                if document.edge_style(a, b).is_none() {
+                    p.move_to(screen(a));
+                    p.line_to(screen(b));
+                }
+            }
+        });
+        frame.stroke(&plain, stroke(EDGE, 1.5));
+        for (a, b, style) in document.edge_styles() {
+            frame.stroke(
+                &Path::line(screen(a), screen(b)),
+                stroke(style.color, self.edge_width(style.width)),
+            );
+        }
+    }
+
+    /// A painted edge's width on screen: never too thin to see.
+    fn edge_width(&self, width: f32) -> f32 {
+        (width * self.camera.zoom).max(1.0)
+    }
+
+    /// Adds what's under `screen` to the stroke: the face or the edge,
+    /// depending on the target.
+    fn paint_at(&self, state: &mut State, screen: Point) {
+        let Tool::Paint { target, .. } = self.tool else {
+            return;
+        };
+        match target {
+            paint::Target::Faces => {
+                if let Some(t) = self.document.triangle_at(self.camera.to_world(screen))
+                    && !state.stroke.contains(&t)
+                {
+                    state.stroke.push(t);
+                }
+            }
+            paint::Target::Edges => {
+                if let Some(edge) = self.edge_at(screen)
+                    && !state.edge_stroke.contains(&edge)
+                {
+                    state.edge_stroke.push(edge);
+                }
+            }
+        }
+    }
+
+    /// The edge (lowest end first) closest to `screen`, within grabbing
+    /// distance.
+    fn edge_at(&self, screen: Point) -> Option<(VertexId, VertexId)> {
+        let at = |v| self.camera.to_screen(self.document.vertex(v));
+        self.document
+            .unique_edges()
+            .into_iter()
+            .map(|(a, b)| ((a, b), closest_on_segment(screen, at(a), at(b)).1))
+            .filter(|&(_, distance)| distance <= EDGE_HIT)
+            .min_by(|(_, d1), (_, d2)| d1.total_cmp(d2))
+            .map(|(edge, _)| edge)
+    }
+
+    /// The paint mode's overlay: the stroke so far, what's under the
+    /// cursor, and the brush following the cursor.
+    fn draw_painting(
+        &self,
+        frame: &mut Frame,
+        state: &State,
+        target: paint::Target,
+        brush: Brush,
+        width: f32,
+        cursor: Option<Point>,
+    ) {
+        let screen = |v| self.camera.to_screen(self.document.vertex(v));
+        let color = brush.color();
+        match target {
+            paint::Target::Faces => {
+                let triangles: Vec<_> = self.document.triangles().collect();
+                let faces = |ids: &[TriangleId]| self.mesh(ids.iter().map(|&t| triangles[t]));
+                let painted = faces(&state.stroke);
+                match color {
+                    Some(color) => frame.fill(&painted, color),
+                    // Cleared: as unpainted faces look.
+                    None => {
+                        frame.fill(&painted, BACKGROUND);
+                        frame.fill(&painted, FILL);
+                    }
+                }
+                frame.stroke(&painted, stroke(EDGE, 1.5));
+
+                let hovered = cursor.and_then(|p| self.document.triangle_at(self.camera.to_world(p)));
+                if let Some(t) = hovered {
+                    let face = faces(&[t]);
+                    if let Some(color) = color {
+                        frame.fill(&face, Color { a: 0.5, ..color });
+                    }
+                    frame.stroke(&face, stroke(HOVER, 2.5));
+                }
+            }
+            paint::Target::Edges => {
+                let line = |(a, b)| Path::line(screen(a), screen(b));
+                let look = match color {
+                    Some(color) => stroke(color, self.edge_width(width)),
+                    // Cleared: as plain edges look.
+                    None => stroke(EDGE, 1.5),
+                };
+                for &edge in &state.edge_stroke {
+                    frame.stroke(&line(edge), look);
+                }
+                if let Some(edge) = cursor.and_then(|p| self.edge_at(p)) {
+                    frame.stroke(&line(edge), stroke(HOVER, self.edge_width(width) + 4.0));
+                    frame.stroke(&line(edge), look);
+                }
+            }
+        }
+
+        if let Some(p) = cursor {
+            let (icon, hotspot) = paint_cursor(target, color);
+            frame.draw_svg(
+                Rectangle::new(p - hotspot, iced::Size::new(CURSOR_SIZE, CURSOR_SIZE)),
+                &iced::widget::svg::Handle::from_memory(icon.into_bytes()),
+            );
+        }
     }
 
     /// Highlights how the pending result differs from the current document:
@@ -1301,22 +1712,49 @@ fn draw_grid(frame: &mut Frame, camera: Camera) {
     frame.fill(&dots, GRID_DOT);
 }
 
-/// A compass in the top right corner whose needle points to world "up".
-fn draw_compass(frame: &mut Frame, camera: Camera) {
-    let centre = Point::new(
-        frame.width() - COMPASS_MARGIN - COMPASS,
-        COMPASS_MARGIN + COMPASS,
-    );
-    let (sin, cos) = camera.rotation.sin_cos();
-    let up = Vector::new(sin, -cos) * (COMPASS - 4.0);
-    let dial = Path::circle(centre, COMPASS);
+/// How big (screen px) the paint mode's cursor icon is drawn.
+const CURSOR_SIZE: f32 = 26.0;
 
-    frame.fill(&dial, BACKGROUND);
-    frame.stroke(&dial, stroke(GRID_DOT, 1.5));
-    let tail = centre - up * 0.6;
-    frame.stroke(&Path::line(tail, centre), stroke(GRID_DOT, 2.0));
-    frame.stroke(&Path::line(centre, centre + up), stroke(EDGE, 2.0));
-    frame.fill(&Path::circle(centre + up, 2.5), EDGE);
+/// The paint mode's cursor: a bucket for faces, a brush for edges, both
+/// dipped in the colour; an eraser to clear. The icon (24 units square) as
+/// SVG, and where its tip is (screen px from its corner).
+fn paint_cursor(target: paint::Target, color: Option<Color>) -> (String, Vector) {
+    let hex = paint::to_hex;
+    let (shadow, lines) = (hex(BACKGROUND), hex(EDGE));
+    // Outlined in the background colour, to show on any colour.
+    let icon = |outline: &str, paint: &str| {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round"><g stroke="{shadow}" stroke-width="4">{outline}{paint}</g>{paint_filled}<g stroke="{lines}" stroke-width="2">{outline}</g></svg>"#,
+            paint_filled = color.map_or(String::new(), |color| {
+                let c = hex(color);
+                paint.replace("<path ", &format!(r#"<path fill="{c}" stroke="{c}" stroke-width="1.5" "#))
+            }),
+        )
+    };
+    let unit = CURSOR_SIZE / 24.0;
+    match (color, target) {
+        (None, _) => (
+            icon(
+                r#"<path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/>"#,
+                "",
+            ),
+            Vector::new(5.0, 20.0) * unit,
+        ),
+        (Some(_), paint::Target::Faces) => (
+            icon(
+                r#"<path d="m19 11-8-8-8.6 8.6a2 2 0 0 0 0 2.8l5.2 5.2c.8.8 2 .8 2.8 0L19 11Z"/><path d="m5 2 5 5"/><path d="M2 13h15"/>"#,
+                r#"<path d="M22 20a2 2 0 1 1-4 0c0-1.6 1.7-2.4 2-4 .3 1.6 2 2.4 2 4Z"/>"#,
+            ),
+            Vector::new(20.0, 22.0) * unit,
+        ),
+        (Some(_), paint::Target::Edges) => (
+            icon(
+                r#"<path d="m9.06 11.9 8.07-8.06a2.85 2.85 0 1 1 4.03 4.03l-8.06 8.08"/>"#,
+                r#"<path d="M7.07 14.94c-1.66 0-3 1.35-3 3.02 0 1.33-2.5 1.52-2 2.02 1.08 1.1 2.49 2.02 4 2.02 2.2 0 4-1.8 4-4.04a3.01 3.01 0 0 0-3-3.02z"/>"#,
+            ),
+            Vector::new(2.0, 21.0) * unit,
+        ),
+    }
 }
 
 fn handle(frame: &mut Frame, at: Point, color: Color) {
@@ -1374,6 +1812,8 @@ mod tests {
             camera: Camera::default(),
             cache,
             grid: cache,
+            background: None,
+            tool: Tool::Shape,
             deadline: Cell::new(None),
         }
     }
@@ -1404,6 +1844,143 @@ mod tests {
     const MOVE: mouse::Event = mouse::Event::CursorMoved {
         position: Point::ORIGIN,
     };
+
+    #[test]
+    fn painting_paints_the_faces_dragged_over_and_nothing_else() {
+        let doc = two_apart();
+        let cache = canvas::Cache::new();
+        let mut editor = editor(&doc, &cache);
+        let brush = Brush::default();
+        editor.tool = Tool::Paint {
+            target: paint::Target::Faces,
+            brush,
+            width: 1.0,
+        };
+        let color = brush.color();
+
+        // From inside the first, over the gap (fast), into the second.
+        let edits = drag(
+            &editor,
+            &[
+                (MOVE, 150.0, 280.0),
+                (PRESS, 150.0, 280.0),
+                (MOVE, 300.0, 280.0),
+                (RELEASE, 300.0, 280.0),
+            ],
+        );
+        assert_eq!(
+            edits,
+            vec![vec![
+                Edit::Paint { triangle: 0, color },
+                Edit::Paint { triangle: 1, color },
+            ]]
+        );
+
+        // Dragging a corner or an edge doesn't change the shape.
+        let edits = drag(
+            &editor,
+            &[
+                (MOVE, 100.0, 300.0),
+                (PRESS, 100.0, 300.0),
+                (MOVE, 50.0, 350.0),
+                (RELEASE, 50.0, 350.0),
+            ],
+        );
+        assert_eq!(edits, vec![vec![Edit::Paint { triangle: 0, color }]]);
+    }
+
+    #[test]
+    fn painting_edges_paints_only_edges_and_faces_only_faces() {
+        let doc = one();
+        let cache = canvas::Cache::new();
+        let mut editor = editor(&doc, &cache);
+        let brush = Brush::default();
+        let style = EdgeStyle {
+            color: brush.color().unwrap(),
+            width: 2.0,
+        };
+        // From the bottom edge, through the face, over the right edge.
+        let stroke = [
+            (MOVE, 200.0, 300.0),
+            (PRESS, 200.0, 300.0),
+            (MOVE, 200.0, 250.0),
+            (MOVE, 280.0, 250.0),
+            (RELEASE, 280.0, 250.0),
+        ];
+
+        editor.tool = Tool::Paint {
+            target: paint::Target::Edges,
+            brush,
+            width: 2.0,
+        };
+        let edits = drag(&editor, &stroke);
+        let edge = |a, b| Edit::PaintEdge {
+            a,
+            b,
+            style: Some(style),
+        };
+        assert_eq!(edits, vec![vec![edge(0, 1), edge(1, 2)]]);
+
+        editor.tool = Tool::Paint {
+            target: paint::Target::Faces,
+            brush,
+            width: 2.0,
+        };
+        let edits = drag(&editor, &stroke);
+        assert_eq!(
+            edits,
+            vec![vec![Edit::Paint {
+                triangle: 0,
+                color: brush.color()
+            }]]
+        );
+    }
+
+    #[test]
+    fn dragging_out_of_a_face_extends_from_the_edge_crossed() {
+        let doc = one();
+        let cache = canvas::Cache::new();
+        let editor = editor(&doc, &cache);
+
+        // Out through the bottom edge: as if dragged from that edge.
+        let from_face = drag(
+            &editor,
+            &[
+                (MOVE, 200.0, 250.0),
+                (PRESS, 200.0, 250.0),
+                (MOVE, 200.0, 290.0),
+                (MOVE, 200.0, 350.0),
+                (RELEASE, 200.0, 350.0),
+            ],
+        );
+        let from_edge = drag(
+            &editor,
+            &[
+                (MOVE, 200.0, 300.0),
+                (PRESS, 200.0, 300.0),
+                (MOVE, 200.0, 350.0),
+                (RELEASE, 200.0, 350.0),
+            ],
+        );
+        assert_eq!(from_face, from_edge);
+        assert!(
+            matches!(&from_face[..], [edits] if matches!(edits[..], [Edit::AddTriangle { .. }])),
+            "{from_face:?}"
+        );
+
+        // Out, then back into the face: nothing.
+        let back = drag(
+            &editor,
+            &[
+                (MOVE, 200.0, 250.0),
+                (PRESS, 200.0, 250.0),
+                (MOVE, 200.0, 350.0),
+                (MOVE, 200.0, 250.0),
+                (RELEASE, 200.0, 250.0),
+            ],
+        );
+        assert!(back.is_empty(), "{back:?}");
+    }
 
     #[test]
     fn changing_direction_mid_drag() {
@@ -1876,6 +2453,8 @@ mod bench {
                     },
                     cache: &cache,
                     grid: &cache,
+                    background: None,
+                    tool: Tool::Shape,
                     deadline: Cell::new(None),
                 };
                 let run = |f: &dyn Fn(&Editor)| {
