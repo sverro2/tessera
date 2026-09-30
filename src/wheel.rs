@@ -17,10 +17,7 @@ const RINGS: usize = 10;
 /// The wheel, `size` px across, with a marker at `color`. Picking gives
 /// hue and saturation (the value stays `color`'s).
 pub fn view<'a>(color: Hsv, size: f32) -> Element<'a, Hsv> {
-    Canvas::new(Wheel { color })
-        .width(size)
-        .height(size)
-        .into()
+    Canvas::new(Wheel { color }).width(size).height(size).into()
 }
 
 struct Wheel {
@@ -123,8 +120,14 @@ impl canvas::Program<Hsv> for Wheel {
         let angle = self.color.hue * TAU;
         let at = centre + Vector::new(angle.cos(), angle.sin()) * (self.color.saturation * radius);
         let ring = Path::circle(at, 5.0);
-        marker.stroke(&ring, Stroke::default().with_color(Color::BLACK).with_width(3.0));
-        marker.stroke(&ring, Stroke::default().with_color(Color::WHITE).with_width(1.5));
+        marker.stroke(
+            &ring,
+            Stroke::default().with_color(Color::BLACK).with_width(3.0),
+        );
+        marker.stroke(
+            &ring,
+            Stroke::default().with_color(Color::WHITE).with_width(1.5),
+        );
 
         vec![wheel, marker.into_geometry()]
     }

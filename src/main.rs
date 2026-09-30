@@ -5,17 +5,19 @@ mod document;
 mod editor;
 mod file;
 mod geometry;
+mod layers;
 mod paint;
-mod wheel;
 mod svg;
+mod wheel;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use iced::keyboard::{self, Key};
 use iced::time::{Duration, Instant};
 use iced::widget::{
-    button, canvas, center, column, container, mouse_area, opaque, row, slider, space, stack, text,
-    text_input,
+    button, center, column, container, mouse_area, opaque, row, scrollable, slider, space, stack,
+    text, text_input, tooltip,
 };
 use iced::window;
 use iced::{Center, Color, Element, Fill, Padding, Subscription, Task, Theme};
@@ -24,6 +26,7 @@ use background::Background;
 use camera::Camera;
 use document::{Document, Edit};
 use editor::Tool;
+use layers::{Layers, NodeId, Place, Signature};
 use paint::{Brush, Hsv, Target};
 
 pub fn main() -> iced::Result {
@@ -55,32 +58,50 @@ const MAX_UNDO: usize = 200;
 const NOTICE_FADE: Duration = Duration::from_millis(600);
 /// The menu bar's height: where menus drop down from.
 const MENU_BAR_HEIGHT: f32 = 34.0;
+/// The layers panel's width, right of the canvas.
+const LAYERS_WIDTH: f32 = 250.0;
+/// A line's height in the layers panel.
+const LAYER_ROW: f32 = 26.0;
+/// The layer name field, to focus when renaming.
+const NAME_FIELD: &str = "layer-name";
 /// Icons for the background's visibility toggle.
 const EYE_OPEN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>"#;
 const ERASER: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/></svg>"#;
+const PIPETTE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 22 1-1h3l9-9"/><path d="M3 21v-3l9-9"/><path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.4.4a2.1 2.1 0 1 1-3 3l-3.8-3.8a2.1 2.1 0 1 1 3-3l.4.4Z"/></svg>"#;
 const EYE_CLOSED: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/><path d="M3 3l18 18"/></svg>"#;
 
 #[derive(Default)]
 struct Tessera {
-    /// The data. Only ever changed through `Document::apply`, or replaced
-    /// as a whole (new, open).
-    document: Document,
-    /// The document as it was before each edit, most recent last; and as
-    /// it was before each undo.
-    undo: Vec<Document>,
-    redo: Vec<Document>,
+    /// The data: the layers, each drawn on only through `Document::apply`;
+    /// or replaced as a whole (new, open).
+    layers: Layers,
+    /// The layer being edited (see [`Self::current`]).
+    current: NodeId,
+    /// The layer or group selected in the layers panel.
+    selected: NodeId,
+    /// The layer or group whose name is being typed: its renaming is one
+    /// undo step.
+    renaming: Option<NodeId>,
+    /// The layer or group whose name is shown as a field to type in.
+    naming: Option<NodeId>,
+    /// A layer or group being dragged in the layers panel, and where
+    /// dropping it would put it.
+    dragging: Option<(NodeId, Option<Place>)>,
+    /// The layers as they were before each change, most recent last; and
+    /// as they were before each undo. Unchanged drawings are shared.
+    undo: Vec<Layers>,
+    redo: Vec<Layers>,
     /// View state, independent of the data.
     camera: Camera,
-    /// The drawn document; cleared when it or the camera changes.
-    cache: canvas::Cache,
-    /// The drawn background grid; cleared when the camera changes.
-    grid: canvas::Cache,
+    /// What's drawn on the canvas; see `editor::Caches` for when to clear
+    /// which.
+    caches: editor::Caches,
     /// Where the document was last saved to or opened from.
     path: Option<PathBuf>,
-    /// The document revision last saved or opened; `None` for a new
-    /// document (which starts out saved). Anything else has unsaved
-    /// changes; moving the view doesn't count.
-    saved: Option<u64>,
+    /// The layers as last saved or opened; `None` for a new document
+    /// (which starts out saved). Anything else has unsaved changes; moving
+    /// the view doesn't count.
+    saved: Option<Signature>,
     /// The menu that is open, if any.
     menu: Option<Menu>,
     /// Asking what to do with unsaved changes before doing this.
@@ -112,6 +133,11 @@ struct Tessera {
     target: Target,
     /// How wide painted edges are (world units).
     edge_width: f32,
+    /// Whether the next click on the canvas picks up a brush (the pipette).
+    picking: bool,
+    /// The modifier keys held (Shift turns painting a layer into painting
+    /// all layers).
+    modifiers: keyboard::Modifiers,
     /// The window's size, once it has been resized (or first laid out);
     /// until then, the size it opens at.
     window_size: Option<iced::Size>,
@@ -192,12 +218,19 @@ enum Choice {
 enum Message {
     Editor(editor::Message),
     Compass(compass::Message),
+    Layers(LayerAction),
     SetMode(Mode),
+    ToggleMode,
     PickBrush(Brush),
     HexTyped(String),
     /// Picked on the colour wheel, or its brightness slider.
     WheelPicked(Hsv),
     SetTarget(Target),
+    /// Paint all of the current layer (or, `true`, all layers) with the
+    /// brush: every face, or every edge.
+    PaintEverything(bool),
+    /// Turns the pipette on (in the paint mode) or off.
+    TogglePicking,
     EdgeWidth(f32),
     WindowResized(iced::Size),
     ToggleMenu(Menu),
@@ -239,11 +272,38 @@ enum Message {
     BackgroundOpacity(f32),
 }
 
-/// What was saved: the document revision and background version.
-#[derive(Debug, Clone, Copy)]
+/// What was saved: the layers and background version.
+#[derive(Debug, Clone)]
 struct Versions {
-    revision: u64,
+    layers: Signature,
     background: u64,
+}
+
+/// Something done in the layers panel.
+#[derive(Debug, Clone)]
+enum LayerAction {
+    /// Pressed on a line: selects it, and starts dragging it.
+    Press(NodeId),
+    /// While dragging, over this line, this far down it (0 to 1).
+    Hover(NodeId, f32),
+    /// While dragging, below all lines.
+    HoverEnd,
+    /// While dragging, left the list.
+    Leave,
+    /// Let go (anywhere): moves what's dragged where it would go.
+    Drop,
+    /// A new layer in front of the selected one.
+    Add,
+    /// The selected one in a new group.
+    Group,
+    Ungroup,
+    Remove,
+    /// Shows a line's name as a field to type in.
+    StartRename(NodeId),
+    EndRename,
+    Rename(String),
+    ToggleVisible(NodeId),
+    ToggleExpanded(NodeId),
 }
 
 impl Tessera {
@@ -266,13 +326,237 @@ impl Tessera {
     fn is_unsaved(&self) -> bool {
         let edited = self
             .saved
-            .is_some_and(|saved| saved != self.document.revision());
-        (edited && !self.document.is_empty()) || self.background_version != self.saved_background
+            .as_ref()
+            .is_some_and(|saved| *saved != self.layers.signature());
+        (edited && !self.layers.is_empty()) || self.background_version != self.saved_background
     }
 
     /// Nothing drawn, no background: nothing a new document would change.
     fn is_blank(&self) -> bool {
-        self.document.is_empty() && self.background.is_none()
+        self.layers.is_empty() && self.background.is_none()
+    }
+
+    /// The layer being edited: `current`, or (if that's gone, e.g. after an
+    /// undo) the frontmost.
+    fn current(&self) -> NodeId {
+        if self.layers.layer(self.current).is_some() {
+            self.current
+        } else {
+            self.layers.first_layer()
+        }
+    }
+
+    /// The current layer's drawing.
+    fn document(&self) -> &Document {
+        &self
+            .layers
+            .layer(self.current())
+            .expect("current layer")
+            .document
+    }
+
+    /// Before changing the layers: `before` becomes an undo step.
+    fn push_undo(&mut self, before: Layers) {
+        // A new document starts out saved.
+        self.saved.get_or_insert_with(|| before.signature());
+        self.undo.push(before);
+        if self.undo.len() > MAX_UNDO {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// After the layers were replaced (undo, new, open): keeps the current
+    /// and selected layer to ones that exist.
+    fn layers_replaced(&mut self) {
+        self.current = self.current();
+        if !self.layers.contains(self.selected) {
+            self.selected = self.current;
+        }
+        self.renaming = None;
+        self.naming = None;
+        self.dragging = None;
+        self.caches.clear_layers();
+    }
+
+    fn layer_action(&mut self, action: LayerAction) -> Task<Message> {
+        let before = self.layers.clone();
+        let selected = self.selected;
+        if !matches!(action, LayerAction::Rename(_)) {
+            self.renaming = None;
+        }
+        let changed = match action {
+            LayerAction::Press(id) => {
+                if self.naming != Some(id) {
+                    self.naming = None;
+                }
+                self.select_layer(id);
+                self.dragging = Some((id, None));
+                return Task::none();
+            }
+            LayerAction::Hover(id, y) => {
+                if let Some((dragged, place)) = &mut self.dragging {
+                    let group = self
+                        .layers
+                        .rows()
+                        .iter()
+                        .find(|row| row.id == id)
+                        .map(|row| row.group);
+                    *place = match group {
+                        None => None,
+                        // A group: its middle (or, expanded, its lower part:
+                        // where its contents follow) puts it in.
+                        Some(Some(expanded)) => Some(if y < 0.25 {
+                            Place::Before(id)
+                        } else if y > 0.75 && !expanded {
+                            Place::After(id)
+                        } else {
+                            Place::Into(id)
+                        }),
+                        Some(None) => Some(if y < 0.5 {
+                            Place::Before(id)
+                        } else {
+                            Place::After(id)
+                        }),
+                    }
+                    // Onto itself: nowhere.
+                    .filter(|_| id != *dragged);
+                }
+                return Task::none();
+            }
+            LayerAction::HoverEnd => {
+                if let Some((_, place)) = &mut self.dragging {
+                    *place = Some(Place::Last);
+                }
+                return Task::none();
+            }
+            LayerAction::Leave => {
+                if let Some((_, place)) = &mut self.dragging {
+                    *place = None;
+                }
+                return Task::none();
+            }
+            LayerAction::Drop => match self.dragging.take() {
+                Some((id, Some(place))) => self.layers.move_to(id, place),
+                _ => return Task::none(),
+            },
+            LayerAction::ToggleExpanded(id) => {
+                self.layers.toggle_expanded(id);
+                return Task::none();
+            }
+            LayerAction::StartRename(id) => {
+                self.dragging = None;
+                self.select_layer(id);
+                self.naming = Some(id);
+                return Task::batch([
+                    iced::widget::operation::focus(NAME_FIELD),
+                    iced::widget::operation::select_all(NAME_FIELD),
+                ]);
+            }
+            LayerAction::EndRename => {
+                self.naming = None;
+                return Task::none();
+            }
+            LayerAction::Rename(name) => {
+                self.layers.rename(selected, name);
+                // Typing a name is one step.
+                if self.renaming != Some(selected) {
+                    self.renaming = Some(selected);
+                    self.push_undo(before);
+                }
+                return Task::none();
+            }
+            LayerAction::Add => {
+                let id = self.layers.add_layer(selected);
+                self.current = id;
+                self.selected = id;
+                true
+            }
+            LayerAction::Group => match self.layers.group(selected) {
+                Some(group) => {
+                    self.selected = group;
+                    true
+                }
+                None => false,
+            },
+            LayerAction::Ungroup => {
+                let ungrouped = self.layers.ungroup(selected);
+                if ungrouped {
+                    self.selected = self.current();
+                }
+                ungrouped
+            }
+            LayerAction::Remove => self.layers.remove(selected),
+            LayerAction::ToggleVisible(id) => {
+                let visible = self
+                    .layers
+                    .rows()
+                    .iter()
+                    .find(|row| row.id == id)
+                    .is_some_and(|row| row.visible);
+                self.layers.set_visible(id, !visible);
+                true
+            }
+        };
+        if changed {
+            self.push_undo(before);
+            self.layers_replaced();
+        }
+        Task::none()
+    }
+
+    /// Paints every face (or edge) of the current layer, or of all layers,
+    /// with the brush; one undo step.
+    fn paint_everything(&mut self, all_layers: bool) {
+        let edit = match self.target {
+            Target::Faces => Edit::PaintAll {
+                color: self.brush.color(),
+            },
+            Target::Edges => Edit::PaintAllEdges {
+                style: self.brush.color().map(|color| document::EdgeStyle {
+                    color,
+                    width: self.edge_width,
+                }),
+            },
+        };
+        let ids: Vec<_> = if all_layers {
+            self.layers.layers().iter().map(|layer| layer.id).collect()
+        } else {
+            vec![self.current()]
+        };
+        let before = self.layers.clone();
+        for id in ids {
+            let layer = self.layers.layer_mut(id).expect("layer");
+            Arc::make_mut(&mut layer.document).apply(edit);
+        }
+        if let Some(color) = self.brush.color() {
+            paint::remember(&mut self.recent, color);
+        }
+        self.push_undo(before);
+        self.caches.clear_layers();
+    }
+
+    /// Paints with `brush` from now on; the colour controls follow.
+    fn set_brush(&mut self, brush: Brush) {
+        self.brush = brush;
+        if let Brush::Color(color) = brush {
+            self.hsv = Hsv::from_color(color, self.hsv.hue);
+            self.hex = paint::to_hex(color);
+        }
+    }
+
+    /// Selects a line in the layers panel; a layer becomes the one edited.
+    fn select_layer(&mut self, id: NodeId) {
+        self.selected = id;
+        if self.layers.layer(id).is_some() && id != self.current() {
+            self.current = id;
+            self.caches.clear_layers();
+        }
+    }
+
+    /// The canvas's size in a window of this size.
+    fn canvas_size(window: iced::Size) -> iced::Size {
+        iced::Size::new(window.width - LAYERS_WIDTH, window.height - MENU_BAR_HEIGHT)
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -280,6 +564,17 @@ impl Tessera {
             keyboard::listen().map(Message::Key),
             window::close_requests().map(Message::CloseRequested),
             window::resize_events().map(|(_, size)| Message::WindowResized(size)),
+            // Letting go of a dragged layer anywhere drops it.
+            if self.dragging.is_some() {
+                iced::event::listen_with(|event, _, _| match event {
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )) => Some(Message::Layers(LayerAction::Drop)),
+                    _ => None,
+                })
+            } else {
+                Subscription::none()
+            },
             if self.notice.is_some() {
                 window::frames().map(Message::Frame)
             } else {
@@ -303,13 +598,14 @@ impl Tessera {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Editor(editor::Message::Edit { edits, revision }) => {
-                if revision != self.document.revision() {
+                if revision != self.document().revision() {
                     return Task::none();
                 }
-                // A new document starts out saved.
-                self.saved.get_or_insert(revision);
-                let before = self.document.clone();
-                if self.document.apply_all(&edits) {
+                self.renaming = None;
+                let before = self.layers.clone();
+                let current = self.current();
+                let layer = self.layers.layer_mut(current).expect("current layer");
+                if Arc::make_mut(&mut layer.document).apply_all(&edits) {
                     for edit in &edits {
                         let color = match *edit {
                             Edit::Paint { color, .. } => color,
@@ -320,23 +616,19 @@ impl Tessera {
                             paint::remember(&mut self.recent, color);
                         }
                     }
-                    self.undo.push(before);
-                    if self.undo.len() > MAX_UNDO {
-                        self.undo.remove(0);
-                    }
-                    self.redo.clear();
+                    self.push_undo(before);
                 }
-                self.cache.clear();
+                self.caches.current.clear();
                 return Task::none();
             }
+            Message::Layers(action) => return self.layer_action(action),
             Message::Undo => {
                 self.menu = None;
                 let Some(before) = self.undo.pop() else {
                     return Task::none();
                 };
-                self.redo
-                    .push(std::mem::replace(&mut self.document, before));
-                self.cache.clear();
+                self.redo.push(std::mem::replace(&mut self.layers, before));
+                self.layers_replaced();
                 return Task::none();
             }
             Message::Redo => {
@@ -344,8 +636,8 @@ impl Tessera {
                 let Some(after) = self.redo.pop() else {
                     return Task::none();
                 };
-                self.undo.push(std::mem::replace(&mut self.document, after));
-                self.cache.clear();
+                self.undo.push(std::mem::replace(&mut self.layers, after));
+                self.layers_replaced();
                 return Task::none();
             }
             Message::Editor(editor::Message::Pan(delta)) => {
@@ -359,27 +651,30 @@ impl Tessera {
             }
             Message::Compass(compass::Message::TurnTo(rotation)) => {
                 // Around the middle of the canvas.
-                let window = self.window_size.unwrap_or(WINDOW_SIZE);
-                let anchor = iced::Point::new(
-                    window.width / 2.0,
-                    (window.height - MENU_BAR_HEIGHT) / 2.0,
-                );
+                let canvas = Self::canvas_size(self.window_size.unwrap_or(WINDOW_SIZE));
+                let anchor = iced::Point::new(canvas.width / 2.0, canvas.height / 2.0);
                 self.camera.rotate_to(anchor, rotation);
             }
             Message::SetMode(mode) => {
+                if mode == Mode::Shape {
+                    self.picking = false;
+                }
                 if mode != self.mode {
                     self.mode = mode;
                     // Colours show in the paint mode only.
-                    self.cache.clear();
+                    self.caches.clear_layers();
                 }
                 return Task::none();
             }
+            Message::ToggleMode => {
+                let mode = match self.mode {
+                    Mode::Shape => Mode::Paint,
+                    Mode::Paint => Mode::Shape,
+                };
+                return Task::done(Message::SetMode(mode));
+            }
             Message::PickBrush(brush) => {
-                self.brush = brush;
-                if let Brush::Color(color) = brush {
-                    self.hsv = Hsv::from_color(color, self.hsv.hue);
-                    self.hex = paint::to_hex(color);
-                }
+                self.set_brush(brush);
                 return Task::none();
             }
             Message::HexTyped(typed) => {
@@ -395,6 +690,38 @@ impl Tessera {
                 self.hsv = hsv;
                 self.brush = Brush::Color(color);
                 self.hex = paint::to_hex(color);
+                return Task::none();
+            }
+            Message::Editor(editor::Message::Pick(picked)) => {
+                // Brushes that paint just like what was picked.
+                let color = match picked {
+                    editor::Picked::Face(color) => color,
+                    editor::Picked::Edge(style) => {
+                        if let Some(style) = style {
+                            self.edge_width = style.width;
+                        }
+                        style.map(|style| style.color)
+                    }
+                };
+                self.picking = false;
+                self.set_brush(match color {
+                    Some(color) => Brush::Color(color),
+                    None => Brush::Eraser,
+                });
+                return Task::none();
+            }
+            Message::TogglePicking => {
+                if self.mode == Mode::Paint {
+                    self.picking = !self.picking;
+                } else {
+                    self.picking = true;
+                    self.mode = Mode::Paint;
+                    self.caches.clear_layers();
+                }
+                return Task::none();
+            }
+            Message::PaintEverything(all_layers) => {
+                self.paint_everything(all_layers);
                 return Task::none();
             }
             Message::SetTarget(target) => {
@@ -440,7 +767,8 @@ impl Tessera {
                 return self.replace(Replace::Open);
             }
             Message::Replace(Replace::New) => {
-                self.document = Document::default();
+                self.layers = Layers::default();
+                self.layers_replaced();
                 self.undo.clear();
                 self.redo.clear();
                 self.camera = Camera::default();
@@ -468,13 +796,19 @@ impl Tessera {
             Message::Opened(Ok(None)) => return Task::none(),
             Message::Opened(Ok(Some((path, text)))) => match file::open(&text) {
                 Ok(contents) => {
-                    self.saved = Some(contents.document.revision());
+                    self.saved = Some(contents.layers.signature());
                     // Its colours, to pick again.
-                    let colors: Vec<_> = contents.document.colors().flatten().collect();
+                    let colors: Vec<_> = contents
+                        .layers
+                        .layers()
+                        .iter()
+                        .flat_map(|layer| layer.document.colors().flatten())
+                        .collect();
                     for color in colors.into_iter().rev() {
                         paint::remember(&mut self.recent, color);
                     }
-                    self.document = contents.document;
+                    self.layers = contents.layers;
+                    self.layers_replaced();
                     self.undo.clear();
                     self.redo.clear();
                     self.camera = contents.camera;
@@ -509,7 +843,7 @@ impl Tessera {
                     Ok(Some(path)) => {
                         self.path = Some(path);
                         self.notify(format!("Saved {}", self.name()), false);
-                        self.saved = Some(versions.revision);
+                        self.saved = Some(versions.layers);
                         self.saved_background = versions.background;
                         if let Some(then) = then {
                             return Task::done(Message::Replace(then));
@@ -523,7 +857,7 @@ impl Tessera {
             }
             Message::ExportSvg => {
                 self.menu = None;
-                let svg = svg::export(&self.document);
+                let svg = svg::export(&self.layers);
                 return Task::perform(save_svg(svg), Message::Exported);
             }
             Message::Exported(result) => {
@@ -548,17 +882,22 @@ impl Tessera {
                     self.menu = None;
                     self.confirming = None;
                     self.editing_background = false;
+                    self.picking = false;
                     return Task::none();
                 }
                 if self.confirming.is_some() {
                     return Task::none();
                 }
                 if !modifiers.command() {
+                    if key == Key::Named(keyboard::key::Named::Tab) {
+                        return Task::done(Message::ToggleMode);
+                    }
                     let message = match key.to_latin(physical_key) {
                         Some('s') => Message::SetMode(Mode::Shape),
                         Some('p') => Message::SetMode(Mode::Paint),
                         Some('f') if self.mode == Mode::Paint => Message::SetTarget(Target::Faces),
                         Some('e') if self.mode == Mode::Paint => Message::SetTarget(Target::Edges),
+                        Some('i') => Message::TogglePicking,
                         _ => return Task::none(),
                     };
                     return Task::done(message);
@@ -574,6 +913,10 @@ impl Tessera {
                     _ => return Task::none(),
                 };
                 return Task::done(message);
+            }
+            Message::Key(keyboard::Event::ModifiersChanged(modifiers)) => {
+                self.modifiers = modifiers;
+                return Task::none();
             }
             Message::Key(_) => return Task::none(),
             Message::ToggleBackgroundMode => {
@@ -616,7 +959,7 @@ impl Tessera {
                     .map(Message::BackgroundFitted);
             }
             Message::BackgroundFitted(window) => {
-                let viewport = iced::Size::new(window.width, window.height - MENU_BAR_HEIGHT);
+                let viewport = Self::canvas_size(window);
                 if let Some(background) = &mut self.background {
                     background.fit(self.camera, viewport);
                     self.background_changed();
@@ -669,7 +1012,7 @@ impl Tessera {
                     }
                     // Not `background_changed`: that would retype the field.
                     self.background_version += 1;
-                    self.grid.clear();
+                    self.caches.grid.clear();
                 }
                 return Task::none();
             }
@@ -706,15 +1049,14 @@ impl Tessera {
         }
 
         // Everything else above moves the camera or replaces the document.
-        self.cache.clear();
-        self.grid.clear();
+        self.caches.clear_all();
         Task::none()
     }
 
     /// What saving now would save.
     fn versions(&self) -> Versions {
         Versions {
-            revision: self.document.revision(),
+            layers: self.layers.signature(),
             background: self.background_version,
         }
     }
@@ -722,7 +1064,7 @@ impl Tessera {
     /// After the background changed: it's unsaved, and needs drawing.
     fn background_changed(&mut self) {
         self.background_version += 1;
-        self.grid.clear();
+        self.caches.grid.clear();
         self.refresh_fields();
     }
 
@@ -762,7 +1104,7 @@ impl Tessera {
     /// Saves to where the document came from, or (if `choose`, or it never
     /// was saved) to a file picked first; then does `then`.
     fn save(&mut self, choose: bool, then: Option<Replace>) -> Task<Message> {
-        let text = file::save(&self.document, self.camera, self.background.as_ref());
+        let text = file::save(&self.layers, self.camera, self.background.as_ref());
         let versions = self.versions();
         let path = self.path.clone().filter(|_| !choose);
         let name = match &self.path {
@@ -797,8 +1139,8 @@ impl Tessera {
             self.mode_switch(),
             space::horizontal(),
             text(match self.mode {
-                Mode::Shape => "Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
-                Mode::Paint => "Click or drag over faces: paint · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+                Mode::Shape => "Tab/P: paint · Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+                Mode::Paint => "Tab/S: shape · F/E: faces/edges · Click or drag: paint · I/Ctrl+click: pick · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
             })
             .size(12),
         ]
@@ -817,9 +1159,9 @@ impl Tessera {
                 text("|").size(12).style(text::secondary),
                 text(format!(
                     "{} vertices · {} edges · {} faces",
-                    self.document.vertex_count(),
-                    self.document.unique_edges().len(),
-                    self.document.triangle_ids().len(),
+                    self.document().vertex_count(),
+                    self.document().unique_edges().len(),
+                    self.document().triangle_ids().len(),
                 ))
                 .size(12),
             ]
@@ -829,14 +1171,23 @@ impl Tessera {
         .style(container::dark);
 
         let canvas = stack![
-            editor::view(
-                &self.document,
-                self.camera,
-                &self.cache,
-                &self.grid,
-                self.background.as_ref(),
-                self.tool(),
-            )
+            {
+                let current = self.current();
+                let (below, above) = self.layers.around(current);
+                let scene = editor::Scene {
+                    document: self.document(),
+                    shown: self.layers.shown(current),
+                    below,
+                    above,
+                };
+                editor::view(
+                    scene,
+                    self.camera,
+                    &self.caches,
+                    self.background.as_ref(),
+                    self.tool(),
+                )
+            }
             .map(Message::Editor),
             container(
                 column![self.notice(), stats]
@@ -860,7 +1211,7 @@ impl Tessera {
                     .style(container::dark)
             )
             .on_press(Message::CloseMenu),
-            canvas,
+            row![canvas, self.layers_panel()],
         ]];
         if let Some(menu) = self.menu {
             screen = screen.push(self.dropdown(menu));
@@ -883,6 +1234,7 @@ impl Tessera {
                 target: self.target,
                 brush: self.brush,
                 width: self.edge_width,
+                picking: self.picking,
             },
         }
     }
@@ -890,8 +1242,16 @@ impl Tessera {
     /// Shape and paint, side by side as one control.
     fn mode_switch(&self) -> Element<'_, Message> {
         joined(vec![
-            ("Shape", self.mode == Mode::Shape, Message::SetMode(Mode::Shape)),
-            ("Paint", self.mode == Mode::Paint, Message::SetMode(Mode::Paint)),
+            (
+                "Shape",
+                self.mode == Mode::Shape,
+                Message::SetMode(Mode::Shape),
+            ),
+            (
+                "Paint",
+                self.mode == Mode::Paint,
+                Message::SetMode(Mode::Paint),
+            ),
         ])
     }
 
@@ -955,6 +1315,21 @@ impl Tessera {
             .padding([4, 6])
             .style(eraser_style)
             .on_press(Message::PickBrush(Brush::Eraser));
+        let pipette_style = if self.picking {
+            button::primary
+        } else {
+            button::secondary
+        };
+        let pipette = tooltip(
+            button(icon(PIPETTE, pipette_style))
+                .padding([4, 6])
+                .style(pipette_style)
+                .on_press(Message::TogglePicking),
+            container(text("Pick up a colour (I, or Ctrl+click)").size(12))
+                .padding([4, 8])
+                .style(container::dark),
+            tooltip::Position::Bottom,
+        );
 
         let hsv = self.hsv;
         let mut body = column![
@@ -977,6 +1352,7 @@ impl Tessera {
                     .padding([3, 6])
                     .on_input(Message::HexTyped),
                 eraser,
+                pipette,
             ]
             .spacing(8)
             .align_y(Center),
@@ -1003,6 +1379,25 @@ impl Tessera {
                 .align_y(Center),
             );
         }
+        // Everything at once; holding Shift, on every layer.
+        let all_layers = self.modifiers.shift();
+        let everything = match (self.target, all_layers) {
+            (Target::Faces, false) => "Paint all faces of the layer",
+            (Target::Edges, false) => "Paint all edges of the layer",
+            (Target::Faces, true) => "Paint all faces, all layers",
+            (Target::Edges, true) => "Paint all edges, all layers",
+        };
+        body = body.push(tooltip(
+            button(text(everything).size(12).width(Fill).center())
+                .width(Fill)
+                .padding([4, 8])
+                .style(button::secondary)
+                .on_press(Message::PaintEverything(all_layers)),
+            container(text("Hold Shift to paint every layer").size(12))
+                .padding([4, 8])
+                .style(container::dark),
+            tooltip::Position::Bottom,
+        ));
         body = body
             .push(swatches(&paint::PALETTE[..6]))
             .push(swatches(&paint::PALETTE[6..]));
@@ -1023,6 +1418,168 @@ impl Tessera {
         .into()
     }
 
+    /// The layers, front first, beside the canvas: select one to edit it,
+    /// show or hide them, drag them to order them and to put them in and out
+    /// of groups, double-click one to rename it.
+    fn layers_panel(&self) -> Element<'_, Message> {
+        use LayerAction::*;
+        let small = |label| text(label).size(12);
+        let action = |label, action: LayerAction| {
+            button(small(label))
+                .padding([2, 6])
+                .style(button::secondary)
+                .on_press(Message::Layers(action))
+        };
+        let current = self.current();
+        let rows = self.layers.rows();
+        let group_selected = rows
+            .iter()
+            .any(|row| row.id == self.selected && row.group.is_some());
+        let (dragged, place) = match self.dragging {
+            Some((id, place)) => (Some(id), place),
+            None => (None, None),
+        };
+
+        let lines = rows.into_iter().map(|row| {
+            let id = row.id;
+            let selected = id == self.selected;
+            let expander: Element<'_, Message> = match row.group {
+                Some(expanded) => button(small(if expanded { "▾" } else { "▸" }))
+                    .padding([0, 4])
+                    .style(button::text)
+                    .on_press(Message::Layers(ToggleExpanded(id)))
+                    .into(),
+                None => space().width(17).into(),
+            };
+            let eye = button(icon(
+                if row.visible { EYE_OPEN } else { EYE_CLOSED },
+                button::text,
+            ))
+            .padding([2, 4])
+            .style(button::text)
+            .on_press(Message::Layers(ToggleVisible(id)));
+            let name: Element<'_, Message> = if self.naming == Some(id) {
+                text_input("Name", row.name)
+                    .id(NAME_FIELD)
+                    .size(12)
+                    .padding([2, 4])
+                    .on_input(|name| Message::Layers(Rename(name)))
+                    .on_submit(Message::Layers(EndRename))
+                    .into()
+            } else {
+                // Hidden (itself or by its group), or being dragged: dimmed.
+                let dim = !row.shown || dragged == Some(id);
+                text(row.name)
+                    .size(12)
+                    .style(move |theme: &Theme| {
+                        if dim {
+                            text::secondary(theme)
+                        } else {
+                            text::default(theme)
+                        }
+                    })
+                    .into()
+            };
+            let editing = id == current;
+            let into = place == Some(Place::Into(id));
+            let content = container(
+                row![space().width(row.depth as f32 * 14.0), expander, eye, name,]
+                    .spacing(2)
+                    .align_y(Center),
+            )
+            .width(Fill)
+            .height(LAYER_ROW - 4.0)
+            .padding([0, 4])
+            .align_y(Center)
+            .style(move |theme: &Theme| {
+                let palette = theme.palette();
+                // Dropping in, selected, or else the layer being edited.
+                let (background, text) = if into || selected {
+                    (palette.primary.weak.color, palette.primary.weak.text)
+                } else if editing {
+                    (palette.background.weak.color, palette.background.weak.text)
+                } else {
+                    return container::Style::default();
+                };
+                container::Style {
+                    background: Some(background.into()),
+                    text_color: Some(text),
+                    border: iced::Border {
+                        radius: 3.0.into(),
+                        color: palette.primary.base.color,
+                        width: if into { 1.5 } else { 0.0 },
+                    },
+                    ..container::Style::default()
+                }
+            });
+            // Where dropping would put it: a line above or below.
+            let marker = |shown: bool| {
+                container(space().height(2))
+                    .width(Fill)
+                    .style(move |theme: &Theme| container::Style {
+                        background: shown.then(|| theme.palette().primary.base.color.into()),
+                        ..container::Style::default()
+                    })
+            };
+            let line = column![
+                marker(place == Some(Place::Before(id))),
+                content,
+                marker(place == Some(Place::After(id))),
+            ];
+            let mut area = mouse_area(line)
+                .on_press(Message::Layers(Press(id)))
+                .on_double_click(Message::Layers(StartRename(id)));
+            if dragged.is_some() {
+                area = area.on_move(move |p| Message::Layers(Hover(id, p.y / LAYER_ROW)));
+            }
+            area.into()
+        });
+
+        // Below the lines: dropping there puts it at the very back.
+        let mut end = mouse_area(
+            container(space().height(LAYER_ROW * 2.0))
+                .width(Fill)
+                .style(move |theme: &Theme| container::Style {
+                    background: (place == Some(Place::Last))
+                        .then(|| theme.palette().primary.weak.color.into()),
+                    ..container::Style::default()
+                }),
+        );
+        if dragged.is_some() {
+            end = end.on_move(|_| Message::Layers(HoverEnd));
+        }
+
+        let list = mouse_area(scrollable(column(lines).push(end)).height(Fill).width(Fill))
+            .on_exit(Message::Layers(Leave));
+
+        let mut buttons = row![
+            action("+ Layer", Add),
+            action("+ Group", Group),
+            action("Delete", Remove),
+        ]
+        .spacing(4);
+        if group_selected {
+            buttons = buttons.push(action("Ungroup", Ungroup));
+        }
+
+        container(
+            column![
+                text("Layers").size(13),
+                buttons,
+                list,
+                text("Drag to order, onto a group to put it in · Double-click: rename")
+                    .size(11)
+                    .style(text::secondary),
+            ]
+            .spacing(6),
+        )
+        .padding(8)
+        .width(LAYERS_WIDTH)
+        .height(Fill)
+        .style(container::dark)
+        .into()
+    }
+
     /// The compass and, below it, the background button and (in the
     /// background mode) the panel to set up the image with.
     fn background_panel(&self) -> Element<'_, Message> {
@@ -1035,7 +1592,10 @@ impl Tessera {
         } else {
             button::secondary
         };
-        let visible = self.background.as_ref().map(|background| background.visible);
+        let visible = self
+            .background
+            .as_ref()
+            .map(|background| background.visible);
         let toggle = button(small("Background"))
             .padding([4, 10])
             .style(move |theme: &Theme, status| {
@@ -1213,7 +1773,7 @@ impl Tessera {
             .style(button::text)
             .on_press_maybe(message)
         };
-        let has_content = !self.document.is_empty();
+        let has_content = !self.layers.is_empty();
 
         let (offset, items) = match menu {
             Menu::File => (
@@ -1437,11 +1997,203 @@ mod tests {
             Point::new(x + 300.0, 300.0),
             Point::new(x + 200.0, 100.0),
         ];
-        let revision = app.document.revision();
+        let revision = app.document().revision();
         let _ = app.update(Message::Editor(editor::Message::Edit {
             edits: vec![Edit::AddTriangle { corners, snap: 0.0 }],
             revision,
         }));
+    }
+
+    #[test]
+    fn layers_hold_their_own_geometry() {
+        let mut app = Tessera::default();
+        edit(&mut app, 0.0);
+        let back = app.current();
+
+        let _ = app.update(Message::Layers(LayerAction::Add));
+        let front = app.current();
+        assert_ne!(front, back);
+        assert!(app.document().is_empty());
+        // The same triangle again: it would overlap on one layer, not on two.
+        edit(&mut app, 0.0);
+        assert_eq!(app.document().triangle_ids().len(), 1);
+        edit(&mut app, 0.0);
+        assert_eq!(app.document().triangle_ids().len(), 1);
+
+        // Drawn around the current layer, back to front.
+        let (below, above) = app.layers.around(front);
+        assert_eq!((below.len(), above.len()), (1, 0));
+
+        // Back to the first layer; its drawing is untouched.
+        let _ = app.update(Message::Layers(LayerAction::Press(back)));
+        let _ = app.update(Message::Layers(LayerAction::Drop));
+        assert_eq!(app.current(), back);
+        assert_eq!(app.document().triangle_ids().len(), 1);
+
+        // Undo goes back over the edit on the front layer, then its adding.
+        let _ = app.update(Message::Undo);
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.layers.layers().len(), 1);
+        assert_eq!(app.current(), back);
+        assert!(app.is_unsaved());
+    }
+
+    #[test]
+    fn dragging_a_layer_moves_it() {
+        let mut app = Tessera::default();
+        let back = app.current();
+        let _ = app.update(Message::Layers(LayerAction::Add));
+        let front = app.current();
+        let names = |app: &Tessera| {
+            app.layers
+                .rows()
+                .iter()
+                .map(|row| row.name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&app), ["Layer 2", "Layer 1"]);
+
+        // Onto itself: nothing; then onto the lower half of the other.
+        let _ = app.update(Message::Layers(LayerAction::Press(front)));
+        let _ = app.update(Message::Layers(LayerAction::Hover(front, 0.9)));
+        assert_eq!(app.dragging, Some((front, None)));
+        let _ = app.update(Message::Layers(LayerAction::Hover(back, 0.9)));
+        let _ = app.update(Message::Layers(LayerAction::Drop));
+        assert_eq!(names(&app), ["Layer 1", "Layer 2"]);
+        assert_eq!(app.dragging, None);
+
+        // Into a group; out again to the very back.
+        let _ = app.update(Message::Layers(LayerAction::Press(back)));
+        let _ = app.update(Message::Layers(LayerAction::Group));
+        let group = app.selected;
+        let _ = app.update(Message::Layers(LayerAction::Press(front)));
+        let _ = app.update(Message::Layers(LayerAction::Hover(group, 0.5)));
+        let _ = app.update(Message::Layers(LayerAction::Drop));
+        let depths: Vec<_> = app.layers.rows().iter().map(|row| row.depth).collect();
+        assert_eq!(depths, [0, 1, 1]);
+        let _ = app.update(Message::Layers(LayerAction::Press(front)));
+        let _ = app.update(Message::Layers(LayerAction::HoverEnd));
+        let _ = app.update(Message::Layers(LayerAction::Drop));
+        let depths: Vec<_> = app.layers.rows().iter().map(|row| row.depth).collect();
+        assert_eq!(depths, [0, 1, 0]);
+
+        // Letting go outside the list: nothing.
+        let _ = app.update(Message::Layers(LayerAction::Press(front)));
+        let _ = app.update(Message::Layers(LayerAction::Hover(group, 0.1)));
+        let _ = app.update(Message::Layers(LayerAction::Leave));
+        let _ = app.update(Message::Layers(LayerAction::Drop));
+        assert_eq!(app.layers.rows().last().unwrap().id, front);
+
+        // Each move is an undo step.
+        let _ = app.update(Message::Undo);
+        let depths: Vec<_> = app.layers.rows().iter().map(|row| row.depth).collect();
+        assert_eq!(depths, [0, 1, 1]);
+    }
+
+    #[test]
+    fn painting_a_whole_layer_or_all_layers() {
+        let mut app = Tessera::default();
+        edit(&mut app, 0.0);
+        let back = app.current();
+        let _ = app.update(Message::Layers(LayerAction::Add));
+        edit(&mut app, 0.0);
+        let red = Color::from_rgb8(255, 0, 0);
+        let _ = app.update(Message::PickBrush(Brush::Color(red)));
+        let painted = |app: &Tessera| {
+            app.layers
+                .layers()
+                .iter()
+                .map(|layer| layer.document.colors().all(|c| c == Some(red)))
+                .collect::<Vec<_>>()
+        };
+
+        let _ = app.update(Message::PaintEverything(false));
+        assert_eq!(painted(&app), [true, false]);
+        let _ = app.update(Message::Undo);
+        assert_eq!(painted(&app), [false, false]);
+
+        let _ = app.update(Message::PaintEverything(true));
+        assert_eq!(painted(&app), [true, true]);
+        assert_eq!(app.recent, vec![red]);
+        // Edges too, the current layer only.
+        let _ = app.update(Message::SetTarget(Target::Edges));
+        let _ = app.update(Message::PaintEverything(false));
+        let styled = |id| app.layers.layer(id).unwrap().document.edge_styles().count();
+        assert_eq!((styled(app.current()), styled(back)), (3, 0));
+    }
+
+    #[test]
+    fn deleting_a_group_with_every_layer_in_it() {
+        let mut app = Tessera::default();
+        edit(&mut app, 0.0);
+        let _ = app.update(Message::Layers(LayerAction::Add));
+        edit(&mut app, 0.0);
+        // Both in one group, then that group in another.
+        let _ = app.update(Message::Layers(LayerAction::Group));
+        let inner = app.selected;
+        let back = app.layers.layers()[1].id;
+        let _ = app.update(Message::Layers(LayerAction::Press(back)));
+        let _ = app.update(Message::Layers(LayerAction::Hover(inner, 0.5)));
+        let _ = app.update(Message::Layers(LayerAction::Drop));
+        let _ = app.update(Message::Layers(LayerAction::Press(inner)));
+        let _ = app.update(Message::Layers(LayerAction::Drop));
+        assert_eq!(app.layers.nodes().len(), 1);
+
+        let _ = app.update(Message::Layers(LayerAction::Remove));
+        assert_eq!(app.layers.layers().len(), 1);
+        assert!(app.document().is_empty());
+        assert_eq!(app.current(), app.layers.first_layer());
+        assert_eq!(app.selected, app.current());
+
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.layers.layers().len(), 2);
+        assert!(app.layers.contains(inner));
+    }
+
+    #[test]
+    fn the_pipette_picks_up_a_brush() {
+        let mut app = Tessera::default();
+        let _ = app.update(Message::TogglePicking);
+        assert_eq!(app.mode, Mode::Paint);
+        assert!(app.picking);
+
+        let red = Color::from_rgb8(255, 0, 0);
+        let pick = |app: &mut Tessera, picked| {
+            let _ = app.update(Message::Editor(editor::Message::Pick(picked)));
+        };
+        pick(&mut app, editor::Picked::Face(Some(red)));
+        assert!(!app.picking);
+        assert_eq!(app.brush, Brush::Color(red));
+
+        pick(
+            &mut app,
+            editor::Picked::Edge(Some(document::EdgeStyle {
+                color: red,
+                width: 4.5,
+            })),
+        );
+        assert_eq!(app.edge_width, 4.5);
+        // Unpainted: the eraser, to paint it back like that.
+        pick(&mut app, editor::Picked::Edge(None));
+        assert_eq!(app.brush, Brush::Eraser);
+
+        let _ = app.update(Message::TogglePicking);
+        let _ = app.update(Message::SetMode(Mode::Shape));
+        assert!(!app.picking);
+    }
+
+    #[test]
+    fn renaming_is_one_undo_step() {
+        let mut app = Tessera::default();
+        let layer = app.current();
+        let _ = app.update(Message::Layers(LayerAction::Press(layer)));
+        let _ = app.update(Message::Layers(LayerAction::Drop));
+        for name in ["S", "Sk", "Sketch"] {
+            let _ = app.update(Message::Layers(LayerAction::Rename(name.into())));
+        }
+        assert_eq!(app.layers.rows()[0].name, "Sketch");
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.layers.rows()[0].name, "Layer 1");
     }
 
     #[test]
@@ -1492,21 +2244,21 @@ mod tests {
     fn undo_and_redo_step_through_edits() {
         let mut app = Tessera::default();
         edit(&mut app, 0.0);
-        let one = app.document.to_parts();
+        let one = app.document().to_parts();
         edit(&mut app, 500.0);
-        let two = app.document.to_parts();
+        let two = app.document().to_parts();
 
         let _ = app.update(Message::Undo);
-        assert_eq!(app.document.to_parts(), one);
+        assert_eq!(app.document().to_parts(), one);
         let _ = app.update(Message::Undo);
-        assert!(app.document.is_empty());
+        assert!(app.document().is_empty());
         let _ = app.update(Message::Undo); // nothing left: no change
-        assert!(app.document.is_empty());
+        assert!(app.document().is_empty());
         assert!(!app.is_unsaved(), "back where it started");
 
         let _ = app.update(Message::Redo);
         let _ = app.update(Message::Redo);
-        assert_eq!(app.document.to_parts(), two);
+        assert_eq!(app.document().to_parts(), two);
         assert!(app.is_unsaved());
 
         // A new edit after undoing drops what could be redone.
@@ -1514,7 +2266,7 @@ mod tests {
         edit(&mut app, 1000.0);
         assert!(app.redo.is_empty());
         let _ = app.update(Message::Redo);
-        assert_eq!(app.document.triangle_ids().len(), 2);
+        assert_eq!(app.document().triangle_ids().len(), 2);
     }
 
     #[test]
@@ -1534,7 +2286,7 @@ mod tests {
     fn edits_for_another_revision_are_ignored() {
         let mut app = Tessera::default();
         edit(&mut app, 0.0);
-        let stale = app.document.revision();
+        let stale = app.document().revision();
         let _ = app.update(Message::Undo);
 
         // Worked out before the undo (say, mid-drag): no longer applies.
@@ -1547,7 +2299,7 @@ mod tests {
             edits: vec![Edit::AddTriangle { corners, snap: 0.0 }],
             revision: stale,
         }));
-        assert!(app.document.is_empty());
+        assert!(app.document().is_empty());
     }
 
     #[test]
@@ -1570,7 +2322,7 @@ mod tests {
                 ],
                 snap: 0.0,
             }],
-            revision: app.document.revision(),
+            revision: app.document().revision(),
         }));
         let _ = app.update(Message::SetMode(Mode::Paint));
         let _ = app.update(Message::HexTyped("#ff0000".into()));
@@ -1582,14 +2334,14 @@ mod tests {
                 triangle: 0,
                 color: Some(red),
             }],
-            revision: app.document.revision(),
+            revision: app.document().revision(),
         }));
-        assert_eq!(app.document.color(0), Some(red));
+        assert_eq!(app.document().color(0), Some(red));
         assert_eq!(app.recent, vec![red]);
 
         let _ = app.update(Message::Undo);
-        assert_eq!(app.document.color(0), None);
-        assert_eq!(app.document.triangle_ids().len(), 1);
+        assert_eq!(app.document().color(0), None);
+        assert_eq!(app.document().triangle_ids().len(), 1);
     }
 
     fn with_background() -> Tessera {
@@ -1608,7 +2360,7 @@ mod tests {
 
         // The window, less the menu bar: 800×600 for a 4×2 image.
         let _ = app.update(Message::BackgroundFitted(iced::Size::new(
-            800.0,
+            800.0 + LAYERS_WIDTH,
             600.0 + MENU_BAR_HEIGHT,
         )));
         let background = app.background.as_ref().unwrap();
@@ -1701,12 +2453,12 @@ mod tests {
         assert!(matches!(app.confirming, Some(Replace::New)));
         let _ = app.update(Message::Confirm(Choice::Cancel));
         assert!(app.confirming.is_none());
-        assert!(!app.document.is_empty());
+        assert!(!app.document().is_empty());
 
         // "Don't save" goes on with it: a blank document and view.
         app.camera.zoom = 2.0;
         let _ = app.update(Message::Replace(Replace::New));
-        assert!(app.document.is_empty());
+        assert!(app.document().is_empty());
         assert_eq!(app.camera.zoom, 1.0);
         assert!(!app.is_unsaved());
     }
@@ -1734,13 +2486,13 @@ mod tests {
         let mut source = Tessera::default();
         edit(&mut source, 0.0);
         source.camera.zoom = 3.0;
-        let text = file::save(&source.document, source.camera, None);
+        let text = file::save(&source.layers, source.camera, None);
 
         let mut app = Tessera::default();
         let path = PathBuf::from("/tmp/drawing.tessera");
         let _ = app.update(Message::Opened(Ok(Some((path.clone(), text)))));
 
-        assert_eq!(app.document.to_parts(), source.document.to_parts());
+        assert_eq!(app.document().to_parts(), source.document().to_parts());
         assert_eq!(app.camera.zoom, 3.0);
         assert_eq!(app.path, Some(path));
         assert!(!app.is_unsaved());

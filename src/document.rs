@@ -62,7 +62,7 @@ impl Default for Document {
 }
 
 /// A revision number no document has had yet.
-fn next_revision() -> u64 {
+pub(crate) fn next_revision() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
@@ -104,6 +104,10 @@ pub enum Edit {
         b: VertexId,
         style: Option<EdgeStyle>,
     },
+    /// Paint every face this colour; `None` clears them all.
+    PaintAll { color: Option<Color> },
+    /// Paint every edge this style; `None` clears them all.
+    PaintAllEdges { style: Option<EdgeStyle> },
 }
 
 /// What [`Document::normalize`] did to make the connectivity follow the
@@ -164,7 +168,9 @@ impl Document {
 
     /// Each face's colour, in the order of [`Self::triangle_ids`].
     pub fn colors(&self) -> impl Iterator<Item = Option<Color>> + '_ {
-        self.triangles.iter().map(|&t| self.colors.get(&key(t)).copied())
+        self.triangles
+            .iter()
+            .map(|&t| self.colors.get(&key(t)).copied())
     }
 
     /// Paints the faces, in the order of [`Self::triangle_ids`] (e.g. as
@@ -185,7 +191,9 @@ impl Document {
 
     /// The painted edges (lowest end first) and their styles.
     pub fn edge_styles(&self) -> impl Iterator<Item = (VertexId, VertexId, EdgeStyle)> + '_ {
-        self.edge_styles.iter().map(|(&(a, b), &style)| (a, b, style))
+        self.edge_styles
+            .iter()
+            .map(|(&(a, b), &style)| (a, b, style))
     }
 
     /// Paints edges (e.g. as read from a file); those that aren't edges
@@ -427,6 +435,24 @@ impl Document {
                 match style {
                     Some(style) => self.edge_styles.insert(edge, style),
                     None => self.edge_styles.remove(&edge),
+                };
+                true
+            }
+            Edit::PaintAll { color } => {
+                self.colors = match color {
+                    Some(color) => self.triangles.iter().map(|&t| (key(t), color)).collect(),
+                    None => BTreeMap::new(),
+                };
+                true
+            }
+            Edit::PaintAllEdges { style } => {
+                self.edge_styles = match style {
+                    Some(style) => self
+                        .unique_edges()
+                        .into_iter()
+                        .map(|edge| (edge, style))
+                        .collect(),
+                    None => BTreeMap::new(),
                 };
                 true
             }
@@ -842,6 +868,28 @@ mod tests {
         }));
         assert_eq!(doc.color(0), None);
         assert_eq!(doc.colors().filter(|c| c.is_none()).count(), 2);
+    }
+
+    #[test]
+    fn painting_everything() {
+        let red = Color::from_rgb8(255, 0, 0);
+        let mut doc = doc_with_triangle();
+        assert!(doc.apply(Edit::InsertVertex {
+            at: Point::new(5.0, 4.0),
+        }));
+        assert!(doc.apply(Edit::PaintAll { color: Some(red) }));
+        assert!(doc.colors().all(|c| c == Some(red)));
+        let style = EdgeStyle {
+            color: red,
+            width: 2.0,
+        };
+        assert!(doc.apply(Edit::PaintAllEdges { style: Some(style) }));
+        assert_eq!(doc.edge_styles().count(), doc.unique_edges().len());
+
+        assert!(doc.apply(Edit::PaintAll { color: None }));
+        assert!(doc.apply(Edit::PaintAllEdges { style: None }));
+        assert!(doc.colors().all(|c| c.is_none()));
+        assert_eq!(doc.edge_styles().count(), 0);
     }
 
     #[test]
