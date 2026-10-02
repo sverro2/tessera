@@ -1,0 +1,134 @@
+//! What the canvas asks for: edits to the current layer, and changing the
+//! view, the brush, the clipboard, the mirror or the background as it
+//! goes.
+
+use crate::*;
+
+impl Tessera {
+    pub(crate) fn update_canvas(&mut self, message: editor::Message) -> Task<Message> {
+        match message {
+            editor::Message::Edit { edits, revision } => {
+                if revision != self.document().revision() {
+                    return Task::none();
+                }
+                self.renaming = None;
+                let before = self.layers.clone();
+                let current = self.current();
+                let layer = self.layers.layer_mut(current).expect("current layer");
+                if Arc::make_mut(&mut layer.document).apply_all(&edits) {
+                    for edit in &edits {
+                        let color = match *edit {
+                            Edit::Paint { color, .. } => color,
+                            Edit::PaintEdge { style, .. } => style.map(|style| style.color),
+                            _ => None,
+                        };
+                        if let Some(color) = color {
+                            paint::remember(&mut self.recent, color);
+                        }
+                    }
+                    self.push_undo(before);
+                }
+                Task::none()
+            }
+            editor::Message::Pan(delta) => {
+                self.camera.pan += delta;
+                self.view_changed()
+            }
+            editor::Message::Zoom { anchor, factor } => {
+                self.camera.zoom_at(anchor, factor);
+                self.view_changed()
+            }
+            editor::Message::Rotate { anchor, angle } => {
+                self.camera.rotate_at(anchor, angle);
+                self.view_changed()
+            }
+            editor::Message::TweakWidth(across) => {
+                // In proportion: fine when thin, quicker when thick.
+                self.edge_width = (self.edge_width * (across * 0.01).exp()).clamp(0.5, 12.0);
+                Task::none()
+            }
+            editor::Message::TweakReach(across) => {
+                self.reach = (self.reach * (across * 0.01).exp()).clamp(REACH.0, REACH.1);
+                Task::none()
+            }
+            editor::Message::TweakLightness(across) => {
+                // On the colour's value itself: through black and back, its
+                // hue and saturation stay.
+                if let Brush::Color(_) = self.brush {
+                    self.hsv.value = (self.hsv.value + across * 0.004).clamp(0.0, 2.0);
+                    let color = self.hsv.to_color();
+                    self.brush = Brush::Color(color);
+                    self.hex = paint::to_hex(color);
+                }
+                Task::none()
+            }
+            editor::Message::Pick(picked) => {
+                // Brushes that paint just like what was picked.
+                let color = match picked {
+                    editor::Picked::Face(color) => color,
+                    editor::Picked::Edge(style) => {
+                        if let Some(style) = style {
+                            self.edge_width = style.width;
+                        }
+                        style.map(|style| style.color)
+                    }
+                };
+                self.picking = false;
+                self.set_brush(match color {
+                    Some(color) => Brush::Color(color),
+                    None => Brush::Eraser,
+                });
+                Task::none()
+            }
+            editor::Message::Copy(piece) => {
+                let faces = piece.triangles.len();
+                self.clipboard = Some(piece);
+                let plural = if faces == 1 { "" } else { "s" };
+                self.notify(format!("Copied {faces} face{plural}"), false);
+                Task::none()
+            }
+            editor::Message::Cut {
+                piece,
+                edits,
+                revision,
+            } => {
+                if revision != self.document().revision() {
+                    return Task::none();
+                }
+                let faces = piece.triangles.len();
+                self.clipboard = Some(piece);
+                let plural = if faces == 1 { "" } else { "s" };
+                self.notify(format!("Cut {faces} face{plural}"), false);
+                self.update(Message::Editor(editor::Message::Edit { edits, revision }))
+            }
+            editor::Message::SetMirror(mirror) => {
+                let before = self.layers.clone();
+                self.layers.set_mirror(self.current(), Some(mirror));
+                self.placing_mirror = false;
+                self.push_undo(before);
+                Task::none()
+            }
+            editor::Message::MoveBackground(delta) => {
+                if let Some(background) = &mut self.background {
+                    background.center += delta;
+                    self.background_changed();
+                }
+                Task::none()
+            }
+            editor::Message::ScaleBackground { anchor, factor } => {
+                if let Some(background) = &mut self.background {
+                    background.scale_at(anchor, factor);
+                    self.background_changed();
+                }
+                Task::none()
+            }
+            editor::Message::RotateBackground { anchor, angle } => {
+                if let Some(background) = &mut self.background {
+                    background.rotate_at(anchor, angle);
+                    self.background_changed();
+                }
+                Task::none()
+            }
+        }
+    }
+}

@@ -1346,7 +1346,7 @@ mod tests {
             corners: [doc.vertex(0), doc.vertex(1), Point::new(5.0, -10.0)],
             snap: 0.0
         }));
-        assert_eq!(doc.colors().filter(|c| c.is_none()).count(), 1);
+        assert_eq!(doc.colors().filter(Option::is_none).count(), 1);
 
         // Clearing.
         assert!(doc.apply(Edit::Paint {
@@ -1354,7 +1354,7 @@ mod tests {
             color: None,
         }));
         assert_eq!(doc.color(0), None);
-        assert_eq!(doc.colors().filter(|c| c.is_none()).count(), 2);
+        assert_eq!(doc.colors().filter(Option::is_none).count(), 2);
     }
 
     #[test]
