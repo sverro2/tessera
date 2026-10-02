@@ -4,14 +4,14 @@
 use super::*;
 
 /// Reads the file at `path`; if it can't, says why (with the path).
-pub(super) async fn read_file(path: PathBuf) -> Result<(PathBuf, String), (PathBuf, String)> {
-    match std::fs::read_to_string(&path) {
-        Ok(text) => Ok((path, text)),
+pub(super) async fn read_file(path: PathBuf) -> Result<(PathBuf, Vec<u8>), (PathBuf, String)> {
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok((path, bytes)),
         Err(error) => Err((path, error.to_string())),
     }
 }
 
-pub(super) async fn open_file() -> Result<Option<(PathBuf, String)>, String> {
+pub(super) async fn open_file() -> Result<Option<(PathBuf, Vec<u8>)>, String> {
     let Some(file) = rfd::AsyncFileDialog::new()
         .add_filter("Tessera", &[file::EXTENSION])
         .pick_file()
@@ -21,16 +21,16 @@ pub(super) async fn open_file() -> Result<Option<(PathBuf, String)>, String> {
     };
 
     let path = file.path().to_path_buf();
-    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
 
-    Ok(Some((path, text)))
+    Ok(Some((path, bytes)))
 }
 
-/// Writes `text` to `path`, or to a file picked first (suggesting `name`).
+/// Writes `bytes` to `path`, or to a file picked first (suggesting `name`).
 pub(super) async fn save_file(
     path: Option<PathBuf>,
     name: String,
-    text: String,
+    bytes: Vec<u8>,
 ) -> Result<Option<PathBuf>, String> {
     let path = match path {
         Some(path) => path,
@@ -51,7 +51,7 @@ pub(super) async fn save_file(
         }
     };
 
-    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
 
     Ok(Some(path))
 }

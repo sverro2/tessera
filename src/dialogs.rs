@@ -291,3 +291,25 @@ pub(super) fn modal<'a>(
     });
     opaque(mouse_area(backdrop).on_press(on_close))
 }
+
+/// Over the window while a file is dragged over it: what dropping it does.
+pub(super) fn dropping_hint(path: &Path) -> Element<'_, Message> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let what = match update::Dropped::of(path) {
+        update::Dropped::Drawing => format!("Drop to open {name}"),
+        update::Dropped::Image => format!("Drop to put {name} behind this layer"),
+        update::Dropped::Other => format!("{name}: not a drawing or an image"),
+    };
+    center(
+        container(text(what).size(16))
+            .padding([12, 20])
+            .style(container::bordered_box),
+    )
+    .style(|_| {
+        container::Style::default().background(Color {
+            a: 0.4,
+            ..Color::BLACK
+        })
+    })
+    .into()
+}

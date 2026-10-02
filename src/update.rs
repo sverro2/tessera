@@ -13,6 +13,7 @@ mod shape;
 
 pub use background::BackgroundMessage;
 pub use export::ExportMessage;
+pub use file::Dropped;
 pub use file::FileMessage;
 pub use keys::KeysMessage;
 pub use layers::LayerAction;

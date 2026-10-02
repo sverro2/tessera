@@ -1,5 +1,6 @@
-//! Files: starting a new drawing, opening one (lately opened too), saving,
-//! and asking first when changes would be lost.
+//! Files: starting a new drawing, opening one (lately opened, or dropped
+//! on the window, too), saving, and asking first when changes would be lost.
+//! Images dropped on the window become the current layer's background.
 
 use crate::*;
 
@@ -13,12 +14,16 @@ pub enum FileMessage {
     Replace(Replace),
     Confirm(Choice),
     /// A file was picked and read: its path and text.
-    Opened(Result<Option<(PathBuf, String)>, String>),
+    Opened(Result<Option<(PathBuf, Vec<u8>)>, String>),
     /// Open a recently opened file.
     OpenRecent(PathBuf),
     /// A recent file couldn't be read (it's gone, say): why.
     RecentFailed(PathBuf, String),
     ClearRecent,
+    /// A file dragged over the window (`None`: dragged off it again).
+    Hovered(Option<PathBuf>),
+    /// A file dropped on the window.
+    Dropped(PathBuf),
     /// Saving this revision finished (to this path, unless cancelled);
     /// then this was to happen.
     Saved(Result<Option<PathBuf>, String>, Versions, Option<Replace>),
@@ -42,6 +47,25 @@ impl Tessera {
             FileMessage::OpenRecent(path) => {
                 self.menu = None;
                 self.replace(Replace::OpenPath(path))
+            }
+            FileMessage::Hovered(path) => {
+                self.dropping = path;
+                Task::none()
+            }
+            FileMessage::Dropped(path) => {
+                self.dropping = None;
+                match Dropped::of(&path) {
+                    Dropped::Drawing => self.replace(Replace::OpenPath(path)),
+                    Dropped::Image => Task::perform(
+                        async move { std::fs::read(&path).map(Some).map_err(|e| e.to_string()) },
+                        |read| Message::Background(BackgroundMessage::BackgroundPicked(read)),
+                    ),
+                    Dropped::Other => {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        self.notify(format!("Can't use {name}: not a drawing or an image"), true);
+                        Task::none()
+                    }
+                }
             }
             FileMessage::Replace(Replace::OpenPath(path)) => {
                 Task::perform(read_file(path), |result| match result {
@@ -89,7 +113,7 @@ impl Tessera {
                 }
             }
             FileMessage::Opened(Ok(None)) => Task::none(),
-            FileMessage::Opened(Ok(Some((path, text)))) => match file::open(&text) {
+            FileMessage::Opened(Ok(Some((path, bytes)))) => match file::open(&bytes) {
                 Ok(contents) => {
                     self.saved = Some(contents.layers.signature());
                     // Its colours, to pick again.
@@ -107,6 +131,10 @@ impl Tessera {
                     self.undo.clear();
                     self.redo.clear();
                     self.camera = contents.camera;
+                    if let Some(layer) = contents.current {
+                        self.current = layer;
+                        self.selected = layer;
+                    }
                     self.backgrounds = contents.backgrounds;
                     self.editing_background = false;
                     self.background_version += 1;
@@ -164,6 +192,33 @@ impl Tessera {
                 }
                 Task::none()
             }
+        }
+    }
+}
+
+/// What a file dropped on the window is, for Tessera.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dropped {
+    /// A drawing, to open.
+    Drawing,
+    /// An image, to put behind the current layer.
+    Image,
+    Other,
+}
+
+impl Dropped {
+    /// By its name.
+    pub fn of(path: &Path) -> Self {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        if extension.as_deref() == Some(file::EXTENSION) {
+            Dropped::Drawing
+        } else if image::ImageFormat::from_path(path).is_ok() {
+            Dropped::Image
+        } else {
+            Dropped::Other
         }
     }
 }

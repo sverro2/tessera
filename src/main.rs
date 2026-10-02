@@ -36,6 +36,7 @@ use iced::{Center, Color, Element, Fill, Padding, Subscription, Task, Theme};
 
 use background::Background;
 use camera::Camera;
+use dialogs::dropping_hint;
 use disk::{open_file, pick_image, read_file, save_file, save_png, save_svg};
 use document::{Document, Edit};
 use editor::Tool;
@@ -172,6 +173,8 @@ struct Tessera {
     picking: bool,
     /// Placing a mirror on the current layer (Ctrl+M).
     placing_mirror: bool,
+    /// A file dragged over the window: what dropping it would do is shown.
+    dropping: Option<PathBuf>,
     /// What was copied (Ctrl+C), to paste on any layer (Ctrl+V).
     clipboard: Option<document::Piece>,
     /// Which keys do what (kept in the config folder).
@@ -443,6 +446,20 @@ impl Tessera {
             keyboard::listen().map(Message::Key),
             window::close_requests().map(Message::CloseRequested),
             window::resize_events().map(|(_, size)| Message::WindowResized(size)),
+            // Files dragged onto the window. (Not yet on Wayland: winit,
+            // which iced uses, doesn't report them there before 0.31.)
+            iced::event::listen_with(|event, _, _| match event {
+                iced::Event::Window(window::Event::FileHovered(path)) => {
+                    Some(Message::File(FileMessage::Hovered(Some(path))))
+                }
+                iced::Event::Window(window::Event::FilesHoveredLeft) => {
+                    Some(Message::File(FileMessage::Hovered(None)))
+                }
+                iced::Event::Window(window::Event::FileDropped(path)) => {
+                    Some(Message::File(FileMessage::Dropped(path)))
+                }
+                _ => None,
+            }),
             // Letting go of a dragged layer anywhere drops it.
             if self.dragging.is_some() {
                 iced::event::listen_with(|event, _, _| match event {
@@ -723,7 +740,7 @@ impl Tessera {
     /// Saves to where the document came from, or (if `choose`, or it never
     /// was saved) to a file picked first; then does `then`.
     fn save(&mut self, choose: bool, then: Option<Replace>) -> Task<Message> {
-        let text = file::save(&self.layers, self.camera, &self.backgrounds);
+        let text = file::save(&self.layers, self.camera, &self.backgrounds, self.current());
         let versions = self.versions();
         let path = self.path.clone().filter(|_| !choose);
         let name = match &self.path {
@@ -858,6 +875,9 @@ impl Tessera {
         }
         if self.png_open {
             screen = screen.push(self.png_dialog());
+        }
+        if let Some(path) = &self.dropping {
+            screen = screen.push(dropping_hint(path));
         }
         if self.confirming.is_some() {
             screen = screen.push(self.confirmation());
@@ -1088,7 +1108,7 @@ mod tests {
         let mut app = Tessera::new();
         edit(&mut app, 0.0);
         let _ = app.update(Message::Layers(LayerAction::Add));
-        let text = file::save(&app.layers, app.camera, &app.backgrounds);
+        let text = file::save(&app.layers, app.camera, &app.backgrounds, app.current());
         let path = PathBuf::from("/drawings/flower.tessera");
         let _ = app.update(Message::File(FileMessage::Opened(Ok(Some((
             path.clone(),
@@ -1110,6 +1130,40 @@ mod tests {
         assert_eq!(app.camera.zoom, 3.0);
         assert_eq!(app.camera.pan, iced::Vector::new(12.0, -4.0));
         assert_eq!(app.current(), app.layers.layers()[back_index].id);
+    }
+
+    #[test]
+    fn files_dropped_on_the_window_open_or_go_behind_the_layer() {
+        use update::Dropped;
+        assert_eq!(
+            Dropped::of(Path::new("/a/flower.tessera")),
+            Dropped::Drawing
+        );
+        assert_eq!(
+            Dropped::of(Path::new("/a/FLOWER.TESSERA")),
+            Dropped::Drawing
+        );
+        assert_eq!(Dropped::of(Path::new("/a/photo.JPG")), Dropped::Image);
+        assert_eq!(Dropped::of(Path::new("/a/scan.png")), Dropped::Image);
+        assert_eq!(Dropped::of(Path::new("/a/notes.txt")), Dropped::Other);
+
+        let mut app = Tessera::default();
+        // Dragged over, and off again: the hint comes and goes.
+        let path = PathBuf::from("/a/flower.tessera");
+        let _ = app.update(Message::File(FileMessage::Hovered(Some(path.clone()))));
+        assert_eq!(app.dropping, Some(path.clone()));
+        let _ = app.update(Message::File(FileMessage::Hovered(None)));
+        assert_eq!(app.dropping, None);
+
+        // A drawing dropped with changes unsaved: asked first.
+        edit(&mut app, 0.0);
+        let _ = app.update(Message::File(FileMessage::Dropped(path.clone())));
+        assert!(matches!(&app.confirming, Some(Replace::OpenPath(p)) if *p == path));
+        app.confirming = None;
+
+        // Neither: said so.
+        let _ = app.update(Message::File(FileMessage::Dropped("/a/notes.txt".into())));
+        assert!(app.notice.as_ref().is_some_and(|notice| notice.error));
     }
 
     #[test]
@@ -1217,7 +1271,7 @@ mod tests {
     #[test]
     fn recent_files() {
         let mut app = Tessera::default();
-        let text = file::save(&app.layers, app.camera, &app.backgrounds);
+        let text = file::save(&app.layers, app.camera, &app.backgrounds, app.current());
         let path = PathBuf::from("/drawings/flower.tessera");
         let _ = app.update(Message::File(FileMessage::Opened(Ok(Some((
             path.clone(),
@@ -1784,7 +1838,12 @@ mod tests {
         let mut source = Tessera::default();
         edit(&mut source, 0.0);
         source.camera.zoom = 3.0;
-        let text = file::save(&source.layers, source.camera, &source.backgrounds);
+        let text = file::save(
+            &source.layers,
+            source.camera,
+            &source.backgrounds,
+            source.current(),
+        );
 
         let mut app = Tessera::default();
         let path = PathBuf::from("/tmp/drawing.tessera");

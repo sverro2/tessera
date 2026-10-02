@@ -1,31 +1,30 @@
-//! The `.tessera` file format: the layers and the view, as JSON.
+//! The `.tessera` file format: a zip of the drawing, as JSON, and the
+//! background images it uses.
 //!
-//! Every file says which `version` of the format it is. Opening reads that
-//! first and upgrades older versions step by step to the current one, so
-//! files keep opening as the format grows. Additions with a sensible default
-//! (e.g. face colour, edge width) can go in as optional fields
-//! (`#[serde(default)]`) without a new version: older files simply lack
-//! them, and unknown fields are ignored. A new version is only needed when
-//! existing fields change meaning; then add a `V3`, make it what `save`
-//! writes, and turn a `V2` into a `V3` in `open`.
+//! - `drawing.json`: the layers (in groups), the view, and the paint used.
+//!   Colours and edge styles are kept once, in tables, and referred to by
+//!   their place in them. Each layer's geometry is compact: its points as
+//!   `[x0, y0, x1, y1, …]`, its faces as `[a, b, c, colour]` (`[a, b, c]` if
+//!   erased), its painted edges as `[a, b, style]`. What's as it is by
+//!   default is left out.
+//! - `images/<hash>.<ext>`: each background image as it was picked (PNG,
+//!   JPEG, …), stored as is (it's compressed already), once however many
+//!   layers use it; named by its contents.
 //!
-//! - Version 1: one drawing.
-//! - Version 2: layers (in groups), each with its own drawing.
-//! - Version 3: as version 2; but what isn't painted is erased (neither shown
-//!   nor exported), where until then it was drawn plainly. Opening an older
-//!   file paints that with the defaults, to look as it did. And each layer
-//!   has a background image of its own (placed one of the file's `images`,
-//!   each kept once however many layers use it); older files had one for
-//!   all, which every layer gets.
+//! The JSON says which `version` of the format it is. Additions with a
+//! sensible default can go in as optional fields (`#[serde(default)]`)
+//! without a new version: older files simply lack them, and fields not
+//! known are ignored. A new version is only needed when existing fields
+//! change meaning; then opening upgrades older versions to it.
 
 use std::collections::HashMap;
+use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
 
 use iced::{Point, Vector};
 use serde::{Deserialize, Serialize};
-
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::background::Background;
 use crate::camera::Camera;
@@ -40,7 +39,10 @@ pub const EXTENSION: &str = "tessera";
 const FORMAT: &str = "tessera";
 
 /// The version `save` writes.
-const VERSION: u32 = 3;
+const VERSION: u32 = 1;
+
+/// The drawing, in the zip.
+const DRAWING: &str = "drawing.json";
 
 /// What a file holds.
 pub struct Contents {
@@ -48,147 +50,24 @@ pub struct Contents {
     pub camera: Camera,
     /// The layers' background images, by layer.
     pub backgrounds: HashMap<NodeId, Background>,
+    /// The layer worked on when it was saved (if it's still there).
+    pub current: Option<NodeId>,
 }
 
-/// Just enough to tell which version a file is.
-#[derive(Deserialize)]
-struct Header {
-    format: String,
-    version: u32,
-}
-
-/// Version 1: one drawing and the view.
-#[derive(Deserialize)]
-struct V1 {
-    view: View,
-    #[serde(flatten)]
-    drawing: DrawingV1,
-    /// Added after the first release; files without one have none.
-    #[serde(default)]
-    background: Option<BackgroundV1>,
-}
-
-/// Version 2: layers and the view.
+/// `drawing.json`.
 #[derive(Serialize, Deserialize)]
-struct V2 {
+struct Drawing {
     format: String,
     version: u32,
     view: View,
+    /// The faces' colours (`#rrggbb`), each once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    colors: Vec<String>,
+    /// The painted edges' styles, each once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    edge_styles: Vec<SavedEdgeStyle>,
     /// Front first.
-    layers: Vec<NodeV2>,
-    /// The background images the layers have (see [`PlacedImage`]), each
-    /// once: image files (PNG, JPEG, …), base64 encoded.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    images: Vec<String>,
-    /// One background image for all layers, as files had it before version
-    /// 3; read, not written.
-    #[serde(default, skip_serializing)]
-    background: Option<BackgroundV1>,
-}
-
-/// A layer or a group of them.
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-enum NodeV2 {
-    Layer {
-        name: String,
-        #[serde(default = "shown")]
-        visible: bool,
-        /// Whether painted edges blend into their neighbours' colours at
-        /// their ends. Added later; files without it don't.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        crossfade_edges: bool,
-        /// How far edges fade at their ends (world units); if not given,
-        /// the default.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        crossfade_edge_width: Option<f32>,
-        /// Whether its edges are hidden when painted and exported (their
-        /// paint kept). Added later; files without it show them.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        hide_edges: bool,
-        /// The mirror its drawing is mirrored across (until applied), as
-        /// two points on it: `[ax, ay, bx, by]`. Added later.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        mirror: Option<[f32; 4]>,
-        /// Mirrors, as files had them briefly: the first is read as the
-        /// mirror; not written.
-        #[serde(default, skip_serializing)]
-        mirrors: Vec<[f32; 4]>,
-        /// Its background image (version 3).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        background: Option<PlacedImage>,
-        #[serde(flatten)]
-        drawing: DrawingV1,
-    },
-    Group {
-        name: String,
-        #[serde(default = "shown")]
-        visible: bool,
-        /// Front first.
-        children: Vec<NodeV2>,
-    },
-}
-
-/// A drawing: the triangles and how they're painted.
-#[derive(Serialize, Deserialize)]
-struct DrawingV1 {
-    vertices: Vec<[f32; 2]>,
-    /// Corners, as indices into `vertices`.
-    triangles: Vec<[usize; 3]>,
-    /// Each triangle's colour (`#rrggbb`), or `null` if unpainted; in the
-    /// order of `triangles`. Added later; files without them are unpainted.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    colors: Vec<Option<String>>,
-    /// The painted edges. Added later; files without them have none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    edges: Vec<EdgeV1>,
-}
-
-/// A painted edge.
-#[derive(Serialize, Deserialize)]
-struct EdgeV1 {
-    /// Its ends, as indices into `vertices`.
-    ends: [usize; 2],
-    /// `#rrggbb`.
-    color: String,
-    /// In world units.
-    width: f32,
-}
-
-/// A background image, embedded.
-#[derive(Serialize, Deserialize)]
-struct BackgroundV1 {
-    /// The image file (PNG, JPEG, …), base64 encoded.
-    image: String,
-    /// Where its centre is (world).
-    center: [f32; 2],
-    /// World units per image pixel.
-    scale: f32,
-    /// Clockwise, in radians.
-    rotation: f32,
-    opacity: f32,
-    #[serde(default = "shown")]
-    visible: bool,
-}
-
-/// A layer's background image: one of the file's `images`, placed.
-#[derive(Serialize, Deserialize)]
-struct PlacedImage {
-    /// Which of the file's images.
-    image: usize,
-    /// Where its centre is (world).
-    center: [f32; 2],
-    /// World units per image pixel.
-    scale: f32,
-    /// Clockwise, in radians.
-    rotation: f32,
-    opacity: f32,
-    #[serde(default = "shown")]
-    visible: bool,
-}
-
-fn shown() -> bool {
-    true
+    layers: Vec<SavedNode>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -197,220 +76,417 @@ struct View {
     zoom: f32,
     /// Clockwise, in radians.
     rotation: f32,
+    /// The layer worked on: which, front first (as listed, groups open).
+    #[serde(default)]
+    layer: usize,
 }
 
-pub fn save(layers: &Layers, camera: Camera, backgrounds: &HashMap<NodeId, Background>) -> String {
-    /// `this`, its layers' background images among `images` (each once).
-    fn node<'a>(
-        this: &Node,
-        backgrounds: &'a HashMap<NodeId, Background>,
-        images: &mut Vec<&'a Background>,
-    ) -> NodeV2 {
-        match this {
-            Node::Layer(layer) => NodeV2::Layer {
-                background: backgrounds.get(&layer.id).map(|background| {
-                    let image = match images.iter().position(|i| i.same_image(background)) {
-                        Some(i) => i,
-                        None => {
-                            images.push(background);
-                            images.len() - 1
-                        }
-                    };
-                    PlacedImage {
-                        image,
-                        center: [background.center.x, background.center.y],
-                        scale: background.scale,
-                        rotation: background.rotation,
-                        opacity: background.opacity,
-                        visible: background.visible,
-                    }
-                }),
-                name: layer.name.clone(),
-                visible: layer.visible,
-                crossfade_edges: layer.crossfade.edges,
-                crossfade_edge_width: (layer.crossfade.width != Crossfade::WIDTH)
-                    .then_some(layer.crossfade.width),
-                hide_edges: !layer.show_edges,
-                mirror: layer.mirror.map(|Mirror { a, b }| [a.x, a.y, b.x, b.y]),
-                mirrors: Vec::new(),
-                drawing: save_drawing(&layer.document),
-            },
-            Node::Group(group) => NodeV2::Group {
-                name: group.name.clone(),
-                visible: group.visible,
-                children: group
-                    .children
-                    .iter()
-                    .map(|child| node(child, backgrounds, images))
-                    .collect(),
-            },
-        }
-    }
+#[derive(Serialize, Deserialize, PartialEq)]
+struct SavedEdgeStyle {
+    /// `#rrggbb`.
+    color: String,
+    /// In world units.
+    width: f32,
+}
 
-    let file = V2 {
+/// A layer or a group of them.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum SavedNode {
+    Layer(SavedLayer),
+    Group {
+        name: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        hidden: bool,
+        /// Front first.
+        children: Vec<SavedNode>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedLayer {
+    name: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    hidden: bool,
+    /// Its edges hidden when painted and exported (their paint kept).
+    #[serde(default, skip_serializing_if = "is_false")]
+    edges_hidden: bool,
+    /// How its painted edges blend into each other, if not the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    crossfade: Option<SavedCrossfade>,
+    /// The mirror it's mirrored across (until applied), as two points on
+    /// it: `[ax, ay, bx, by]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mirror: Option<[f32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    background: Option<SavedBackground>,
+    /// `[x0, y0, x1, y1, …]`.
+    #[serde(default)]
+    points: Vec<f32>,
+    /// `[a, b, c, colour]` (an index into `colors`), or `[a, b, c]` if
+    /// erased; corners are indices into the points.
+    #[serde(default)]
+    faces: Vec<Vec<usize>>,
+    /// The painted edges: `[a, b, style]` (an index into `edge_styles`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    edges: Vec<[usize; 3]>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedCrossfade {
+    edges: bool,
+    /// How far (world units) from their ends edges fade.
+    width: f32,
+}
+
+/// A layer's background image, placed.
+#[derive(Serialize, Deserialize)]
+struct SavedBackground {
+    /// The image, in the zip.
+    image: String,
+    /// Where its centre is (world).
+    center: [f32; 2],
+    /// World units per image pixel.
+    scale: f32,
+    /// Clockwise, in radians.
+    rotation: f32,
+    opacity: f32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    hidden: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+/// Everything, as a `.tessera` file; `current` the layer worked on.
+pub fn save(
+    layers: &Layers,
+    camera: Camera,
+    backgrounds: &HashMap<NodeId, Background>,
+    current: NodeId,
+) -> Vec<u8> {
+    let mut saving = Saving {
+        backgrounds,
+        colors: Vec::new(),
+        edge_styles: Vec::new(),
+        images: Vec::new(),
+    };
+    let nodes = layers
+        .nodes()
+        .iter()
+        .map(|node| saving.node(node))
+        .collect();
+    let drawing = Drawing {
         format: FORMAT.to_string(),
         version: VERSION,
         view: View {
             pan: [camera.pan.x, camera.pan.y],
             zoom: camera.zoom,
             rotation: camera.rotation,
+            layer: layers
+                .layers()
+                .iter()
+                .position(|layer| layer.id == current)
+                .unwrap_or(0),
         },
-        layers: Vec::new(),
-        images: Vec::new(),
-        background: None,
-    };
-    let mut images = Vec::new();
-    let file = V2 {
-        layers: layers
-            .nodes()
-            .iter()
-            .map(|this| node(this, backgrounds, &mut images))
-            .collect(),
-        images: images
-            .iter()
-            .map(|image| BASE64.encode(image.bytes()))
-            .collect(),
-        ..file
+        colors: saving.colors,
+        edge_styles: saving.edge_styles,
+        layers: nodes,
     };
 
-    serde_json::to_string(&file).expect("serializable")
+    // In memory: nothing to go wrong but running out of it.
+    let json = tidy(&serde_json::to_string_pretty(&drawing).expect("serializable"));
+    let packed = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    // Image files are compressed already.
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    let mut add = |name: &str, options, bytes: &[u8]| {
+        zip.start_file(name, options)
+            .map_err(std::io::Error::other)
+            .and_then(|()| zip.write_all(bytes))
+            .expect("writing to memory");
+    };
+    add(DRAWING, packed, json.as_bytes());
+    for (name, background) in &saving.images {
+        add(name, stored, background.bytes());
+    }
+    zip.finish().expect("writing to memory").into_inner()
 }
 
-fn save_drawing(document: &Document) -> DrawingV1 {
-    let (vertices, triangles) = document.to_parts();
-    let used = document.unique_vertices();
-    let index = |v| used.binary_search(&v).expect("used vertex");
-    DrawingV1 {
-        vertices: vertices.iter().map(|p| [p.x, p.y]).collect(),
-        triangles,
-        colors: if document.colors().any(|c| c.is_some()) {
-            document.colors().map(|c| c.map(paint::to_hex)).collect()
-        } else {
-            Vec::new()
-        },
-        edges: document
-            .edge_styles()
-            .map(|(a, b, style)| EdgeV1 {
-                ends: [index(a), index(b)],
-                color: paint::to_hex(style.color),
-                width: style.width,
+/// Saving: the paint and images met so far, each once.
+struct Saving<'a> {
+    backgrounds: &'a HashMap<NodeId, Background>,
+    colors: Vec<String>,
+    edge_styles: Vec<SavedEdgeStyle>,
+    /// Their names in the zip, and the images.
+    images: Vec<(String, &'a Background)>,
+}
+
+impl<'a> Saving<'a> {
+    fn node(&mut self, node: &Node) -> SavedNode {
+        match node {
+            Node::Layer(layer) => SavedNode::Layer(self.layer(layer)),
+            Node::Group(group) => SavedNode::Group {
+                name: group.name.clone(),
+                hidden: !group.visible,
+                children: group
+                    .children
+                    .iter()
+                    .map(|child| self.node(child))
+                    .collect(),
+            },
+        }
+    }
+
+    fn layer(&mut self, layer: &Layer) -> SavedLayer {
+        let document = &layer.document;
+        let (points, triangles) = document.to_parts();
+        let used = document.unique_vertices();
+        let index = |v| used.binary_search(&v).expect("used vertex");
+        let faces = triangles
+            .iter()
+            .zip(document.colors())
+            .map(|(&[a, b, c], color)| {
+                let mut face = vec![a, b, c];
+                face.extend(color.map(|color| self.color(paint::to_hex(color))));
+                face
             })
-            .collect(),
+            .collect();
+        let edges = document
+            .edge_styles()
+            .map(|(a, b, style)| {
+                let style = SavedEdgeStyle {
+                    color: paint::to_hex(style.color),
+                    width: style.width,
+                };
+                [index(a), index(b), self.edge_style(style)]
+            })
+            .collect();
+        SavedLayer {
+            name: layer.name.clone(),
+            hidden: !layer.visible,
+            edges_hidden: !layer.show_edges,
+            crossfade: (layer.crossfade != Crossfade::default()).then_some(SavedCrossfade {
+                edges: layer.crossfade.edges,
+                width: layer.crossfade.width,
+            }),
+            mirror: layer.mirror.map(|Mirror { a, b }| [a.x, a.y, b.x, b.y]),
+            background: self
+                .backgrounds
+                .get(&layer.id)
+                .map(|background| self.background(background)),
+            points: points.iter().flat_map(|p| [p.x, p.y]).collect(),
+            faces,
+            edges,
+        }
+    }
+
+    fn color(&mut self, color: String) -> usize {
+        index_of(&mut self.colors, color)
+    }
+
+    fn edge_style(&mut self, style: SavedEdgeStyle) -> usize {
+        index_of(&mut self.edge_styles, style)
+    }
+
+    fn background(&mut self, background: &'a Background) -> SavedBackground {
+        // The same image (shared, or alike) is kept once.
+        let kept = self
+            .images
+            .iter()
+            .find(|(_, image)| image.same_image(background) || image.bytes() == background.bytes());
+        let image = match kept {
+            Some((name, _)) => name.clone(),
+            None => {
+                let name = image_name(background.bytes());
+                self.images.push((name.clone(), background));
+                name
+            }
+        };
+        SavedBackground {
+            image,
+            center: [background.center.x, background.center.y],
+            scale: background.scale,
+            rotation: background.rotation,
+            opacity: background.opacity,
+            hidden: !background.visible,
+        }
     }
 }
 
-pub fn open(text: &str) -> Result<Contents, String> {
-    let header: Header =
-        serde_json::from_str(text).map_err(|_| "Not a Tessera file".to_string())?;
-    if header.format != FORMAT {
-        return Err("Not a Tessera file".to_string());
-    }
-    let damaged = |e: serde_json::Error| format!("Damaged file: {e}");
-
-    let (view, layers, images, background) = match header.version {
-        1 => {
-            let file: V1 = serde_json::from_str(text).map_err(damaged)?;
-            let layer = NodeV2::Layer {
-                name: "Layer 1".to_string(),
-                visible: true,
-                crossfade_edges: false,
-                crossfade_edge_width: None,
-                hide_edges: false,
-                mirrors: Vec::new(),
-                mirror: None,
-                background: None,
-                drawing: file.drawing,
-            };
-            (file.view, vec![layer], Vec::new(), file.background)
+/// Pretty JSON, but with each array of plain values (numbers, strings) on
+/// one line, `[1, 2, 3]`, rather than a value a line: a face a line, the
+/// points a line; readable, and short.
+fn tidy(pretty: &str) -> String {
+    let chars: Vec<char> = pretty.chars().collect();
+    // Where the string starting at `i` ends (past its closing quote).
+    let past_string = |mut i: usize| {
+        i += 1;
+        while i < chars.len() && chars[i] != '"' {
+            i += if chars[i] == '\\' { 2 } else { 1 };
         }
-        // The same but for what being unpainted means (see `upgrade`).
-        2 | 3 => {
-            let file: V2 = serde_json::from_str(text).map_err(damaged)?;
-            (file.view, file.layers, file.images, file.background)
-        }
-        version if version > VERSION => {
-            return Err(format!(
-                "Made with a newer Tessera (format version {version}); please update"
-            ));
-        }
-        version => return Err(format!("Unknown format version {version}")),
+        (i + 1).min(chars.len())
     };
-
-    /// `saved`, its layers' background images (as saved) in `placed`, in
-    /// the order of [`Layers::layers`].
-    fn node(saved: NodeV2, placed: &mut Vec<Option<PlacedImage>>) -> Result<Node, String> {
-        Ok(match saved {
-            NodeV2::Layer {
-                name,
-                visible,
-                crossfade_edges,
-                crossfade_edge_width,
-                hide_edges,
-                mirrors,
-                mirror,
-                background,
-                drawing,
-            } => Node::Layer(Layer {
-                // Made unique by `Layers::from_nodes`.
-                id: {
-                    placed.push(background);
-                    0
-                },
-                name,
-                visible,
-                crossfade: Crossfade {
-                    edges: crossfade_edges,
-                    width: fade_width(crossfade_edge_width),
-                },
-                show_edges: !hide_edges,
-                document: Arc::new(open_drawing(drawing)?),
-                mirror: mirror
-                    .or(mirrors.first().copied())
-                    .filter(|m| m.iter().all(|c| c.is_finite()))
-                    .map(|[ax, ay, bx, by]| Mirror {
-                        a: Point::new(ax, ay),
-                        b: Point::new(bx, by),
-                    })
-                    .filter(|m| m.a != m.b),
-            }),
-            NodeV2::Group {
-                name,
-                visible,
-                children,
-            } => Node::Group(Group {
-                id: 0,
-                name,
-                visible,
-                expanded: true,
-                children: children
-                    .into_iter()
-                    .map(|child| node(child, placed))
-                    .collect::<Result<_, _>>()?,
-            }),
-        })
-    }
-    let mut placed = Vec::new();
-    let nodes = layers
-        .into_iter()
-        .map(|saved| node(saved, &mut placed))
-        .collect::<Result<_, _>>()?;
-    let mut layers = Layers::from_nodes(nodes);
-    // Before version 3, what wasn't painted was drawn plainly: it's painted
-    // with the defaults now, to look as it did.
-    if header.version < 3 {
-        let ids: Vec<_> = layers.layers().iter().map(|layer| layer.id).collect();
-        for id in ids {
-            if let Some(layer) = layers.layer_mut(id) {
-                Arc::make_mut(&mut layer.document).paint_unpainted();
+    // Where the array starting at `i` ends, if nothing's nested in it.
+    let flat_end = |i: usize| {
+        let mut j = i + 1;
+        while j < chars.len() {
+            match chars[j] {
+                '"' => j = past_string(j),
+                '[' | '{' => return None,
+                ']' => return Some(j),
+                _ => j += 1,
+            }
+        }
+        None
+    };
+    let mut out = String::with_capacity(pretty.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '"' => {
+                let end = past_string(i);
+                out.extend(&chars[i..end]);
+                i = end;
+            }
+            '[' if let Some(end) = flat_end(i) => {
+                out.push('[');
+                let mut j = i + 1;
+                while j < end {
+                    match chars[j] {
+                        '"' => {
+                            let past = past_string(j);
+                            out.extend(&chars[j..past]);
+                            j = past;
+                        }
+                        ',' => {
+                            out.push_str(", ");
+                            j += 1;
+                        }
+                        c if c.is_whitespace() => j += 1,
+                        c => {
+                            out.push(c);
+                            j += 1;
+                        }
+                    }
+                }
+                out.push(']');
+                i = end + 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
             }
         }
     }
+    out
+}
+
+/// Where `item` is in `items`; put last if it isn't there yet.
+fn index_of<T: PartialEq>(items: &mut Vec<T>, item: T) -> usize {
+    match items.iter().position(|other| *other == item) {
+        Some(i) => i,
+        None => {
+            items.push(item);
+            items.len() - 1
+        }
+    }
+}
+
+/// An image file's name in the zip: by its contents (so the same image is
+/// named alike), with the extension of its format.
+fn image_name(bytes: &[u8]) -> String {
+    // FNV-1a: plenty to tell a drawing's few images apart.
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    let extension = image::guess_format(bytes)
+        .ok()
+        .and_then(|format| format.extensions_str().first().copied())
+        .unwrap_or("img");
+    format!("images/{hash:016x}.{extension}")
+}
+
+/// A `.tessera` file's contents; if it can't be read, why.
+pub fn open(bytes: &[u8]) -> Result<Contents, String> {
+    let not_ours = || "Not a Tessera file".to_string();
+    let mut zip = ZipArchive::new(Cursor::new(bytes)).map_err(|_| not_ours())?;
+    let mut json = Vec::new();
+    zip.by_name(DRAWING)
+        .map_err(|_| not_ours())?
+        .read_to_end(&mut json)
+        .map_err(|e| format!("Damaged file: {e}"))?;
+
+    /// Just enough to tell which version it is.
+    #[derive(Deserialize)]
+    struct Header {
+        format: String,
+        version: u32,
+    }
+    let header: Header = serde_json::from_slice(&json).map_err(|_| not_ours())?;
+    if header.format != FORMAT {
+        return Err(not_ours());
+    }
+    if header.version > VERSION {
+        return Err(format!(
+            "Made with a newer Tessera (format version {}); please update",
+            header.version
+        ));
+    }
+    if header.version != VERSION {
+        return Err(format!("Unknown format version {}", header.version));
+    }
+    let drawing: Drawing =
+        serde_json::from_slice(&json).map_err(|e| format!("Damaged file: {e}"))?;
+
+    let colors = drawing
+        .colors
+        .iter()
+        .map(|hex| paint::from_hex(hex).ok_or_else(|| format!("Damaged file: colour {hex:?}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let edge_styles = drawing
+        .edge_styles
+        .iter()
+        .map(|style| {
+            let color = paint::from_hex(&style.color)
+                .ok_or_else(|| format!("Damaged file: colour {:?}", style.color))?;
+            let width = if style.width.is_finite() && style.width > 0.0 {
+                style.width
+            } else {
+                crate::document::DEFAULT_EDGE.width
+            };
+            Ok(EdgeStyle { color, width })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let mut opening = Opening {
+        zip,
+        colors,
+        edge_styles,
+        images: HashMap::new(),
+        backgrounds: Vec::new(),
+    };
+    let nodes = drawing
+        .layers
+        .into_iter()
+        .map(|node| opening.node(node))
+        .collect::<Result<_, _>>()?;
+    let layers = Layers::from_nodes(nodes);
+    // Laid out as the layers are: their ids now theirs.
+    let ids: Vec<_> = layers.layers().iter().map(|layer| layer.id).collect();
+    let backgrounds = ids
+        .iter()
+        .zip(opening.backgrounds)
+        .filter_map(|(&id, background)| Some((id, background?)))
+        .collect();
 
     let View {
         pan: [x, y],
         zoom,
         rotation,
-    } = view;
+        layer,
+    } = drawing.view;
     let finite = [x, y, zoom, rotation].iter().all(|n| n.is_finite());
     let camera = if finite && zoom > 0.0 {
         Camera {
@@ -423,104 +499,143 @@ pub fn open(text: &str) -> Result<Contents, String> {
         Camera::default()
     };
 
-    // The images, each read once, for the layers placing them to share.
-    let images = images
-        .into_iter()
-        .map(open_image)
-        .collect::<Result<Vec<_>, _>>()?;
-    let ids: Vec<_> = layers.layers().iter().map(|layer| layer.id).collect();
-    let mut backgrounds: HashMap<NodeId, Background> = ids
-        .into_iter()
-        .zip(placed)
-        .filter_map(|(id, placed)| {
-            let placed = placed?;
-            let image = images.get(placed.image)?;
-            Some((id, place(image.clone(), &placed)))
-        })
-        .collect();
-    // One for all, from before version 3: every layer's.
-    if let Some(saved) = background {
-        let image = open_image(saved.image.clone())?;
-        let placed = PlacedImage {
-            image: 0,
-            center: saved.center,
-            scale: saved.scale,
-            rotation: saved.rotation,
-            opacity: saved.opacity,
-            visible: saved.visible,
-        };
-        let background = place(image, &placed);
-        for layer in layers.layers() {
-            backgrounds
-                .entry(layer.id)
-                .or_insert_with(|| background.clone());
-        }
-    }
-
     Ok(Contents {
+        current: ids.get(layer).copied(),
         layers,
         camera,
         backgrounds,
     })
 }
 
-/// A saved fade width, if it's a usable one; else the default.
-fn fade_width(saved: Option<f32>) -> f32 {
-    saved
-        .filter(|width| width.is_finite() && *width > 0.0)
-        .unwrap_or(Crossfade::WIDTH)
+/// Opening: the paint tables, and the images read so far (each once, for
+/// the layers placing it to share).
+struct Opening<'a> {
+    zip: ZipArchive<Cursor<&'a [u8]>>,
+    colors: Vec<iced::Color>,
+    edge_styles: Vec<EdgeStyle>,
+    images: HashMap<String, Background>,
+    /// Each layer's, in the order of [`Layers::layers`].
+    backgrounds: Vec<Option<Background>>,
 }
 
-fn open_drawing(drawing: DrawingV1) -> Result<Document, String> {
-    let vertices = drawing
-        .vertices
-        .iter()
-        .map(|&[x, y]| Point::new(x, y))
-        .collect();
-    let mut document = Document::from_parts(vertices, drawing.triangles)
-        .map_err(|e| format!("Damaged file: {e}"))?;
-    let colors = drawing
-        .colors
-        .iter()
-        .map(|hex| match hex {
-            Some(hex) => paint::from_hex(hex)
-                .map(Some)
-                .ok_or_else(|| format!("Damaged file: colour {hex:?}")),
-            None => Ok(None),
+impl Opening<'_> {
+    fn node(&mut self, saved: SavedNode) -> Result<Node, String> {
+        Ok(match saved {
+            SavedNode::Layer(layer) => Node::Layer(self.layer(layer)?),
+            SavedNode::Group {
+                name,
+                hidden,
+                children,
+            } => Node::Group(Group {
+                // Made unique by `Layers::from_nodes`.
+                id: 0,
+                name,
+                visible: !hidden,
+                expanded: true,
+                children: children
+                    .into_iter()
+                    .map(|child| self.node(child))
+                    .collect::<Result<_, _>>()?,
+            }),
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    document.set_colors(colors);
-    let edges = drawing
-        .edges
-        .iter()
-        .map(|edge| {
-            let color = paint::from_hex(&edge.color)
-                .ok_or_else(|| format!("Damaged file: colour {:?}", edge.color))?;
-            let [a, b] = edge.ends;
-            let valid = edge.width.is_finite() && edge.width > 0.0;
-            Ok((
-                a,
-                b,
-                EdgeStyle {
-                    color,
-                    width: if valid { edge.width } else { 1.0 },
-                },
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    document.set_edge_styles(edges);
-    Ok(document)
-}
+    }
 
-/// A background image saved (base64), unplaced.
-fn open_image(saved: String) -> Result<Background, String> {
-    let damaged = |e: String| format!("Damaged background image: {e}");
-    let bytes = BASE64.decode(saved).map_err(|e| damaged(e.to_string()))?;
-    Background::load(bytes).map_err(damaged)
+    fn layer(&mut self, saved: SavedLayer) -> Result<Layer, String> {
+        let damaged = |what: String| format!("Damaged file: {what}");
+        if !saved.points.len().is_multiple_of(2) {
+            return Err(damaged("points come in pairs".into()));
+        }
+        let points = saved
+            .points
+            .chunks(2)
+            .map(|p| Point::new(p[0], p[1]))
+            .collect();
+        let mut triangles = Vec::with_capacity(saved.faces.len());
+        let mut colors = Vec::with_capacity(saved.faces.len());
+        for face in &saved.faces {
+            let (corners, color) = match face[..] {
+                [a, b, c] => ([a, b, c], None),
+                [a, b, c, color] => {
+                    let color = self.colors.get(color).copied();
+                    let color = color.ok_or_else(|| damaged(format!("colour of {face:?}")))?;
+                    ([a, b, c], Some(color))
+                }
+                _ => return Err(damaged(format!("face {face:?}"))),
+            };
+            triangles.push(corners);
+            colors.push(color);
+        }
+        let mut document = Document::from_parts(points, triangles).map_err(damaged)?;
+        document.set_colors(colors);
+        let edges = saved
+            .edges
+            .iter()
+            .map(|&[a, b, style]| {
+                let found = self.edge_styles.get(style).copied();
+                let found = found.ok_or_else(|| damaged(format!("edge style {style}")))?;
+                Ok((a, b, found))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        document.set_edge_styles(edges);
+
+        let background = saved
+            .background
+            .map(|background| self.background(background))
+            .transpose()?;
+        self.backgrounds.push(background);
+
+        let crossfade = match saved.crossfade {
+            Some(SavedCrossfade { edges, width }) if width.is_finite() && width > 0.0 => {
+                Crossfade { edges, width }
+            }
+            Some(SavedCrossfade { edges, .. }) => Crossfade {
+                edges,
+                ..Crossfade::default()
+            },
+            None => Crossfade::default(),
+        };
+        Ok(Layer {
+            // Made unique by `Layers::from_nodes`.
+            id: 0,
+            name: saved.name,
+            visible: !saved.hidden,
+            crossfade,
+            show_edges: !saved.edges_hidden,
+            document: Arc::new(document),
+            mirror: saved
+                .mirror
+                .filter(|m| m.iter().all(|c| c.is_finite()))
+                .map(|[ax, ay, bx, by]| Mirror {
+                    a: Point::new(ax, ay),
+                    b: Point::new(bx, by),
+                })
+                .filter(|m| m.a != m.b),
+        })
+    }
+
+    /// A background image, read from the zip (once), placed as saved.
+    fn background(&mut self, saved: SavedBackground) -> Result<Background, String> {
+        let damaged = |e: String| format!("Damaged background image: {e}");
+        let image = match self.images.get(&saved.image) {
+            Some(image) => image.clone(),
+            None => {
+                let mut bytes = Vec::new();
+                self.zip
+                    .by_name(&saved.image)
+                    .map_err(|e| damaged(e.to_string()))?
+                    .read_to_end(&mut bytes)
+                    .map_err(|e| damaged(e.to_string()))?;
+                let image = Background::load(bytes).map_err(damaged)?;
+                self.images.insert(saved.image.clone(), image.clone());
+                image
+            }
+        };
+        Ok(place(image, &saved))
+    }
 }
 
 /// `background` placed as saved (where that's usable).
-fn place(mut background: Background, saved: &PlacedImage) -> Background {
+fn place(mut background: Background, saved: &SavedBackground) -> Background {
     let [x, y] = saved.center;
     if [x, y, saved.scale, saved.rotation, saved.opacity]
         .iter()
@@ -533,7 +648,7 @@ fn place(mut background: Background, saved: &PlacedImage) -> Background {
         background.rotation = saved.rotation;
         background.opacity = saved.opacity.clamp(0.0, 1.0);
     }
-    background.visible = saved.visible;
+    background.visible = !saved.hidden;
     background
 }
 
@@ -559,6 +674,11 @@ mod tests {
             triangle: 1,
             color: Some(paint::PALETTE[3]),
         });
+        // One face erased, one edge too.
+        document.apply(Edit::Paint {
+            triangle: 2,
+            color: None,
+        });
         let (a, b) = document.unique_edges()[2];
         assert!(document.apply(Edit::PaintEdge {
             a,
@@ -568,7 +688,29 @@ mod tests {
                 width: 2.5,
             }),
         }));
+        let (a, b) = document.unique_edges()[0];
+        assert!(document.apply(Edit::PaintEdge { a, b, style: None }));
         document
+    }
+
+    /// The drawing, as written.
+    fn json(file: &[u8]) -> String {
+        let mut zip = ZipArchive::new(Cursor::new(file)).unwrap();
+        let mut text = String::new();
+        zip.by_name(DRAWING)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        text
+    }
+
+    /// `text` as `drawing.json`, zipped.
+    fn zipped(text: &str) -> Vec<u8> {
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file(DRAWING, SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(text.as_bytes()).unwrap();
+        zip.finish().unwrap().into_inner()
     }
 
     #[test]
@@ -587,6 +729,11 @@ mod tests {
             },
         );
         layers.set_show_edges(first, false);
+        let mirror = Mirror {
+            a: Point::new(1.0, 2.0),
+            b: Point::new(3.0, 4.0),
+        };
+        layers.set_mirror(first, Some(mirror));
         let group = layers.group(first).unwrap();
         layers.rename(group, "Back".into());
         let camera = Camera {
@@ -596,7 +743,7 @@ mod tests {
             image: None,
         };
 
-        let opened = open(&save(&layers, camera, &HashMap::new())).unwrap();
+        let opened = open(&save(&layers, camera, &HashMap::new(), first)).unwrap();
 
         let rows = |layers: &Layers| {
             layers
@@ -606,22 +753,14 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(rows(&opened.layers), rows(&layers));
-        let crossfades = |layers: &Layers| {
+        let settings = |layers: &Layers| {
             layers
                 .layers()
                 .iter()
-                .map(|layer| layer.crossfade)
+                .map(|layer| (layer.crossfade, layer.show_edges, layer.mirror))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(crossfades(&opened.layers), crossfades(&layers));
-        let edges_shown = |layers: &Layers| {
-            layers
-                .layers()
-                .iter()
-                .map(|layer| layer.show_edges)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(edges_shown(&opened.layers), [true, false]);
+        assert_eq!(settings(&opened.layers), settings(&layers));
         let (document, saved) = (
             &opened.layers.layers()[1].document,
             &layers.layers()[1].document,
@@ -631,7 +770,7 @@ mod tests {
             document.colors().collect::<Vec<_>>(),
             saved.colors().collect::<Vec<_>>()
         );
-        assert!(document.color(1).is_some());
+        assert_eq!(document.color(2), None);
         assert_eq!(
             document.edge_styles().collect::<Vec<_>>(),
             saved.edge_styles().collect::<Vec<_>>()
@@ -639,37 +778,42 @@ mod tests {
         assert_eq!(opened.camera.pan, camera.pan);
         assert_eq!(opened.camera.zoom, camera.zoom);
         assert_eq!(opened.camera.rotation, camera.rotation);
+        // The layer worked on.
+        assert_eq!(opened.current, Some(opened.layers.layers()[1].id));
     }
 
     #[test]
-    fn keeps_a_layers_mirror() {
+    fn paint_is_kept_once_and_defaults_left_out() {
         let mut layers = Layers::default();
         let first = layers.first_layer();
-        let mirror = crate::document::Mirror {
-            a: Point::new(1.0, 2.0),
-            b: Point::new(3.0, 4.0),
-        };
-        layers.set_mirror(first, Some(mirror));
-        let text = save(&layers, Camera::default(), &HashMap::new());
-        let opened = open(&text).unwrap();
-        assert_eq!(opened.layers.layers()[0].mirror, Some(mirror));
-        // Without one, files stay as they were.
-        layers.set_mirror(first, None);
-        assert!(!save(&layers, Camera::default(), &HashMap::new()).contains("mirror"));
-    }
-
-    #[test]
-    fn erased_stays_erased() {
-        let mut document = drawing();
-        document.apply(Edit::PaintAll { color: None });
-        document.apply(Edit::PaintAllEdges { style: None });
-        let mut layers = Layers::default();
-        let first = layers.first_layer();
-        layers.layer_mut(first).unwrap().document = Arc::new(document);
-        let opened = open(&save(&layers, Camera::default(), &HashMap::new())).unwrap();
-        let document = &opened.layers.layers()[0].document;
-        assert!(document.colors().all(|color| color.is_none()));
-        assert_eq!(document.edge_styles().count(), 0);
+        layers.layer_mut(first).unwrap().document = Arc::new(drawing());
+        let text = json(&save(&layers, Camera::default(), &HashMap::new(), first));
+        let drawing: serde_json::Value = serde_json::from_str(&text).unwrap();
+        // The default colour and the one painted; the default edge style
+        // and the one painted.
+        assert_eq!(drawing["colors"].as_array().unwrap().len(), 2, "{text}");
+        assert_eq!(
+            drawing["edge_styles"].as_array().unwrap().len(),
+            2,
+            "{text}"
+        );
+        let layer = &drawing["layers"][0];
+        // An erased face: no colour.
+        let faces = layer["faces"].as_array().unwrap();
+        let erased = faces
+            .iter()
+            .filter(|face| face.as_array().unwrap().len() == 3)
+            .count();
+        assert_eq!(erased, 1, "{text}");
+        for unset in [
+            "hidden",
+            "edges_hidden",
+            "crossfade",
+            "mirror",
+            "background",
+        ] {
+            assert!(layer.get(unset).is_none(), "{unset}: {text}");
+        }
     }
 
     #[test]
@@ -685,17 +829,22 @@ mod tests {
         let mut layers = Layers::default();
         let first = layers.first_layer();
         let second = layers.add_layer(first);
-        let third = layers.add_layer(second);
+        layers.add_layer(second);
         let mut moved = background.clone();
         moved.center = Point::new(-1.0, 0.0);
         let backgrounds = HashMap::from([(first, background.clone()), (second, moved)]);
 
-        let text = save(&layers, Camera::default(), &backgrounds);
-        // The image once.
-        let image = BASE64.encode(background.bytes());
-        assert_eq!(text.matches(&image).count(), 1, "{text}");
+        let file = save(&layers, Camera::default(), &backgrounds, first);
+        // The image once, as it is.
+        let zip = ZipArchive::new(Cursor::new(&file[..])).unwrap();
+        let images: Vec<_> = zip
+            .file_names()
+            .filter(|name| name.starts_with("images/"))
+            .collect();
+        assert_eq!(images.len(), 1, "{images:?}");
+        assert!(images[0].ends_with(".png"), "{images:?}");
 
-        let opened = open(&text).unwrap();
+        let opened = open(&file).unwrap();
         let ids: Vec<_> = opened.layers.layers().iter().map(|l| l.id).collect();
         // Front first: the third, the second, the first.
         assert!(!opened.backgrounds.contains_key(&ids[0]));
@@ -708,104 +857,59 @@ mod tests {
         assert_eq!(one.rotation, -0.25);
         assert_eq!(one.opacity, 0.3);
         assert!(!one.visible);
-        let _ = third;
     }
 
     #[test]
-    fn a_background_for_all_from_before_goes_to_every_layer() {
-        let background = Background::load(crate::background::tests::pixel()).unwrap();
-        let image = BASE64.encode(background.bytes());
-        let text = format!(
-            r#"{{"format":"tessera","version":2,
-            "view":{{"pan":[0.0,0.0],"zoom":1.0,"rotation":0.0}},
-            "layers":[
-                {{"kind":"layer","name":"Front","vertices":[],"triangles":[]}},
-                {{"kind":"layer","name":"Back","vertices":[],"triangles":[]}}],
-            "background":{{"image":"{image}","center":[1.0,2.0],"scale":1.0,
-                "rotation":0.0,"opacity":0.5}}}}"#
-        );
-        let opened = open(&text).unwrap();
-        assert_eq!(opened.backgrounds.len(), 2);
-        assert!(
-            opened
-                .backgrounds
-                .values()
-                .all(|b| b.center == Point::new(1.0, 2.0))
-        );
-    }
-
-    #[test]
-    fn opens_version_1() {
-        // A version 1 file as written by the first release of the format.
-        // Keep this file text as it is: it guards that old files keep
-        // opening.
-        let text = r#"{"format":"tessera","version":1,
-            "view":{"pan":[10.0,20.0],"zoom":2.0,"rotation":0.0},
-            "vertices":[[0.0,0.0],[10.0,0.0],[5.0,10.0]],
-            "triangles":[[0,1,2]]}"#;
-
-        let opened = open(text).unwrap();
-        let layers = opened.layers.layers();
-        assert_eq!(layers.len(), 1);
-        assert_eq!(layers[0].document.triangle_ids().len(), 1);
-        assert_eq!(opened.camera.zoom, 2.0);
-    }
-
-    #[test]
-    fn opens_version_1_with_colours_and_background() {
-        let background = Background::load(crate::background::tests::pixel()).unwrap();
-        let image = BASE64.encode(background.bytes());
-        let text = format!(
-            r##"{{"format":"tessera","version":1,
-            "view":{{"pan":[0.0,0.0],"zoom":1.0,"rotation":0.0}},
-            "vertices":[[0.0,0.0],[10.0,0.0],[5.0,10.0]],
-            "triangles":[[0,1,2]],"colors":["#ff0000"],
-            "edges":[{{"ends":[0,1],"color":"#00ff00","width":2.0}}],
-            "background":{{"image":"{image}","center":[0.0,0.0],"scale":1.0,
-                "rotation":0.0,"opacity":0.5}}}}"##
-        );
-
-        let opened = open(&text).unwrap();
-        let document = &opened.layers.layers()[0].document;
-        assert_eq!(document.color(0), Some(iced::Color::from_rgb8(255, 0, 0)));
+    fn plain_arrays_go_on_one_line() {
+        let pretty = "{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": [\n    [\n      3,\n      \"x, ]\"\n    ]\n  ]\n}";
         assert_eq!(
-            document.edge_style(0, 1).map(|style| style.width),
-            Some(2.0)
+            tidy(pretty),
+            "{\n  \"a\": [1, 2],\n  \"b\": [\n    [3, \"x, ]\"]\n  ]\n}"
         );
-        // What wasn't painted was drawn plainly then: the defaults now.
+        // Still the same JSON.
+        let same: serde_json::Value = serde_json::from_str(&tidy(pretty)).unwrap();
         assert_eq!(
-            document.edge_style(1, 2),
-            Some(crate::document::DEFAULT_EDGE)
+            same,
+            serde_json::from_str::<serde_json::Value>(pretty).unwrap()
         );
-        assert!(opened.backgrounds.values().all(|b| b.opacity == 0.5));
-        assert_eq!(opened.backgrounds.len(), 1);
     }
 
     #[test]
     fn ignores_fields_it_does_not_know() {
-        let text = r#"{"format":"tessera","version":2,"style":{"fill":"red"},
+        let file = zipped(
+            r#"{"format":"tessera","version":1,"style":{"fill":"red"},
             "view":{"pan":[0.0,0.0],"zoom":1.0,"rotation":0.0},
-            "layers":[{"kind":"layer","name":"A","vertices":[],"triangles":[],"x":1}]}"#;
-        assert!(open(text).is_ok());
+            "layers":[{"kind":"layer","name":"A","x":1}]}"#,
+        );
+        assert!(open(&file).is_ok());
     }
 
     #[test]
     fn refuses_what_it_cannot_open() {
-        let error = |text: &str| open(text).err().unwrap();
+        let error = |file: &[u8]| open(file).err().unwrap();
 
-        assert_eq!(error("<svg/>"), "Not a Tessera file");
+        assert_eq!(error(b"<svg/>"), "Not a Tessera file");
         assert_eq!(
-            error(r#"{"format":"other","version":1}"#),
+            error(&zipped(r#"{"format":"other","version":1}"#)),
             "Not a Tessera file"
         );
-        assert!(error(r#"{"format":"tessera","version":99}"#).contains("newer Tessera"));
+        assert!(error(&zipped(r#"{"format":"tessera","version":99}"#)).contains("newer Tessera"));
         assert!(
-            error(
+            error(&zipped(
                 r#"{"format":"tessera","version":1,
                 "view":{"pan":[0.0,0.0],"zoom":1.0,"rotation":0.0},
-                "vertices":[[0.0,0.0]],"triangles":[[0,1,2]]}"#
-            )
+                "layers":[{"kind":"layer","name":"A","points":[0.0,0.0],"faces":[[0,1,2]]}]}"#
+            ))
             .contains("missing vertex")
+        );
+        assert!(
+            error(&zipped(
+                r#"{"format":"tessera","version":1,
+                "view":{"pan":[0.0,0.0],"zoom":1.0,"rotation":0.0},
+                "layers":[{"kind":"layer","name":"A",
+                    "points":[0,0,1,0,0,1],"faces":[[0,1,2,7]]}]}"#
+            ))
+            .contains("colour")
         );
     }
 }

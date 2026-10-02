@@ -296,17 +296,6 @@ impl Document {
             .collect();
     }
 
-    /// Paints what isn't painted with the defaults (as older files had it
-    /// drawn). Not an edit.
-    pub fn paint_unpainted(&mut self) {
-        for t in &self.triangles {
-            self.colors.entry(key(*t)).or_insert(DEFAULT_FACE);
-        }
-        for edge in self.unique_edges() {
-            self.edge_styles.entry(edge).or_insert(DEFAULT_EDGE);
-        }
-    }
-
     /// The style edge `a`–`b` is painted, if any.
     pub fn edge_style(&self, a: VertexId, b: VertexId) -> Option<EdgeStyle> {
         self.edge_styles.get(&(a.min(b), a.max(b))).copied()

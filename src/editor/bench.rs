@@ -71,7 +71,7 @@ fn bench_file() {
     let Ok(path) = std::env::var("TESSERA_BENCH") else {
         return;
     };
-    let contents = crate::file::open(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
     let layers = contents.layers.layers();
     let doc = &layers
         .iter()
