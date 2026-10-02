@@ -2814,7 +2814,7 @@ impl Editor<'_> {
             Dragged::Apex { a, b, .. } => vec![a, b],
         };
         let guides = self.guides(moving, &ends);
-        let (near, candidates) = self.line_up(&guides, world);
+        let (near, all_near, candidates) = self.line_up(&guides, world);
 
         // Moving it to `at`: what that does, if it works out, lands there
         // (not snapped on elsewhere) and keeps the shape (nothing flattened
@@ -2841,8 +2841,7 @@ impl Editor<'_> {
             .filter(|&&(_, closest)| attempt(closest).is_some())
             .map(|&(guide, _)| guide)
             .collect();
-        let near = near.into_iter().map(|(guide, _)| guide).collect();
-        Some((fine, near, found))
+        Some((fine, all_near, found))
     }
 
     /// Lining up the corner dragged out for a new triangle started at
@@ -2861,8 +2860,7 @@ impl Editor<'_> {
             guides.push(Guide::ParallelFrom { at: from, u, v });
             guides.push(Guide::Along { u, v });
         }
-        let guides = self.unique(guides);
-        let (near, candidates) = self.line_up(&guides, world);
+        let (near, all_near, candidates) = self.line_up(&guides, world);
         let attempt = |at: Point| {
             let pending = self.pending(Interaction::Creating { from, to: at })?;
             self.keeps_shape(&pending).then_some(pending)
@@ -2876,8 +2874,7 @@ impl Editor<'_> {
             .filter(|&&(_, closest)| attempt(closest).is_some())
             .map(|&(guide, _)| guide)
             .collect();
-        let near = near.into_iter().map(|(guide, _)| guide).collect();
-        (fine, near, found)
+        (fine, all_near, found)
     }
 
     /// The guides a point dragged (`moving`, if it's a vertex already),
@@ -2945,7 +2942,9 @@ impl Editor<'_> {
             guides.push(Guide::Along { u, v });
         }
 
-        self.unique(guides)
+        // Each kept, even where they run alike: each edge followed has a
+        // length of its own to line up with (see `line_up`).
+        guides
     }
 
     /// The edges on the outlines of the shapes there are, but for those
@@ -3007,10 +3006,15 @@ impl Editor<'_> {
     }
 
     /// Of `guides`, those coming up near the cursor (at `world`), nearest
-    /// first, with where on them it comes closest; and where it lines up
-    /// with them, best first: points (where two cross, or as far as an edge
-    /// is long) before lines, nearest first.
-    fn line_up(&self, guides: &[Guide], world: Point) -> (Vec<(Guide, Point)>, Vec<Point>) {
+    /// first: each line once, with where on it it comes closest; and all
+    /// of them (several may run alike); and where it lines up with them,
+    /// best first: points (where two cross, or as far as an edge is long,
+    /// for every edge followed) before lines, nearest first.
+    fn line_up(
+        &self,
+        guides: &[Guide],
+        world: Point,
+    ) -> (Vec<(Guide, Point)>, Vec<Guide>, Vec<Point>) {
         let camera = self.camera;
         let document = self.document;
         let cursor = camera.to_screen(world);
@@ -3044,6 +3048,8 @@ impl Editor<'_> {
             if distance <= GUIDE_HIT {
                 lines.push((distance, closest));
             }
+            // (Where several run alike, each edge they follow still has a
+            // length of its own.)
             // As long as the edge it follows: straight on, past its end;
             // square or parallel, either way.
             let ways: &[f32] = match guide {
@@ -3068,7 +3074,14 @@ impl Editor<'_> {
             }
         }
         near.sort_by(|x, y| x.0.total_cmp(&y.0));
-        let near: Vec<(Guide, Point)> = near.into_iter().map(|(_, g, at)| (g, at)).collect();
+        let all_near: Vec<Guide> = near.iter().map(|&(_, guide, _)| guide).collect();
+        // Each line (or circle) once, from here: to show, and to cross.
+        let unique = self.unique(all_near.clone());
+        let near: Vec<(Guide, Point)> = near
+            .into_iter()
+            .filter(|(_, guide, _)| unique.contains(guide))
+            .map(|(_, g, at)| (g, at))
+            .collect();
         for (i, &(g, _)) in near.iter().enumerate() {
             for &(h, _) in &near[i + 1..] {
                 for at in crossings(g.shape(document, camera), h.shape(document, camera)) {
@@ -3081,7 +3094,7 @@ impl Editor<'_> {
         points.sort_by(|x, y| x.0.total_cmp(&y.0));
         lines.sort_by(|x, y| x.0.total_cmp(&y.0));
         let lined = points.into_iter().chain(lines).map(|(_, l)| l).collect();
-        (near, lined)
+        (near, all_near, lined)
     }
 
     /// Whether `pending` keeps the shape: flattens or drops no triangle.
@@ -3176,9 +3189,9 @@ impl Editor<'_> {
             return;
         };
         let p = camera.to_screen(at);
-        // Marks halfway along `a`–`b`: an arrowhead pointing along it, or
-        // two ticks across.
-        let mark = |frame: &mut Frame, a: Point, b: Point, arrow: bool| {
+        // Marks halfway along `a`–`b` (moved `aside` along it, to make room
+        // for another): an arrowhead pointing along it, or two ticks across.
+        let mark = |frame: &mut Frame, a: Point, b: Point, arrow: bool, aside: f32| {
             let d = b - a;
             let length = d.x.hypot(d.y);
             if length < 1.0 {
@@ -3186,7 +3199,7 @@ impl Editor<'_> {
             }
             let (x, y) = (d.x / length, d.y / length);
             let (along, across) = (Vector::new(x, y), Vector::new(-y, x));
-            let mid = a + d * 0.5;
+            let mid = a + d * 0.5 + along * aside;
             let path = Path::new(|path| {
                 if arrow {
                     path.move_to(mid - along * 4.0 + across * 4.0);
@@ -3227,7 +3240,7 @@ impl Editor<'_> {
                     // Both edges, as long.
                     for v in [a, b] {
                         frame.stroke(&Path::line(screen(v), p), stroke(GUIDE, 2.0));
-                        mark(frame, screen(v), p, false);
+                        mark(frame, screen(v), p, false, 0.0);
                     }
                     continue;
                 }
@@ -3243,24 +3256,32 @@ impl Editor<'_> {
             let Some((u, v)) = guide.followed() else {
                 continue;
             };
-            match *guide {
-                Guide::Parallel { .. } | Guide::ParallelFrom { .. } => {
-                    // Pointing the same way.
-                    let (a, b) = (screen(u), screen(v));
-                    let ahead = p - start;
-                    let same_way = (b - a).x * ahead.x + (b - a).y * ahead.y >= 0.0;
-                    let (a, b) = if same_way { (a, b) } else { (b, a) };
-                    mark(frame, a, b, true);
-                    mark(frame, start, p, true);
-                }
-                Guide::Square { m, n } => square(frame, screen(n), screen(m), p),
-                _ => {}
-            }
             // Just as long: only if it is.
-            let new = start.distance(p);
-            if (new - screen(u).distance(screen(v))).abs() < 0.75 {
-                mark(frame, screen(u), screen(v), false);
-                mark(frame, start, p, false);
+            let equal = (start.distance(p) - screen(u).distance(screen(v))).abs() < 0.75;
+            let parallel = matches!(guide, Guide::Parallel { .. } | Guide::ParallelFrom { .. });
+            // Both: the arrowheads just before the middle, the ticks just
+            // after, side by side rather than over each other.
+            let aside = if equal && parallel { 7.0 } else { 0.0 };
+            if parallel {
+                // Pointing the same way.
+                let (a, b) = (screen(u), screen(v));
+                let ahead = p - start;
+                let same_way = (b - a).x * ahead.x + (b - a).y * ahead.y >= 0.0;
+                let (a, b) = if same_way { (a, b) } else { (b, a) };
+                mark(frame, a, b, true, -aside);
+                mark(frame, start, p, true, -aside);
+            }
+            if let Guide::Square { m, n } = *guide {
+                square(frame, screen(n), screen(m), p);
+            }
+            if equal {
+                // Along each the way it points, so ticks land past arrows.
+                let (a, b) = (screen(u), screen(v));
+                let ahead = p - start;
+                let same_way = (b - a).x * ahead.x + (b - a).y * ahead.y >= 0.0;
+                let (a, b) = if same_way { (a, b) } else { (b, a) };
+                mark(frame, a, b, false, aside);
+                mark(frame, start, p, false, aside);
             }
         }
         if lit.len() >= 2 {
@@ -4077,13 +4098,15 @@ impl Editor<'_> {
                     focus.and_then(|p| self.document.triangle_at(self.camera.to_world(p)));
                 if let Some(t) = hovered {
                     let face = faces(&[t]);
+                    // Tweaking its lightness: as it will be, unoutlined.
+                    let tweaking = state.tweaking.is_some();
                     if let Some(color) = color.filter(|_| !picking) {
-                        // Tweaking its lightness: as it will be.
-                        let tweaking = state.tweaking.is_some();
                         let alpha = if tweaking { 1.0 } else { 0.5 };
                         frame.fill(&face, Color { a: alpha, ..color });
                     }
-                    frame.stroke(&face, stroke(HOVER, 2.5));
+                    if !tweaking {
+                        frame.stroke(&face, stroke(HOVER, 2.5));
+                    }
                 }
             }
             paint::Target::Edges => {
@@ -4097,7 +4120,11 @@ impl Editor<'_> {
                     frame.stroke(&line(edge), look);
                 }
                 if let Some(edge) = focus.and_then(|p| self.edge_at(p)) {
-                    frame.stroke(&line(edge), stroke(HOVER, self.edge_width(width) + 4.0));
+                    // Tweaking its width (or lightness): as it will be, no
+                    // halo around it to make it look wider.
+                    if state.tweaking.is_none() {
+                        frame.stroke(&line(edge), stroke(HOVER, self.edge_width(width) + 4.0));
+                    }
                     if !picking {
                         frame.stroke(&line(edge), look);
                     }
@@ -5442,6 +5469,49 @@ mod tests {
                 .any(|g| matches!(g, Guide::ParallelFrom { at, .. } if *at == start)),
             "{lit:?}"
         );
+    }
+
+    #[test]
+    fn every_edge_a_guide_follows_offers_its_length() {
+        // A (100, 300), B (400, 300), C (400, 100), and D (100, 60) above A:
+        // edge A D is square to A B (300 long) and parallel to B C (200
+        // long): one line, two lengths.
+        let mut doc = Document::default();
+        triangle(&mut doc, [(100.0, 300.0), (400.0, 300.0), (400.0, 100.0)]);
+        triangle(&mut doc, [(100.0, 300.0), (400.0, 100.0), (100.0, 60.0)]);
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let shift = |m| Event::Keyboard(keyboard::Event::ModifiersChanged(m));
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(MOVE), 100.0, 60.0);
+        run(&editor, &mut state, Event::Mouse(PRESS), 100.0, 60.0);
+        run(
+            &editor,
+            &mut state,
+            shift(keyboard::Modifiers::SHIFT),
+            100.0,
+            60.0,
+        );
+        // Near as long as B C.
+        run(&editor, &mut state, Event::Mouse(MOVE), 103.0, 103.0);
+        let pending = state.pending.as_ref().unwrap();
+        assert!(
+            pending.at.distance(Point::new(100.0, 100.0)) < 1e-3,
+            "{:?}",
+            pending.at
+        );
+        let lit = editor.lit(&state, pending);
+        assert!(
+            lit.contains(&Guide::Parallel { n: 0, u: 1, v: 2 }),
+            "{lit:?}"
+        );
+        // Faint, the line's shown once.
+        let x100 = state
+            .guides
+            .iter()
+            .filter(|g| matches!(g, Guide::Square { n: 0, .. } | Guide::Parallel { n: 0, .. }))
+            .count();
+        assert!(x100 <= 1, "{:?}", state.guides);
     }
 
     #[test]
