@@ -433,10 +433,11 @@ pub struct State {
     selected_in: u64,
     /// The layer the selection is of.
     selected_layer: NodeId,
-    /// Dragging a point with Shift: the guides coming up, and where it
-    /// lined up, if it did.
+    /// Dragging a point with Shift: the guides coming up that would do,
+    /// nearest first; and all those near, done or not (what it lines up
+    /// with is told from where it lands: see [`Editor::lit`]).
     guides: Vec<Guide>,
-    lined: Option<Lined>,
+    near_guides: Vec<Guide>,
     /// The lasso being drawn (world).
     lasso: Vec<Point>,
     /// Working on the current layer through one of its mirror images (the
@@ -620,6 +621,8 @@ enum Guide {
     Corner { a: VertexId, b: VertexId },
     /// From `n`, level (or `upright`) as seen in the view.
     Level { n: VertexId, upright: bool },
+    /// Just as far from `a` as from `b`: edges to both as long.
+    Middle { a: VertexId, b: VertexId },
 }
 
 /// Where a guide runs (world).
@@ -660,6 +663,11 @@ impl Guide {
                 let (a, b) = (at(a), at(b));
                 Shape::Circle(a + (b - a) * 0.5, a.distance(b) / 2.0)
             }
+            Guide::Middle { a, b } => {
+                let (a, b) = (at(a), at(b));
+                let d = b - a;
+                Shape::Line(a + d * 0.5, Vector::new(-d.y, d.x))
+            }
         }
     }
 
@@ -668,7 +676,10 @@ impl Guide {
         match self {
             Guide::Straight { m, n } | Guide::Square { m, n } => Some((m, n)),
             Guide::Parallel { u, v, .. } => Some((u, v)),
-            Guide::Between { .. } | Guide::Corner { .. } | Guide::Level { .. } => None,
+            Guide::Between { .. }
+            | Guide::Corner { .. }
+            | Guide::Level { .. }
+            | Guide::Middle { .. } => None,
         }
     }
 
@@ -679,22 +690,17 @@ impl Guide {
             | Guide::Square { n, .. }
             | Guide::Parallel { n, .. }
             | Guide::Level { n, .. } => Some(n),
-            Guide::Between { .. } | Guide::Corner { .. } => None,
+            Guide::Between { .. } | Guide::Corner { .. } | Guide::Middle { .. } => None,
         }
     }
 }
 
-/// Where a point dragged with Shift lines up: on one guide, where two
-/// cross, or on one from an end as far as its edge is long (`equal`).
-#[derive(Debug, Clone, Copy)]
-struct Lined {
-    at: Point,
-    guides: [Option<Guide>; 2],
-    equal: bool,
-}
-
 /// Where a dragged point lined up, and what releasing there does.
-type LinedUp = (Lined, Pending);
+type LinedUp = (Point, Pending);
+
+/// The guides for a point dragged with Shift: those that would do, all
+/// those near, and where it lined up (see [`Editor::guided`]).
+type Guided = (Vec<Guide>, Vec<Guide>, Option<LinedUp>);
 
 /// What's being dragged, to line up with what's around it.
 #[derive(Debug, Clone, Copy)]
@@ -1698,7 +1704,7 @@ impl Editor<'_> {
             }
         }
 
-        if !state.guides.is_empty()
+        if !state.near_guides.is_empty()
             && matches!(
                 state.interaction,
                 Interaction::MovingVertex { .. }
@@ -1706,7 +1712,7 @@ impl Editor<'_> {
                     | Interaction::LeavingFace { .. }
             )
         {
-            self.draw_guides(&mut overlay, state, bounds);
+            self.draw_guides(&mut overlay, state, pending, bounds);
         }
         // Pasting where it doesn't fit: the piece, in red.
         if let (Interaction::Pasting { base, from, to }, None, Some(piece)) =
@@ -2250,14 +2256,14 @@ impl Editor<'_> {
         // With Shift, a dragged point lines up with what's around it.
         let shift = state.modifiers.shift();
         state.guides.clear();
-        state.lined = None;
-        let guided = |dragged: Dragged, state_guides: &mut Vec<Guide>| {
+        state.near_guides.clear();
+        let guided = |dragged: Dragged, guides: &mut Vec<Guide>, near: &mut Vec<Guide>| {
             if !shift {
                 return None;
             }
-            let (near, lined) = self.guided(dragged, world)?;
-            *state_guides = near;
-            lined
+            let found;
+            (*guides, *near, found) = self.guided(dragged, world)?;
+            found
         };
         match &mut state.interaction {
             Interaction::Creating { to, .. } => {
@@ -2265,10 +2271,13 @@ impl Editor<'_> {
                 state.pending = self.pending(state.interaction);
             }
             Interaction::MovingVertex { id, to } => {
-                if let Some((lined, pending)) = guided(Dragged::Vertex(*id), &mut state.guides) {
-                    *to = lined.at;
+                if let Some((at, pending)) = guided(
+                    Dragged::Vertex(*id),
+                    &mut state.guides,
+                    &mut state.near_guides,
+                ) {
+                    *to = at;
                     state.pending = Some(pending);
-                    state.lined = Some(lined);
                     self.deadline.set(None);
                     return;
                 }
@@ -2287,10 +2296,11 @@ impl Editor<'_> {
                     b: *b,
                     start: *start,
                 };
-                if let Some((lined, pending)) = guided(dragged, &mut state.guides) {
-                    *apex = lined.at;
+                if let Some((at, pending)) =
+                    guided(dragged, &mut state.guides, &mut state.near_guides)
+                {
+                    *apex = at;
                     state.pending = Some(pending);
-                    state.lined = Some(lined);
                     self.deadline.set(None);
                     return;
                 }
@@ -2318,10 +2328,11 @@ impl Editor<'_> {
                 match *edge {
                     Some((a, b, start)) => {
                         let dragged = Dragged::Apex { a, b, start };
-                        if let Some((lined, pending)) = guided(dragged, &mut state.guides) {
-                            *apex = lined.at;
+                        if let Some((at, pending)) =
+                            guided(dragged, &mut state.guides, &mut state.near_guides)
+                        {
+                            *apex = at;
                             state.pending = Some(pending);
-                            state.lined = Some(lined);
                         } else if let Some((p, pending)) = self.limit_extend(a, b, start, world) {
                             *apex = p;
                             state.pending = pending;
@@ -2697,10 +2708,11 @@ impl Editor<'_> {
     }
 
     /// Lining up `dragged` (the cursor at `world`) with the guides around
-    /// it: those coming up, and where it lines up (and what releasing there
-    /// does), if anywhere that works out. `None` if a vertex is in reach, to
+    /// it: those coming up that would do, nearest first; all those near;
+    /// and where it lines up (and what releasing there does), if anywhere
+    /// that works out. `None` if a vertex is in reach, to
     /// snap onto instead.
-    fn guided(&self, dragged: Dragged, world: Point) -> Option<(Vec<Guide>, Option<LinedUp>)> {
+    fn guided(&self, dragged: Dragged, world: Point) -> Option<Guided> {
         let camera = self.camera;
         let cursor = camera.to_screen(world);
         let moving = match dragged {
@@ -2747,38 +2759,28 @@ impl Editor<'_> {
                 Dragged::Apex { a, b, start } => self.extend(a, b, start, at),
             }?;
             let landed = camera.to_screen(pending.at).distance(camera.to_screen(at)) < 0.5;
-            let kept = pending.changes.squashed.is_empty()
-                && pending.result.triangle_ids().len() >= self.document.triangle_ids().len();
-            (landed && kept).then_some(pending)
+            (landed && self.keeps_shape(&pending)).then_some(pending)
         };
         let found = candidates
             .into_iter()
             .take(2 * MAX_SNAPS)
-            .find_map(|lined| Some((lined, attempt(lined.at)?)));
+            .find_map(|at| Some((at, attempt(at)?)));
 
-        // Shown: those it lines up with, and the nearest few others that
-        // would do (where they come closest).
-        let mut shown: Vec<Guide> = found
+        // Those that would do (where they come closest), nearest first.
+        let fine: Vec<Guide> = near
             .iter()
-            .flat_map(|(lined, _)| lined.guides)
-            .flatten()
+            .filter(|&&(_, closest)| attempt(closest).is_some())
+            .map(|&(guide, _)| guide)
             .collect();
-        for (guide, closest) in near {
-            if shown.len() >= GUIDES_SHOWN {
-                break;
-            }
-            if !shown.contains(&guide) && attempt(closest).is_some() {
-                shown.push(guide);
-            }
-        }
-        Some((shown, found))
+        let near = near.into_iter().map(|(guide, _)| guide).collect();
+        Some((fine, near, found))
     }
 
     /// The guides a point dragged (`moving`, if it's a vertex already),
     /// with edges to `ends`, can line up with: straight on from the edges
     /// at its ends, or square to them; at the angle of the edges at its
     /// other ends; level or upright in the view from its ends; between two
-    /// ends, or square at the point itself. Each once.
+    /// ends, as far from both, or square at the point itself. Each once.
     fn guides(&self, moving: Option<VertexId>, ends: &[VertexId]) -> Vec<Guide> {
         let document = self.document;
         let camera = self.camera;
@@ -2822,6 +2824,7 @@ impl Editor<'_> {
                     guides.push(Guide::Between { a, b });
                 }
                 guides.push(Guide::Corner { a, b });
+                guides.push(Guide::Middle { a, b });
             }
         }
 
@@ -2855,7 +2858,7 @@ impl Editor<'_> {
     /// first, with where on them it comes closest; and where it lines up
     /// with them, best first: points (where two cross, or as far as an edge
     /// is long) before lines, nearest first.
-    fn line_up(&self, guides: &[Guide], world: Point) -> (Vec<(Guide, Point)>, Vec<Lined>) {
+    fn line_up(&self, guides: &[Guide], world: Point) -> (Vec<(Guide, Point)>, Vec<Point>) {
         let camera = self.camera;
         let document = self.document;
         let cursor = camera.to_screen(world);
@@ -2887,30 +2890,23 @@ impl Editor<'_> {
             }
             near.push((distance, guide, closest));
             if distance <= GUIDE_HIT {
-                let lined = Lined {
-                    at: closest,
-                    guides: [Some(guide), None],
-                    equal: false,
-                };
-                lines.push((distance, lined));
+                lines.push((distance, closest));
             }
             // As long as the edge it follows: straight on, past its end;
             // square or parallel, either way.
             let ways: &[f32] = match guide {
                 Guide::Straight { .. } => &[1.0],
                 Guide::Square { .. } | Guide::Parallel { .. } => &[1.0, -1.0],
-                Guide::Between { .. } | Guide::Corner { .. } | Guide::Level { .. } => &[],
+                Guide::Between { .. }
+                | Guide::Corner { .. }
+                | Guide::Level { .. }
+                | Guide::Middle { .. } => &[],
             };
             if let Shape::Line(o, d) = shape {
                 for &way in ways {
                     let p = o + d * way;
                     if off(p) <= GUIDE_POINT_HIT {
-                        let lined = Lined {
-                            at: p,
-                            guides: [Some(guide), None],
-                            equal: true,
-                        };
-                        points.push((off(p), lined));
+                        points.push((off(p), p));
                     }
                 }
             }
@@ -2921,12 +2917,7 @@ impl Editor<'_> {
             for &(h, _) in &near[i + 1..] {
                 for at in crossings(g.shape(document, camera), h.shape(document, camera)) {
                     if off(at) <= GUIDE_POINT_HIT {
-                        let lined = Lined {
-                            at,
-                            guides: [Some(g), Some(h)],
-                            equal: false,
-                        };
-                        points.push((off(at), lined));
+                        points.push((off(at), at));
                     }
                 }
             }
@@ -2937,22 +2928,65 @@ impl Editor<'_> {
         (near, lined)
     }
 
-    /// The guides coming up for a point dragged with Shift, faint; the ones
-    /// it lined up with bold, with the edges they follow, marked: parallel
-    /// edges with an arrowhead each, edges as long with two ticks each, a
-    /// right angle with a square in its corner, where two cross with a
-    /// diamond.
-    fn draw_guides(&self, frame: &mut Frame, state: &State, bounds: Rectangle) {
+    /// Whether `pending` keeps the shape: flattens or drops no triangle.
+    fn keeps_shape(&self, pending: &Pending) -> bool {
+        pending.changes.squashed.is_empty()
+            && pending.result.triangle_ids().len() >= self.document.triangle_ids().len()
+    }
+
+    /// The guides near a point dragged with Shift that it lines up with
+    /// where `pending` puts it: those running through it, if that keeps the
+    /// shape (else it's lined up with nothing worth showing).
+    fn lit(&self, state: &State, pending: &Pending) -> Vec<Guide> {
+        if !self.keeps_shape(pending) {
+            return Vec::new();
+        }
+        state
+            .near_guides
+            .iter()
+            .copied()
+            .filter(|&guide| self.runs_through(guide, pending.at))
+            .collect()
+    }
+
+    /// Whether `guide` runs through `at` (world), on screen to the pixel.
+    fn runs_through(&self, guide: Guide, at: Point) -> bool {
+        let camera = self.camera;
+        let p = camera.to_screen(at);
+        let off = match guide.shape(self.document, camera) {
+            Shape::Line(o, d) => closest_on_line(p, camera.to_screen(o), camera.to_screen(o + d)).1,
+            Shape::Circle(c, r) => (camera.to_screen(c).distance(p) - r * camera.zoom).abs(),
+        };
+        off < 0.75
+    }
+
+    /// The guides for a point dragged with Shift, now at `at` (as it will
+    /// be released): those it lines up with there bold, with the edges they
+    /// follow, marked (parallel edges with an arrowhead each, edges as long
+    /// with two ticks each, a right angle with a square in its corner,
+    /// where two or more meet with a diamond); and the nearest few others
+    /// that would do, faint.
+    fn draw_guides(
+        &self,
+        frame: &mut Frame,
+        state: &State,
+        pending: Option<&Pending>,
+        bounds: Rectangle,
+    ) {
+        let at = pending.map(|pending| pending.at);
         let camera = self.camera;
         let document = self.document;
-        let at = |v| camera.to_screen(document.vertex(v));
-        let active: Vec<Guide> = state
-            .lined
-            .map(|lined| lined.guides.iter().flatten().copied().collect())
-            .unwrap_or_default();
+        let screen = |v| camera.to_screen(document.vertex(v));
+        // What it lines up with is told from where it lands, so no more and
+        // no less lights up than is so.
+        let lit = pending.map_or_else(Vec::new, |pending| self.lit(state, pending));
+        let mut shown = lit.clone();
+        let others = state.guides.iter().filter(|guide| !lit.contains(guide));
+        shown.extend(others.take(GUIDES_SHOWN.saturating_sub(lit.len())));
+
         let reach = bounds.width + bounds.height;
-        for guide in &state.guides {
-            let on = active.contains(guide);
+        for guide in &shown {
+            let on = lit.contains(guide);
             let dashed = Stroke {
                 line_dash: LineDash {
                     segments: &[6.0, 4.0],
@@ -2978,14 +3012,14 @@ impl Editor<'_> {
                 }
             }
             if let (true, Some((u, v))) = (on, guide.followed()) {
-                frame.stroke(&Path::line(at(u), at(v)), stroke(GUIDE, 3.0));
+                frame.stroke(&Path::line(screen(u), screen(v)), stroke(GUIDE, 3.0));
             }
         }
 
-        let Some(lined) = state.lined else {
+        let Some(at) = at.filter(|_| !lit.is_empty()) else {
             return;
         };
-        let p = camera.to_screen(lined.at);
+        let p = camera.to_screen(at);
         // Marks halfway along `a`–`b`: an arrowhead pointing along it, or
         // two ticks across.
         let mark = |frame: &mut Frame, a: Point, b: Point, arrow: bool| {
@@ -3025,42 +3059,55 @@ impl Editor<'_> {
             });
             frame.stroke(&path, stroke(GUIDE, 2.0));
         };
-        for guide in lined.guides.iter().flatten() {
-            if let Guide::Corner { a, b } = *guide {
-                frame.stroke(&Path::line(at(a), p), stroke(GUIDE, 2.0));
-                frame.stroke(&Path::line(at(b), p), stroke(GUIDE, 2.0));
-                square(frame, p, at(a), at(b));
-                continue;
+        for guide in &lit {
+            match *guide {
+                Guide::Corner { a, b } => {
+                    frame.stroke(&Path::line(screen(a), p), stroke(GUIDE, 2.0));
+                    frame.stroke(&Path::line(screen(b), p), stroke(GUIDE, 2.0));
+                    square(frame, p, screen(a), screen(b));
+                    continue;
+                }
+                Guide::Middle { a, b } => {
+                    // Both edges, as long.
+                    for v in [a, b] {
+                        frame.stroke(&Path::line(screen(v), p), stroke(GUIDE, 2.0));
+                        mark(frame, screen(v), p, false);
+                    }
+                    continue;
+                }
+                Guide::Between { .. } => continue,
+                _ => {}
             }
-            if let Guide::Level { n, .. } = *guide {
-                frame.stroke(&Path::line(at(n), p), stroke(GUIDE, 2.0));
-                continue;
-            }
-            // The new edge, from the end it starts at, and the one it
-            // follows; marked alike.
-            let (Some(from), Some((u, v))) = (guide.from(), guide.followed()) else {
+            let Some(from) = guide.from() else {
                 continue;
             };
-            frame.stroke(&Path::line(at(from), p), stroke(GUIDE, 2.0));
-            match guide {
+            // The new edge, from the end it starts at; marked alike with
+            // the one it follows.
+            frame.stroke(&Path::line(screen(from), p), stroke(GUIDE, 2.0));
+            let Some((u, v)) = guide.followed() else {
+                continue;
+            };
+            match *guide {
                 Guide::Parallel { .. } => {
                     // Pointing the same way.
-                    let (a, b) = (at(u), at(v));
-                    let ahead = p - at(from);
+                    let (a, b) = (screen(u), screen(v));
+                    let ahead = p - screen(from);
                     let same_way = (b - a).x * ahead.x + (b - a).y * ahead.y >= 0.0;
                     let (a, b) = if same_way { (a, b) } else { (b, a) };
                     mark(frame, a, b, true);
-                    mark(frame, at(from), p, true);
+                    mark(frame, screen(from), p, true);
                 }
-                Guide::Square { m, n } => square(frame, at(*n), at(*m), p),
+                Guide::Square { m, n } => square(frame, screen(n), screen(m), p),
                 _ => {}
             }
-            if lined.equal {
-                mark(frame, at(u), at(v), false);
-                mark(frame, at(from), p, false);
+            // Just as long: only if it is.
+            let new = screen(from).distance(p);
+            if (new - screen(u).distance(screen(v))).abs() < 0.75 {
+                mark(frame, screen(u), screen(v), false);
+                mark(frame, screen(from), p, false);
             }
         }
-        if lined.guides[1].is_some() {
+        if lit.len() >= 2 {
             let diamond = Path::new(|path| {
                 path.move_to(p + Vector::new(0.0, -7.0));
                 path.line_to(p + Vector::new(7.0, 0.0));
@@ -4950,7 +4997,10 @@ mod tests {
             run(&editor, &mut state, Event::Mouse(PRESS), 100.0, 100.0);
             run(&editor, &mut state, shift(modifiers), 100.0, 100.0);
             run(&editor, &mut state, Event::Mouse(MOVE), to.0, to.1);
-            let lined = state.lined;
+            let lit = state
+                .pending
+                .as_ref()
+                .map_or_else(Vec::new, |pending| editor.lit(&state, pending));
             let edits = run(&editor, &mut state, Event::Mouse(RELEASE), to.0, to.1);
             let [edits] = &edits[..] else {
                 panic!("{edits:?}");
@@ -4959,36 +5009,34 @@ mod tests {
                 panic!("{edits:?}");
             };
             assert_eq!(id, d);
-            (to, lined)
+            (to, lit)
         };
+        let has = |lit: &[Guide], kind: fn(&Guide) -> bool| lit.iter().any(kind);
 
         // Without Shift, where it's let go.
-        let (to, lined) = drag_d((103.0, 40.0), keyboard::Modifiers::empty());
+        let (to, lit) = drag_d((103.0, 40.0), keyboard::Modifiers::empty());
         assert_eq!(to, Point::new(103.0, 40.0));
-        assert!(lined.is_none());
+        assert!(lit.is_empty());
         // With: edge A D square to A B (and so parallel to B C).
-        let (to, lined) = drag_d((103.0, 40.0), keyboard::Modifiers::SHIFT);
+        let (to, lit) = drag_d((103.0, 40.0), keyboard::Modifiers::SHIFT);
         assert!(to.distance(Point::new(100.0, 40.0)) < 1e-3, "{to:?}");
-        assert!(matches!(
-            lined.unwrap().guides[0],
-            Some(Guide::Square { .. })
-        ));
+        assert!(has(&lit, |g| matches!(g, Guide::Square { .. })), "{lit:?}");
         // Straight on from B C, past C, as long as it: at (300, -100).
-        let (to, lined) = drag_d((303.0, -97.0), keyboard::Modifiers::SHIFT);
+        let (to, lit) = drag_d((303.0, -97.0), keyboard::Modifiers::SHIFT);
         assert!(to.distance(Point::new(300.0, -100.0)) < 1e-3, "{to:?}");
-        assert!(lined.unwrap().equal);
+        assert!(
+            has(&lit, |g| matches!(g, Guide::Straight { .. })),
+            "{lit:?}"
+        );
         // A right angle at D itself, between D A and D C: on the circle over
         // A C (centre (200, 200)).
-        let (to, lined) = drag_d((64.0, 150.0), keyboard::Modifiers::SHIFT);
+        let (to, lit) = drag_d((64.0, 150.0), keyboard::Modifiers::SHIFT);
         let centre = Point::new(200.0, 200.0);
         assert!(
             (to.distance(centre) - 200.0 * 2f32.sqrt() / 2.0).abs() < 1e-2,
             "{to:?}"
         );
-        assert!(matches!(
-            lined.unwrap().guides[0],
-            Some(Guide::Corner { .. })
-        ));
+        assert!(has(&lit, |g| matches!(g, Guide::Corner { .. })), "{lit:?}");
         let (a, c) = (Point::new(100.0, 300.0), Point::new(300.0, 100.0));
         let dot = (a - to).x * (c - to).x + (a - to).y * (c - to).y;
         assert!(dot.abs() < 1.0, "{dot}");
@@ -5030,19 +5078,49 @@ mod tests {
             s2.x - 30.0,
             s0.y + 4.0,
         );
-        let lined = state.lined.expect("lined up");
+        let pending = state.pending.as_ref().expect("lined up");
+        let (at, lit) = (pending.at, editor.lit(&state, pending));
         assert!(
-            lined.guides.iter().flatten().any(|guide| matches!(
+            lit.iter().any(|guide| matches!(
                 guide,
                 Guide::Level {
                     n: 0,
                     upright: false
                 }
             )),
-            "{lined:?}"
+            "{lit:?}"
         );
-        let on_screen = camera.to_screen(lined.at);
+        let on_screen = camera.to_screen(at);
         assert!((on_screen.y - s0.y).abs() < 1e-2, "{on_screen:?} {s0:?}");
+    }
+
+    #[test]
+    fn with_shift_a_vertex_lines_up_in_the_middle_of_its_ends() {
+        let doc = one();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let shift = |m| Event::Keyboard(keyboard::Event::ModifiersChanged(m));
+        // Corner 2 (200, 100), between 0 (100, 300) and 1 (300, 300),
+        // dragged up and a little aside: back to as far from both.
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 100.0);
+        run(&editor, &mut state, Event::Mouse(PRESS), 200.0, 100.0);
+        run(
+            &editor,
+            &mut state,
+            shift(keyboard::Modifiers::SHIFT),
+            200.0,
+            100.0,
+        );
+        run(&editor, &mut state, Event::Mouse(MOVE), 205.0, 60.0);
+        let pending = state.pending.as_ref().expect("moved");
+        assert!(
+            pending.at.distance(Point::new(200.0, 60.0)) < 1e-3,
+            "{:?}",
+            pending.at
+        );
+        let lit = editor.lit(&state, pending);
+        assert!(lit.contains(&Guide::Middle { a: 0, b: 1 }), "{lit:?}");
     }
 
     #[test]
@@ -5076,13 +5154,11 @@ mod tests {
             Shape::Circle(..) => false,
         };
         assert!(!state.guides.iter().any(on_diagonal), "{:?}", state.guides);
-        assert!(
-            !state
-                .lined
-                .is_some_and(|lined| lined.guides.iter().flatten().any(on_diagonal)),
-            "{:?}",
-            state.lined
-        );
+        let lit = state
+            .pending
+            .as_ref()
+            .map_or_else(Vec::new, |pending| editor.lit(&state, pending));
+        assert!(!lit.iter().any(on_diagonal), "{lit:?}");
     }
 
     #[test]

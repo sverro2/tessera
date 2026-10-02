@@ -1084,8 +1084,6 @@ impl Tessera {
                         return Task::done(Message::ToggleMode);
                     }
                     let message = match key.to_latin(physical_key) {
-                        Some('s') => Message::SetMode(Mode::Shape),
-                        Some('p') => Message::SetMode(Mode::Paint),
                         Some('f') if self.mode == Mode::Paint => Message::SetTarget(Target::Faces),
                         Some('e') if self.mode == Mode::Paint => Message::SetTarget(Target::Edges),
                         Some('i') => Message::TogglePicking,
@@ -1333,8 +1331,8 @@ impl Tessera {
             self.mode_switch(),
             space::horizontal(),
             text(match self.mode {
-                Mode::Shape => "Tab/P: paint · Drag corner: move (Shift: line up) · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri (or selection) · Ctrl+drag: lasso · Shift+click: (de)select vertex · Ctrl+L: select shape · Ctrl+C/X/V: copy/cut/paste · Drag/G: move selection · R: rotate · T: scale · O: proportional · Alt+move: its reach · Esc: deselect · Ctrl+M: mirror · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
-                Mode::Paint => "Tab/S: shape · F/E: faces/edges · Click or drag: paint · I/Ctrl+click: pick · Alt+move: edge width · C+move: lighter/darker · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+                Mode::Shape => "Tab: paint · Drag corner: move (Shift: line up) · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri (or selection) · Ctrl+drag: lasso · Shift+click: (de)select vertex · Ctrl+L: select shape · Ctrl+C/X/V: copy/cut/paste · Drag/G: move selection · R: rotate · T: scale · O: proportional · Alt+move: its reach · Esc: deselect · Ctrl+M: mirror · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+                Mode::Paint => "Tab: shape · F/E: faces/edges · Click or drag: paint · I/Ctrl+click: pick · Alt+move: edge width · C+move: lighter/darker · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
             })
             .size(12),
         ]
