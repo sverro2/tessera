@@ -125,6 +125,9 @@ pub enum Message {
     /// Holding C while painting, the mouse moved this far across (screen
     /// px): make the colour lighter (or, to the left, darker).
     TweakLightness(f32),
+    /// Holding Alt with a selection (proportional editing on), the mouse
+    /// moved this far across (screen px): reach further (or less far).
+    TweakReach(f32),
     Pan(Vector),
     Zoom {
         anchor: Point,
@@ -217,6 +220,7 @@ pub fn view<'a>(
     caches: &'a Caches,
     background: Option<&'a Background>,
     tool: Tool,
+    proportional: Option<f32>,
 ) -> Element<'a, Message> {
     let Scene {
         current,
@@ -241,6 +245,7 @@ pub fn view<'a>(
         caches,
         background,
         tool,
+        proportional,
         deadline: Cell::new(None),
     });
     // Apart, as images (the background) are drawn after shapes within a
@@ -292,6 +297,7 @@ struct Worker<'a> {
     camera: Camera,
     background: Option<&'a Background>,
     tool: Tool,
+    proportional: Option<f32>,
     deadline: Option<std::time::Instant>,
 }
 
@@ -311,6 +317,7 @@ impl<'a> Worker<'a> {
             caches,
             background: self.background,
             tool: self.tool,
+            proportional: self.proportional,
             deadline: Cell::new(self.deadline),
         }
     }
@@ -335,6 +342,10 @@ struct Editor<'a> {
     caches: &'a Caches,
     background: Option<&'a Background>,
     tool: Tool,
+    /// Proportional editing: within this distance (screen px, so it reaches
+    /// further zoomed out) of what's moved, vertices go along with it, the
+    /// less the further.
+    proportional: Option<f32>,
     /// When working out what a drag does should give up, so a heavy case
     /// (e.g. a fill through crowded geometry) can't make it crawl.
     deadline: Cell<Option<std::time::Instant>>,
@@ -369,6 +380,9 @@ pub struct State {
     selected_in: u64,
     /// The lasso being drawn (world).
     lasso: Vec<Point>,
+    /// The proportional editing the pending move was worked out with, and
+    /// the zoom (its reach is on screen).
+    proportional: Option<(f32, f32)>,
 }
 
 /// Adjusting the brush while painting, by holding a key and moving the
@@ -387,6 +401,8 @@ enum Tweaking {
     Width,
     /// How light the colour is (C).
     Lightness,
+    /// How far proportional editing reaches (Alt, with a selection).
+    Reach,
 }
 
 /// An in-progress drag. Positions are in world coordinates.
@@ -459,6 +475,17 @@ enum Pivot {
 }
 
 impl Interaction {
+    /// Where the cursor moving the selection (or a vertex) got to, if it's
+    /// being moved.
+    fn selection_to(self) -> Option<Point> {
+        match self {
+            Interaction::MovingSelection { to, .. }
+            | Interaction::PivotingSelection { to, .. }
+            | Interaction::MovingVertex { to, .. } => Some(to),
+            _ => None,
+        }
+    }
+
     /// Grabbing, rotating or scaling the selection: applied on a click, not
     /// a drag.
     fn is_transforming(self) -> bool {
@@ -539,6 +566,15 @@ impl canvas::Program<Message> for Editor<'_> {
                 *shape = self.highlight(shape.start);
             }
         }
+        // Proportional editing changed (reaching further, say, or zoomed):
+        // what's being moved is worked out again.
+        let proportional = self.proportional.map(|reach| (reach, self.camera.zoom));
+        if state.proportional != proportional {
+            state.proportional = proportional;
+            if let Some(to) = state.interaction.selection_to() {
+                state.aim.get_or_insert(to);
+            }
+        }
         // The selection is only the shape mode's, and only of vertices still
         // there (not welded away, say, or undone).
         if self.tool != Tool::Shape || !self.shown {
@@ -563,17 +599,42 @@ impl canvas::Program<Message> for Editor<'_> {
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
                 // Holding Alt over the canvas, painting edges, tweaks the
-                // stroke width; the edge previewed stays meanwhile.
-                let alt = modifiers.alt() && self.paints_edges();
-                state.tweaking = match state.tweaking {
-                    Some(tweak) if tweak.what == Tweaking::Width => alt.then_some(tweak),
-                    None if alt => inside.map(|at| Tweak {
-                        what: Tweaking::Width,
-                        at,
-                        last: at,
-                    }),
-                    other => other,
+                // stroke width; the edge previewed stays meanwhile. With a
+                // selection to edit proportionally, how far that reaches;
+                // what's being moved stays meanwhile.
+                let alt = if !modifiers.alt() {
+                    None
+                } else if self.paints_edges() {
+                    Some(Tweaking::Width)
+                } else if self.tool == Tool::Shape && self.proportional.is_some() {
+                    Some(Tweaking::Reach)
+                } else {
+                    None
                 };
+                let was = state.tweaking;
+                state.tweaking = match (was, alt) {
+                    (Some(tweak), _) if tweak.what == Tweaking::Lightness => Some(tweak),
+                    (Some(tweak), Some(what)) if tweak.what == what => Some(tweak),
+                    (_, Some(what)) => {
+                        let at = if what == Tweaking::Reach {
+                            screen
+                        } else {
+                            inside
+                        };
+                        at.map(|at| Tweak { what, at, last: at })
+                    }
+                    (_, None) => None,
+                };
+                // Done: what's being moved goes on from where the cursor is.
+                if was.is_some_and(|tweak| tweak.what == Tweaking::Reach)
+                    && state.tweaking.is_none()
+                    && let Some(pos) = screen
+                {
+                    rebase(&mut state.interaction, self.camera.to_world(pos));
+                }
+                if self.tool == Tool::Shape {
+                    return Some(canvas::Action::request_redraw());
+                }
                 // Holding Ctrl turns the brush into the pipette.
                 matches!(self.tool, Tool::Paint { .. }).then(canvas::Action::request_redraw)
             }
@@ -780,7 +841,9 @@ impl canvas::Program<Message> for Editor<'_> {
                     }
                     // Adjusting the brush (holding Alt or C): a click applies it
                     // to what's previewed, not what's under the mouse.
-                    mouse::Button::Left if state.tweaking.is_some() => {
+                    mouse::Button::Left
+                        if state.tweaking.is_some() && matches!(self.tool, Tool::Paint { .. }) =>
+                    {
                         let at = state.tweaking.map_or(pos, |tweak| tweak.at);
                         state.stroke.clear();
                         state.edge_stroke.clear();
@@ -843,12 +906,16 @@ impl canvas::Program<Message> for Editor<'_> {
                 let pos = screen?;
                 let world = self.camera.to_world(pos);
 
-                if let (Some(tweak), Interaction::Idle) = (&mut state.tweaking, state.interaction) {
+                if let Some(tweak) = &mut state.tweaking
+                    && (tweak.what == Tweaking::Reach
+                        || matches!(state.interaction, Interaction::Idle))
+                {
                     let across = pos.x - tweak.last.x;
                     tweak.last = pos;
                     let message = match tweak.what {
                         Tweaking::Width => Message::TweakWidth(across),
                         Tweaking::Lightness => Message::TweakLightness(across),
+                        Tweaking::Reach => Message::TweakReach(across),
                     };
                     return Some(canvas::Action::publish(message).and_capture());
                 }
@@ -1377,6 +1444,70 @@ impl Editor<'_> {
             Some(pending) => pending.result.vertex(pending.changes.kept(v)),
             None => self.document.vertex(v),
         };
+        // Editing proportionally: how far that reaches around what's moved
+        // (the selection, else the vertex dragged or hovered), and how much
+        // the vertices there go along.
+        let tweaking = state
+            .tweaking
+            .is_some_and(|tweak| tweak.what == Tweaking::Reach);
+        let subjects = match state.interaction {
+            _ if !state.selection.is_empty() => state.selection.clone(),
+            Interaction::MovingVertex { id, .. } => vec![id],
+            Interaction::Idle => {
+                let near = match state.tweaking {
+                    Some(tweak) if tweaking => Some(tweak.at),
+                    _ => cursor,
+                };
+                match near.and_then(|p| self.hit_test(p)) {
+                    Some(Hover::Vertex(v)) => vec![v],
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        };
+        if let Some(reach) = self.proportional.filter(|_| !subjects.is_empty()) {
+            let around = Path::new(|p| {
+                for &v in &subjects {
+                    p.circle(camera.to_screen(at(v)), reach);
+                }
+            });
+            frame.fill(
+                &around,
+                Color {
+                    a: if tweaking { 0.12 } else { 0.06 },
+                    ..HOVER
+                },
+            );
+            if let [v] = subjects[..] {
+                let dashed = Stroke {
+                    line_dash: LineDash {
+                        segments: &[6.0, 4.0],
+                        offset: 0,
+                    },
+                    ..stroke(Color { a: 0.5, ..HOVER }, 1.0)
+                };
+                frame.stroke(&Path::circle(camera.to_screen(at(v)), reach), dashed);
+            }
+            for (v, w) in self.weights(&subjects) {
+                if w < 1.0 {
+                    let p = camera.to_screen(at(v));
+                    frame.fill(&Path::circle(p, 3.5), Color { a: w, ..HOVER });
+                }
+            }
+            if let (true, Some(p)) = (tweaking, cursor) {
+                let label = Point::new(p.x + 14.0, p.y - 18.0);
+                for (offset, color) in [(1.0, BACKGROUND), (0.0, EDGE)] {
+                    frame.fill_text(canvas::Text {
+                        content: format!("{:.0} px", self.proportional.unwrap_or_default()),
+                        position: label + Vector::new(offset, offset),
+                        color,
+                        size: 13.0.into(),
+                        ..canvas::Text::default()
+                    });
+                }
+            }
+        }
+
         for &v in &state.selection {
             let p = camera.to_screen(at(v));
             frame.fill(&Path::circle(p, 4.5), HOVER);
@@ -1445,7 +1576,11 @@ impl Editor<'_> {
                 state.pending = self.pending(state.interaction);
             }
             Interaction::MovingVertex { id, to } => {
-                if let Some((p, pending)) = self.limit_move(*id, world) {
+                let moved = match self.proportional {
+                    Some(_) => self.move_proportionally(*id, world),
+                    None => self.limit_move(*id, world),
+                };
+                if let Some((p, pending)) = moved {
                     *to = p;
                     state.pending = Some(pending);
                 }
@@ -1487,7 +1622,7 @@ impl Editor<'_> {
             }
             Interaction::MovingSelection { from, to, .. } => {
                 let by = world - *from;
-                if let Some(pending) = self.transform(&state.selection, world, |p| p + by) {
+                if let Some(pending) = self.transform(&state.selection, world, |p, w| p + by * w) {
                     *to = world;
                     state.pending = Some(pending);
                 }
@@ -1515,9 +1650,10 @@ impl Editor<'_> {
                         (0.0, world.distance(center) / start)
                     }
                 };
-                let (sin, cos) = turn.sin_cos();
-                let transform = |p: Point| {
-                    let d = (p - center) * scale;
+                // Those proportionally edited, partly.
+                let transform = |p: Point, w: f32| {
+                    let (sin, cos) = (turn * w).sin_cos();
+                    let d = (p - center) * (1.0 + (scale - 1.0) * w);
                     center + Vector::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos)
                 };
                 if let Some(pending) = self.transform(&state.selection, world, transform) {
@@ -1725,20 +1861,72 @@ impl Editor<'_> {
             .find_map(|p| self.check(vec![Edit::MoveVertex { id, to: p }], p))
     }
 
-    /// Moving each of `selection` to where `f` takes it, all at once (the
-    /// cursor `at`). `None` if that doesn't work out: it folds something
-    /// over, say.
+    /// Moving each of `selection` (and, editing proportionally, those
+    /// around it) to where `f` takes it, all at once (the cursor `at`). `f`
+    /// is told how much to move each: 1 fully, less for those around.
+    /// `None` if that doesn't work out: it folds something over, say.
     fn transform(
         &self,
         selection: &[VertexId],
         at: Point,
-        f: impl Fn(Point) -> Point,
+        f: impl Fn(Point, f32) -> Point,
     ) -> Option<Pending> {
-        let moves = selection
-            .iter()
-            .map(|&v| (v, f(self.document.vertex(v))))
+        let moves = self
+            .weights(selection)
+            .into_iter()
+            .map(|(v, w)| (v, f(self.document.vertex(v), w)))
             .collect();
         self.check(vec![Edit::MoveVertices { moves }], at)
+    }
+
+    /// Dragging vertex `id` to `to`, editing proportionally: those around
+    /// it go along. Onto the best snap that works out (a vertex to weld
+    /// with, an edge to join), else `to` itself. `None` if nothing works
+    /// out: it would fold something over, say.
+    fn move_proportionally(&self, id: VertexId, to: Point) -> Option<(Point, Pending)> {
+        let from = self.document.vertex(id);
+        let snaps = self.snaps(
+            self.camera.to_screen(to),
+            |v| v == id,
+            |u, v| u == id || v == id,
+            &[],
+        );
+        snaps
+            .into_iter()
+            .take(MAX_SNAPS)
+            .map(|(_, p)| p)
+            .chain([to])
+            .find_map(|p| {
+                let by = p - from;
+                Some((p, self.transform(&[id], p, |q, w| q + by * w)?))
+            })
+    }
+
+    /// How much each vertex goes along with `selection`: those selected
+    /// fully (1); editing proportionally, those within reach (on screen) of
+    /// one the less the further, smoothly down to nothing.
+    fn weights(&self, selection: &[VertexId]) -> Vec<(VertexId, f32)> {
+        let mut weights: Vec<_> = selection.iter().map(|&v| (v, 1.0)).collect();
+        let Some(reach) = self.proportional.filter(|_| !selection.is_empty()) else {
+            return weights;
+        };
+        let reach = reach / self.camera.zoom;
+        let selected: Vec<Point> = selection.iter().map(|&v| self.document.vertex(v)).collect();
+        for v in self.document.unique_vertices() {
+            if selection.contains(&v) {
+                continue;
+            }
+            let p = self.document.vertex(v);
+            let near = selected
+                .iter()
+                .map(|q| p.distance(*q))
+                .fold(f32::INFINITY, f32::min);
+            if near < reach {
+                let t = 1.0 - near / reach;
+                weights.push((v, t * t * (3.0 - 2.0 * t)));
+            }
+        }
+        weights
     }
 
     /// The centre of `selection`: the average of its vertices.
@@ -1831,6 +2019,7 @@ impl Editor<'_> {
             caches: self.caches,
             background: self.background,
             tool: self.tool,
+            proportional: self.proportional,
             deadline: self.deadline.clone(),
         }
     }
@@ -2005,6 +2194,7 @@ impl Editor<'_> {
             camera: self.camera,
             background: self.background,
             tool: self.tool,
+            proportional: self.proportional,
             deadline: self.deadline.get(),
         }
     }
@@ -2421,7 +2611,7 @@ impl Editor<'_> {
                         let hsv = paint::Hsv::from_color(color, 0.0);
                         format!("{:.0}%", hsv.value * 100.0)
                     }
-                    (Tweaking::Lightness, None) => String::new(),
+                    (Tweaking::Lightness, None) | (Tweaking::Reach, _) => String::new(),
                 };
                 let label = Point::new(p.x + CURSOR_SIZE * 0.5, p.y - CURSOR_SIZE * 0.9);
                 for (offset, color) in [(1.0, BACKGROUND), (0.0, EDGE)] {
@@ -2824,6 +3014,43 @@ enum Look {
     Faded,
 }
 
+/// Moving the selection, the cursor now at `cursor` (world) after it was
+/// away (adjusting how far proportional editing reaches, say): the move
+/// goes on from there, as it was, rather than jumping to the cursor.
+fn rebase(interaction: &mut Interaction, cursor: Point) {
+    match interaction {
+        Interaction::MovingSelection { from, to, .. } => {
+            *from += cursor - *to;
+            *to = cursor;
+        }
+        Interaction::PivotingSelection {
+            pivot,
+            center,
+            from,
+            to,
+        } => {
+            let d = cursor - *center;
+            *from = match pivot {
+                Pivot::Rotate => {
+                    let angle = |p: Point| (p.y - center.y).atan2(p.x - center.x);
+                    let (sin, cos) = (angle(*from) - angle(*to)).sin_cos();
+                    *center + Vector::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos)
+                }
+                Pivot::Scale => {
+                    let scale = to.distance(*center) / from.distance(*center);
+                    if scale > 1e-6 {
+                        *center + d * (1.0 / scale)
+                    } else {
+                        *from
+                    }
+                }
+            };
+            *to = cursor;
+        }
+        _ => {}
+    }
+}
+
 /// The layers, with the overlay over them.
 fn with_overlay(mut layers: Vec<Geometry>, overlay: Frame) -> Vec<Geometry> {
     layers.push(overlay.into_geometry());
@@ -2892,6 +3119,7 @@ mod tests {
             caches,
             background: None,
             tool: Tool::Shape,
+            proportional: None,
             deadline: Cell::new(None),
         }
     }
@@ -3103,6 +3331,111 @@ mod tests {
         state.selection = vec![4];
         run(&editor, &mut state, ctrl_l(), 600.0, 500.0);
         assert_eq!(selected(&state), [3, 4, 5]);
+    }
+
+    #[test]
+    fn proportional_editing_takes_vertices_nearby_along() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let mut editor = editor(&doc, &cache);
+        editor.proportional = Some(100.0);
+        let mut state = State::default();
+        lasso_right(&editor, &mut state);
+
+        run(&editor, &mut state, key('g'), 300.0, 250.0);
+        run(&editor, &mut state, Event::Mouse(MOVE), 310.0, 270.0);
+        let edits = run(&editor, &mut state, Event::Mouse(PRESS), 310.0, 270.0);
+        let by = Vector::new(10.0, 20.0);
+        // Vertex 1 is halfway within reach of 3: half as far (smoothly, so
+        // just that); 0 and 2 are out of reach.
+        let mut expected = vec![(1, doc.vertex(1) + by * 0.5)];
+        expected.extend([3, 4, 5].map(|v| (v, doc.vertex(v) + by)));
+        assert_eq!(moves(&edits), expected);
+    }
+
+    #[test]
+    fn proportional_editing_reaches_as_far_on_screen_at_any_zoom() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let mut editor = editor(&doc, &cache);
+        editor.proportional = Some(100.0);
+        // Zoomed out to half: 100 px reach 200 world units, from vertex 3 at
+        // (250, 300) as far as vertex 0 at (100, 300).
+        editor.camera.zoom = 0.5;
+        let weights = editor.weights(&[3]);
+        let weight = |v| weights.iter().find(|&&(u, _)| u == v).map(|&(_, w)| w);
+        assert_eq!(weight(3), Some(1.0));
+        assert!(weight(0).is_some_and(|w| w > 0.0 && w < 1.0));
+        editor.camera.zoom = 1.0;
+        let weights = editor.weights(&[3]);
+        assert!(!weights.iter().any(|&(v, _)| v == 0));
+    }
+
+    #[test]
+    fn dragging_a_vertex_takes_those_nearby_along_proportionally() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let mut editor = editor(&doc, &cache);
+        editor.proportional = Some(100.0);
+
+        // Vertex 3 at (250, 300); vertex 1, 50 away, goes half as far.
+        let edits = drag(
+            &editor,
+            &[
+                (MOVE, 250.0, 300.0),
+                (PRESS, 250.0, 300.0),
+                (MOVE, 260.0, 320.0),
+                (RELEASE, 260.0, 320.0),
+            ],
+        );
+        let by = Vector::new(10.0, 20.0);
+        let moved = moves(&edits);
+        assert!(moved.contains(&(3, doc.vertex(3) + by)), "{moved:?}");
+        assert!(moved.contains(&(1, doc.vertex(1) + by * 0.5)), "{moved:?}");
+        assert!(!moved.iter().any(|&(v, _)| v == 0), "{moved:?}");
+    }
+
+    #[test]
+    fn alt_tweaks_the_reach_while_the_move_holds_still() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let mut editor = editor(&doc, &cache);
+        editor.proportional = Some(100.0);
+        let mut state = State::default();
+        let alt = |m| Event::Keyboard(keyboard::Event::ModifiersChanged(m));
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+        lasso_right(&editor, &mut state);
+
+        run(&editor, &mut state, key('g'), 300.0, 250.0);
+        run(&editor, &mut state, Event::Mouse(MOVE), 310.0, 270.0);
+        run(
+            &editor,
+            &mut state,
+            alt(keyboard::Modifiers::ALT),
+            310.0,
+            270.0,
+        );
+        let cursor = mouse::Cursor::Available(Point::new(340.0, 260.0));
+        let moved = editor
+            .update(&mut state, &Event::Mouse(MOVE), bounds, cursor)
+            .and_then(|action| action.into_inner().0);
+        assert!(
+            matches!(moved, Some(Message::TweakReach(across)) if across == 30.0),
+            "{moved:?}"
+        );
+        // Let go of Alt away from where the move was: it goes on from there.
+        run(
+            &editor,
+            &mut state,
+            alt(keyboard::Modifiers::empty()),
+            340.0,
+            260.0,
+        );
+        run(&editor, &mut state, Event::Mouse(MOVE), 345.0, 260.0);
+        let edits = run(&editor, &mut state, Event::Mouse(PRESS), 345.0, 260.0);
+        let by = Vector::new(15.0, 20.0);
+        let moved = moves(&edits);
+        assert!(moved.contains(&(3, doc.vertex(3) + by)), "{moved:?}");
     }
 
     #[test]
@@ -4230,6 +4563,7 @@ mod bench {
                     caches: &cache,
                     background: None,
                     tool: Tool::Shape,
+                    proportional: None,
                     deadline: Cell::new(None),
                 };
                 let run = |f: &dyn Fn(&Editor)| {

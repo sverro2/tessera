@@ -45,6 +45,8 @@ pub fn main() -> iced::Result {
 }
 
 /// The window's size when it opens.
+/// How far proportional editing may reach (screen px): least, most.
+const REACH: (f32, f32) = (5.0, 1000.0);
 const WINDOW_SIZE: iced::Size = iced::Size::new(1152.0, 768.0);
 /// What the canvas is for: changing the shape, or painting it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -136,6 +138,11 @@ struct Tessera {
     target: Target,
     /// How wide painted edges are (world units).
     edge_width: f32,
+    /// Proportional editing (shape mode): moving vertices takes those within
+    /// `reach` (screen px, so zoomed out it reaches further) along, the less
+    /// the further.
+    proportional: bool,
+    reach: f32,
     /// The layers before the fade width slider was dragged: the drag is one
     /// undo step.
     fading_from: Option<Layers>,
@@ -241,6 +248,10 @@ enum Message {
     /// Turns the pipette on (in the paint mode) or off.
     TogglePicking,
     EdgeWidth(f32),
+    /// Turns proportional editing on or off (O).
+    ToggleProportional,
+    /// How far proportional editing reaches (screen px).
+    Reach(f32),
     /// Whether the current layer's painted faces or edges (whichever is
     /// being painted) blend into their neighbours.
     Crossfade(bool),
@@ -612,6 +623,7 @@ impl Tessera {
             hex: paint::to_hex(color),
             hsv: Hsv::from_color(color, 0.0),
             edge_width: 2.0,
+            reach: 100.0,
             brush,
             recent_files: recent::Recent::load(),
             ..Tessera::default()
@@ -717,6 +729,10 @@ impl Tessera {
                 self.edge_width = (self.edge_width * (across * 0.01).exp()).clamp(0.5, 12.0);
                 return Task::none();
             }
+            Message::Editor(editor::Message::TweakReach(across)) => {
+                self.reach = (self.reach * (across * 0.01).exp()).clamp(REACH.0, REACH.1);
+                return Task::none();
+            }
             Message::Editor(editor::Message::TweakLightness(across)) => {
                 // On the colour's value itself: through black and back, its
                 // hue and saturation stay.
@@ -801,6 +817,14 @@ impl Tessera {
             }
             Message::EdgeWidth(width) => {
                 self.edge_width = width;
+                return Task::none();
+            }
+            Message::ToggleProportional => {
+                self.proportional = !self.proportional;
+                return Task::none();
+            }
+            Message::Reach(reach) => {
+                self.reach = reach.clamp(REACH.0, REACH.1);
                 return Task::none();
             }
             Message::WindowResized(size) => {
@@ -998,6 +1022,7 @@ impl Tessera {
                         Some('f') if self.mode == Mode::Paint => Message::SetTarget(Target::Faces),
                         Some('e') if self.mode == Mode::Paint => Message::SetTarget(Target::Edges),
                         Some('i') => Message::TogglePicking,
+                        Some('o') if self.mode == Mode::Shape => Message::ToggleProportional,
                         _ => return Task::none(),
                     };
                     return Task::done(message);
@@ -1240,7 +1265,7 @@ impl Tessera {
             self.mode_switch(),
             space::horizontal(),
             text(match self.mode {
-                Mode::Shape => "Tab/P: paint · Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Ctrl+drag: lasso · Shift+click: (de)select vertex · Ctrl+L: select shape · Drag/G: move selection · R: rotate · T: scale · Esc: deselect · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+                Mode::Shape => "Tab/P: paint · Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Ctrl+drag: lasso · Shift+click: (de)select vertex · Ctrl+L: select shape · Drag/G: move selection · R: rotate · T: scale · O: proportional · Alt+move: its reach · Esc: deselect · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
                 Mode::Paint => "Tab/S: shape · F/E: faces/edges · Click or drag: paint · I/Ctrl+click: pick · Alt+move: edge width · C+move: lighter/darker · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
             })
             .size(12),
@@ -1287,6 +1312,7 @@ impl Tessera {
                     &self.caches,
                     self.background.as_ref(),
                     self.tool(),
+                    self.proportional.then_some(self.reach),
                 )
             }
             .map(Message::Editor),
@@ -1300,6 +1326,7 @@ impl Tessera {
             .padding(10),
             self.background_panel(),
             self.paint_panel(),
+            self.shape_panel(),
         ];
 
         let mut screen = stack![column![
@@ -1357,6 +1384,54 @@ impl Tessera {
                 Message::SetMode(Mode::Paint),
             ),
         ])
+    }
+
+    /// In the shape mode: proportional editing, on or off, and how far it
+    /// reaches.
+    fn shape_panel(&self) -> Element<'_, Message> {
+        if self.mode != Mode::Shape || self.editing_background {
+            return space().into();
+        }
+        let mut body =
+            column![tooltip(
+            checkbox(self.proportional)
+                .label("Proportional (O)")
+                .size(14)
+                .text_size(13)
+                .on_toggle(|_| Message::ToggleProportional),
+            container(
+                text("Moving vertices takes those around them along, the less the further; how far is on screen, so zoomed out it reaches further")
+                    .size(12),
+            )
+            .padding([4, 8])
+            .style(container::dark),
+            tooltip::Position::Bottom,
+        )]
+            .spacing(8);
+        if self.proportional {
+            // On a log scale: a small reach is as easy to set as a large one.
+            body = body.push(
+                row![
+                    text("Reach").size(13).width(44),
+                    slider(REACH.0.ln()..=REACH.1.ln(), self.reach.ln(), |reach| {
+                        Message::Reach(reach.exp())
+                    })
+                    .step(0.01),
+                    text(format!("{:.0} px", self.reach)).size(13).width(48),
+                ]
+                .spacing(8)
+                .align_y(Center),
+            );
+            body = body.push(text("Alt+move: reach").size(11).style(text::secondary));
+        }
+        container(opaque(
+            container(body)
+                .padding(10)
+                .width(220)
+                .style(container::bordered_box),
+        ))
+        .padding(12)
+        .into()
     }
 
     /// In the paint mode: what to paint (faces or edges) and the brush to
@@ -2580,6 +2655,21 @@ mod tests {
             repeat: false,
         }));
         assert!(!app.about);
+    }
+
+    #[test]
+    fn proportional_editing_toggles_and_reaches_as_far_as_set() {
+        let mut app = Tessera::new();
+        assert!(!app.proportional);
+        let _ = app.update(Message::ToggleProportional);
+        assert!(app.proportional);
+        let start = app.reach;
+        let _ = app.update(Message::Editor(editor::Message::TweakReach(100.0)));
+        assert!((app.reach - start * 1f32.exp()).abs() < 1e-3);
+        let _ = app.update(Message::Editor(editor::Message::TweakReach(-10_000.0)));
+        assert_eq!(app.reach, REACH.0);
+        let _ = app.update(Message::Reach(1e6));
+        assert_eq!(app.reach, REACH.1);
     }
 
     #[test]
