@@ -148,6 +148,11 @@ struct Tessera {
     fading_from: Option<Layers>,
     /// Whether the next click on the canvas picks up a brush (the pipette).
     picking: bool,
+    /// Placing a mirror on the current layer (Ctrl+M).
+    placing_mirror: bool,
+    /// The current layer's mirror whose buttons are hovered: shown on the
+    /// canvas.
+    hovered_mirror: Option<usize>,
     /// The modifier keys held (Shift turns painting a layer into painting
     /// all layers).
     modifiers: keyboard::Modifiers,
@@ -250,6 +255,18 @@ enum Message {
     EdgeWidth(f32),
     /// Turns proportional editing on or off (O).
     ToggleProportional,
+    /// Starts placing a mirror on the current layer (Ctrl+M), or stops.
+    PlaceMirror(bool),
+    /// Makes the current layer's mirror images actual geometry.
+    ApplyMirrors,
+    /// Makes the images of one of the current layer's mirrors (by its
+    /// place) actual geometry, the others staying.
+    ApplyMirror(usize),
+    /// The buttons of one of the current layer's mirrors are hovered, or
+    /// none.
+    HoverMirror(Option<usize>),
+    /// Takes one of the current layer's mirrors away (by its place).
+    RemoveMirror(usize),
     /// How far proportional editing reaches (screen px).
     Reach(f32),
     /// Whether the current layer's painted faces or edges (whichever is
@@ -819,6 +836,100 @@ impl Tessera {
                 self.edge_width = width;
                 return Task::none();
             }
+            Message::PlaceMirror(placing) => {
+                self.placing_mirror = placing;
+                return Task::none();
+            }
+            Message::Editor(editor::Message::AddMirror(mirror)) => {
+                let current = self.current();
+                let before = self.layers.clone();
+                let mut mirrors = self
+                    .layers
+                    .layer(current)
+                    .expect("current layer")
+                    .mirrors
+                    .clone();
+                mirrors.push(mirror);
+                self.layers.set_mirrors(current, mirrors);
+                self.placing_mirror = false;
+                self.push_undo(before);
+                return Task::none();
+            }
+            Message::ApplyMirrors => {
+                let current = self.current();
+                let edits: Vec<_> = self
+                    .layers
+                    .layer(current)
+                    .expect("current layer")
+                    .mirrors
+                    .iter()
+                    .map(|&mirror| Edit::Mirror { mirror })
+                    .collect();
+                if edits.is_empty() {
+                    return Task::none();
+                }
+                self.hovered_mirror = None;
+                let before = self.layers.clone();
+                let layer = self.layers.layer_mut(current).expect("current layer");
+                if Arc::make_mut(&mut layer.document).apply_all(&edits) {
+                    self.layers.set_mirrors(current, Vec::new());
+                    self.push_undo(before);
+                } else {
+                    self.notify(
+                        "Can't apply the mirrors: the drawing overlaps a mirror image".into(),
+                        true,
+                    );
+                }
+                return Task::none();
+            }
+            Message::HoverMirror(hovered) => {
+                self.hovered_mirror = hovered;
+                return Task::none();
+            }
+            Message::ApplyMirror(i) => {
+                let current = self.current();
+                let mut mirrors = self
+                    .layers
+                    .layer(current)
+                    .expect("current layer")
+                    .mirrors
+                    .clone();
+                if !document::applies_alone(&mirrors, i) {
+                    return Task::none();
+                }
+                let mirror = mirrors.remove(i);
+                let before = self.layers.clone();
+                let layer = self.layers.layer_mut(current).expect("current layer");
+                if Arc::make_mut(&mut layer.document).apply(Edit::Mirror { mirror }) {
+                    self.layers.set_mirrors(current, mirrors);
+                    self.hovered_mirror = None;
+                    self.push_undo(before);
+                } else {
+                    self.notify(
+                        "Can't apply the mirror: the drawing overlaps its mirror image".into(),
+                        true,
+                    );
+                }
+                return Task::none();
+            }
+            Message::RemoveMirror(i) => {
+                self.hovered_mirror = None;
+                // Fewer images than before, so they can't come to overlap.
+                let current = self.current();
+                let mut mirrors = self
+                    .layers
+                    .layer(current)
+                    .expect("current layer")
+                    .mirrors
+                    .clone();
+                if i < mirrors.len() {
+                    let before = self.layers.clone();
+                    mirrors.remove(i);
+                    self.layers.set_mirrors(current, mirrors);
+                    self.push_undo(before);
+                }
+                return Task::none();
+            }
             Message::ToggleProportional => {
                 self.proportional = !self.proportional;
                 return Task::none();
@@ -1007,6 +1118,7 @@ impl Tessera {
                     self.about = false;
                     self.editing_background = false;
                     self.picking = false;
+                    self.placing_mirror = false;
                     return Task::none();
                 }
                 if self.confirming.is_some() || self.about {
@@ -1029,6 +1141,7 @@ impl Tessera {
                 }
                 let message = match key.to_latin(physical_key) {
                     Some('n') => Message::New,
+                    Some('m') => Message::PlaceMirror(!self.placing_mirror),
                     Some('o') => Message::Open,
                     Some('s') if modifiers.shift() => Message::SaveAs,
                     Some('s') => Message::Save,
@@ -1265,7 +1378,7 @@ impl Tessera {
             self.mode_switch(),
             space::horizontal(),
             text(match self.mode {
-                Mode::Shape => "Tab/P: paint · Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Ctrl+drag: lasso · Shift+click: (de)select vertex · Ctrl+L: select shape · Drag/G: move selection · R: rotate · T: scale · O: proportional · Alt+move: its reach · Esc: deselect · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+                Mode::Shape => "Tab/P: paint · Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Ctrl+drag: lasso · Shift+click: (de)select vertex · Ctrl+L: select shape · Drag/G: move selection · R: rotate · T: scale · O: proportional · Alt+move: its reach · Esc: deselect · Ctrl+M: mirror · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
                 Mode::Paint => "Tab/S: shape · F/E: faces/edges · Click or drag: paint · I/Ctrl+click: pick · Alt+move: edge width · C+move: lighter/darker · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
             })
             .size(12),
@@ -1313,6 +1426,7 @@ impl Tessera {
                     self.background.as_ref(),
                     self.tool(),
                     self.proportional.then_some(self.reach),
+                    self.hovered_mirror,
                 )
             }
             .map(Message::Editor),
@@ -1327,6 +1441,7 @@ impl Tessera {
             self.background_panel(),
             self.paint_panel(),
             self.shape_panel(),
+            self.mirror_bar(),
         ];
 
         let mut screen = stack![column![
@@ -1360,6 +1475,7 @@ impl Tessera {
             _ if self.editing_background => Tool::Background {
                 painted: self.mode == Mode::Paint,
             },
+            _ if self.placing_mirror => Tool::Mirror,
             Mode::Shape => Tool::Shape,
             Mode::Paint => Tool::Paint {
                 target: self.target,
@@ -1384,6 +1500,106 @@ impl Tessera {
                 Message::SetMode(Mode::Paint),
             ),
         ])
+    }
+
+    /// Over the canvas, at the top: placing a mirror, a way out; the current
+    /// layer mirrored, its mirrors (each to take away), ways to apply them or
+    /// add another.
+    fn mirror_bar(&self) -> Element<'_, Message> {
+        let small = |label| text(label).size(13);
+        let count = self
+            .layers
+            .layer(self.current())
+            .map_or(0, |layer| layer.mirrors.len());
+        let bar = if self.editing_background {
+            return space().into();
+        } else if self.placing_mirror {
+            row![
+                small(if count == 0 {
+                    "Placing a mirror"
+                } else {
+                    "Placing another mirror: it mirrors all there is so far"
+                }),
+                button(small("Cancel"))
+                    .padding([3, 10])
+                    .style(button::secondary)
+                    .on_press(Message::PlaceMirror(false)),
+            ]
+        } else if count > 0 {
+            let mirrors = &self
+                .layers
+                .layer(self.current())
+                .expect("current layer")
+                .mirrors;
+            let tip = |label: &'static str| {
+                container(text(label).size(12))
+                    .padding([4, 8])
+                    .style(container::dark)
+            };
+            let mut bar = row![small("Mirrors")];
+            for i in 0..count {
+                let alone = document::applies_alone(mirrors, i);
+                let mirror = row![
+                    text(format!("{}", i + 1)).size(13),
+                    tooltip(
+                        button(small("Apply"))
+                            .padding([3, 8])
+                            .on_press_maybe(alone.then_some(Message::ApplyMirror(i))),
+                        tip(if alone {
+                            "Make this mirror's images actual geometry"
+                        } else {
+                            "It mirrors the images of the mirrors before it too: apply those first"
+                        }),
+                        tooltip::Position::Bottom,
+                    ),
+                    tooltip(
+                        button(small("×"))
+                            .padding([3, 8])
+                            .style(button::secondary)
+                            .on_press(Message::RemoveMirror(i)),
+                        tip("Take this mirror away"),
+                        tooltip::Position::Bottom,
+                    ),
+                ]
+                .spacing(4)
+                .align_y(Center);
+                // Hovered, the canvas shows what it mirrors.
+                bar = bar.push(
+                    mouse_area(
+                        container(mirror)
+                            .padding([2, 6])
+                            .style(container::rounded_box),
+                    )
+                    .on_enter(Message::HoverMirror(Some(i)))
+                    .on_exit(Message::HoverMirror(None)),
+                );
+            }
+            bar.push(tooltip(
+                button(small("Apply all"))
+                    .padding([3, 10])
+                    .on_press(Message::ApplyMirrors),
+                tip("Make all the mirror images actual geometry"),
+                tooltip::Position::Bottom,
+            ))
+            .push(tooltip(
+                button(small("Add…"))
+                    .padding([3, 10])
+                    .style(button::secondary)
+                    .on_press(Message::PlaceMirror(true)),
+                tip("Add a mirror, mirroring all there is so far (Ctrl+M)"),
+                tooltip::Position::Bottom,
+            ))
+        } else {
+            return space().into();
+        };
+        container(opaque(
+            container(bar.spacing(8).align_y(Center))
+                .padding([6, 10])
+                .style(container::bordered_box),
+        ))
+        .center_x(Fill)
+        .padding([36, 12])
+        .into()
     }
 
     /// In the shape mode: proportional editing, on or off, and how far it
@@ -2218,6 +2434,7 @@ fn scene_layer(layer: &layers::Layer) -> editor::SceneLayer<'_> {
         document: &layer.document,
         crossfade: layer.crossfade,
         show_edges: layer.show_edges,
+        mirrors: &layer.mirrors,
     }
 }
 
@@ -2670,6 +2887,82 @@ mod tests {
         assert_eq!(app.reach, REACH.0);
         let _ = app.update(Message::Reach(1e6));
         assert_eq!(app.reach, REACH.1);
+    }
+
+    #[test]
+    fn a_mirror_is_placed_applied_and_undone() {
+        let mut app = Tessera::new();
+        edit(&mut app, 0.0);
+        let faces = app.document().triangle_ids().len();
+        let _ = app.update(Message::PlaceMirror(true));
+        assert_eq!(app.tool(), Tool::Mirror);
+        let (min, max) = app.document().bounds().unwrap();
+        // Right of it, then below all that.
+        let x = max.x + 50.0;
+        let first = document::Mirror {
+            a: iced::Point::new(x, 0.0),
+            b: iced::Point::new(x, 10.0),
+        };
+        let y = max.y + 50.0;
+        let second = document::Mirror {
+            a: iced::Point::new(min.x, y),
+            b: iced::Point::new(min.x + 10.0, y),
+        };
+        let _ = app.update(Message::Editor(editor::Message::AddMirror(first)));
+        assert!(!app.placing_mirror);
+        let _ = app.update(Message::Editor(editor::Message::AddMirror(second)));
+        let current = app.current();
+        assert_eq!(app.layers.layer(current).unwrap().mirrors, [first, second]);
+
+        // Taking the first away keeps the second.
+        let _ = app.update(Message::RemoveMirror(0));
+        assert_eq!(app.layers.layer(current).unwrap().mirrors, [second]);
+        let _ = app.update(Message::Undo);
+
+        // Applied: four times the drawing.
+        let _ = app.update(Message::ApplyMirrors);
+        assert_eq!(app.document().triangle_ids().len(), 4 * faces);
+        assert!(app.layers.layer(current).unwrap().mirrors.is_empty());
+
+        // One undo step back to mirrored, but not applied.
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.document().triangle_ids().len(), faces);
+        assert_eq!(app.layers.layer(current).unwrap().mirrors, [first, second]);
+    }
+
+    #[test]
+    fn one_mirror_is_applied_the_others_staying() {
+        let mut app = Tessera::new();
+        edit(&mut app, 0.0);
+        let faces = app.document().triangle_ids().len();
+        let (min, max) = app.document().bounds().unwrap();
+        let upright = document::Mirror {
+            a: iced::Point::new(max.x + 50.0, 0.0),
+            b: iced::Point::new(max.x + 50.0, 10.0),
+        };
+        let level = document::Mirror {
+            a: iced::Point::new(min.x, max.y + 50.0),
+            b: iced::Point::new(min.x + 10.0, max.y + 50.0),
+        };
+        for mirror in [upright, level] {
+            let _ = app.update(Message::Editor(editor::Message::AddMirror(mirror)));
+        }
+        let current = app.current();
+        let shown = |app: &Tessera| {
+            app.layers
+                .layer(current)
+                .unwrap()
+                .drawing()
+                .triangle_ids()
+                .len()
+        };
+        assert_eq!(shown(&app), 4 * faces);
+
+        // The second, square to the first: applied alone, the same shows.
+        let _ = app.update(Message::ApplyMirror(1));
+        assert_eq!(app.document().triangle_ids().len(), 2 * faces);
+        assert_eq!(app.layers.layer(current).unwrap().mirrors, [upright]);
+        assert_eq!(shown(&app), 4 * faces);
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use iced::{Color, Point};
 
-use crate::geometry::{area2, min_height, overlap};
+use crate::geometry::{Affine, area2, min_height, overlap};
 
 mod fill;
 
@@ -99,6 +99,9 @@ pub enum Edit {
     /// is rearranged either: a move that folds a triangle over is rejected.
     /// Landing on other vertices or edges joins them up as usual.
     MoveVertices { moves: Vec<(VertexId, Point)> },
+    /// Add the drawing's mirror image across `mirror`, joined up with it
+    /// where they meet (on the mirror line). Rejected if the two overlap.
+    Mirror { mirror: Mirror },
     /// Paint a face this colour; `None` clears it.
     Paint {
         triangle: TriangleId,
@@ -114,6 +117,86 @@ pub enum Edit {
     PaintAll { color: Option<Color> },
     /// Paint every edge this style; `None` clears them all.
     PaintAllEdges { style: Option<EdgeStyle> },
+}
+
+/// A mirror: the line through `a` and `b`, reflecting what's on one side
+/// onto the other.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Mirror {
+    pub a: Point,
+    pub b: Point,
+}
+
+impl Mirror {
+    /// `p` reflected across the line.
+    pub fn reflect(self, p: Point) -> Point {
+        self.affine().apply(p)
+    }
+
+    /// The reflection across the line.
+    pub fn affine(self) -> Affine {
+        Affine::reflection(self.a, self.b)
+    }
+}
+
+/// Where a drawing shows with `mirrors` one after the other, each
+/// mirroring all there is so far: the maps from the drawing to each of its
+/// images, itself (the identity) first.
+pub fn images(mirrors: &[Mirror]) -> Vec<Affine> {
+    let mut images = vec![Affine::IDENTITY];
+    for mirror in mirrors {
+        let reflect = mirror.affine();
+        let mirrored: Vec<_> = images.iter().map(|&image| image.then(reflect)).collect();
+        images.extend(mirrored);
+    }
+    images
+}
+
+/// Whether mirror `i` of `mirrors` can be applied on its own (making the
+/// drawing and its image across it the drawing, the other mirrors staying)
+/// and still show the same: if it mirrors the images of the mirrors before
+/// it just as it would the drawing (as when it's square to them, or
+/// parallel). The first always can.
+pub fn applies_alone(mirrors: &[Mirror], i: usize) -> bool {
+    let Some(mirror) = mirrors.get(i) else {
+        return false;
+    };
+    let rest: Vec<_> = mirrors
+        .iter()
+        .enumerate()
+        .filter(|&(j, _)| j != i)
+        .map(|(_, &m)| m)
+        .collect();
+    let now = images(mirrors);
+    let after: Vec<_> = [Affine::IDENTITY, mirror.affine()]
+        .into_iter()
+        .flat_map(|first| {
+            images(&rest)
+                .into_iter()
+                .map(move |image| first.then(image))
+        })
+        .collect();
+    now.len() == after.len()
+        && now
+            .iter()
+            .all(|&image| after.iter().any(|other| other.near(image)))
+}
+
+/// For drawings shown at `images`: the maps taking the drawing onto
+/// where another of its images shows, as seen from one (`g` then back from
+/// `h`). The images overlap each other iff the drawing overlaps itself
+/// under one of these.
+pub fn crossings(images: &[Affine]) -> Vec<Affine> {
+    let mut maps: Vec<Affine> = Vec::new();
+    for (i, &g) in images.iter().enumerate() {
+        for (j, &h) in images.iter().enumerate() {
+            let map = g.then(h.inverse());
+            if i != j && !map.near(Affine::IDENTITY) && !maps.iter().any(|m| m.near(map)) {
+                maps.push(map);
+            }
+        }
+    }
+    maps
 }
 
 /// What [`Document::normalize`] did to make the connectivity follow the
@@ -421,13 +504,128 @@ impl Document {
                 return None;
             }
             if paint {
-                next.inherit_colors(&document);
-                next.inherit_edge_styles(&document);
+                // A mirror image takes its paint from what it mirrors.
+                let mirrored;
+                let source = match edit {
+                    Edit::Mirror { mirror } => {
+                        mirrored = document.with_reflection(*mirror);
+                        &mirrored
+                    }
+                    _ => &document,
+                };
+                next.inherit_colors(source);
+                next.inherit_edge_styles(source);
             }
             document = next;
         }
 
         Some((document, changes))
+    }
+
+    /// Just the drawing's mirror image across `mirror`, painted alike.
+    pub fn reflection(&self, mirror: Mirror) -> Document {
+        self.transformed(mirror.affine())
+    }
+
+    /// The drawing mapped by `map`, painted alike.
+    pub fn transformed(&self, map: Affine) -> Document {
+        let flips = map.flips();
+        Document {
+            vertices: self.vertices.iter().map(|&p| map.apply(p)).collect(),
+            // Turned over, they wind the other way round: turned back.
+            triangles: self
+                .triangles
+                .iter()
+                .map(|&[a, b, c]| if flips { [a, c, b] } else { [a, b, c] })
+                .collect(),
+            colors: self.colors.clone(),
+            edge_styles: self.edge_styles.clone(),
+            revision: next_revision(),
+        }
+    }
+
+    /// The drawing with `mirrors` applied, one after the other: see
+    /// [`Self::with_mirror`].
+    pub fn with_mirrors(&self, mirrors: &[Mirror]) -> Document {
+        let mut drawing = self.clone();
+        for &mirror in mirrors {
+            drawing = drawing.with_mirror(mirror);
+        }
+        drawing
+    }
+
+    /// The drawing and, beside it, its mirror image across `mirror`: not
+    /// joined up (see [`Self::with_mirror`]).
+    fn with_reflection(&self, mirror: Mirror) -> Document {
+        let n = self.vertices.len();
+        let image = self.reflection(mirror);
+        let mut both = self.clone();
+        both.vertices.extend(image.vertices);
+        both.triangles
+            .extend(image.triangles.into_iter().map(|t| t.map(|v| v + n)));
+        both.colors.extend(
+            image
+                .colors
+                .into_iter()
+                .map(|(t, c)| (key(t.map(|v| v + n)), c)),
+        );
+        both.edge_styles.extend(
+            image
+                .edge_styles
+                .into_iter()
+                .map(|((a, b), style)| ((a + n, b + n), style)),
+        );
+        both.revision = next_revision();
+        both
+    }
+
+    /// The drawing with its mirror image joined on, as applying the mirror
+    /// would make it; for showing and exporting it. Unlike applying, it
+    /// doesn't check the two don't overlap (they're kept from that while
+    /// editing): it's quick enough to do on every change.
+    pub fn with_mirror(&self, mirror: Mirror) -> Document {
+        let mut changes = Changes::default();
+        let mut joined = self.with_reflection(mirror);
+        if !joined.normalize(&[], &mut changes, self) {
+            return self.with_reflection(mirror);
+        }
+        joined.inherit_colors(&self.with_reflection(mirror));
+        joined.inherit_edge_styles(&self.with_reflection(mirror));
+        joined
+    }
+
+    /// Whether the drawing overlaps itself mapped by any of `maps`: those of
+    /// its triangles new or moved since `before` (all of them, without it),
+    /// mapped, against all of it. (With each map's inverse among them too,
+    /// that's all that can have come to overlap.)
+    pub fn overlaps_under(&self, before: Option<&Document>, maps: &[Affine]) -> bool {
+        let changed = before.map(|before| Changed::since(self, before));
+        let bounds = |t: [Point; 3]| {
+            let (mut min, mut max) = (t[0], t[0]);
+            for p in &t[1..] {
+                min = Point::new(min.x.min(p.x), min.y.min(p.y));
+                max = Point::new(max.x.max(p.x), max.y.max(p.y));
+            }
+            (min, max)
+        };
+        let all: Vec<_> = self.triangles().map(|t| (t, bounds(t))).collect();
+        self.triangles
+            .iter()
+            .filter(|&&t| changed.as_ref().is_none_or(|changed| changed.triangle(t)))
+            .any(|&[a, b, c]| {
+                maps.iter().any(|&map| {
+                    let corners = if map.flips() { [c, b, a] } else { [a, b, c] };
+                    let image = corners.map(|v| map.apply(self.vertices[v]));
+                    let (min, max) = bounds(image);
+                    all.iter().any(|&(u, (umin, umax))| {
+                        min.x <= umax.x
+                            && umin.x <= max.x
+                            && min.y <= umax.y
+                            && umin.y <= max.y
+                            && overlap(image, u)
+                    })
+                })
+            })
     }
 
     fn apply_unchecked(
@@ -446,6 +644,10 @@ impl Document {
                 }
             }
             Edit::MoveVertex { id, to } => self.move_vertex(id, to),
+            Edit::Mirror { mirror } => {
+                *self = self.with_reflection(mirror);
+                true
+            }
             Edit::MoveVertices { moves } => {
                 let used = self.unique_vertices();
                 moves.iter().all(|(id, to)| {
@@ -918,6 +1120,75 @@ mod tests {
             snap: 0.0
         }));
         doc
+    }
+
+    #[test]
+    fn a_mirror_square_to_the_ones_before_applies_alone() {
+        let upright = Mirror {
+            a: Point::new(10.0, 0.0),
+            b: Point::new(10.0, 5.0),
+        };
+        let level = Mirror {
+            a: Point::new(0.0, 20.0),
+            b: Point::new(5.0, 20.0),
+        };
+        let slanted = Mirror {
+            a: Point::new(0.0, 20.0),
+            b: Point::new(5.0, 25.0),
+        };
+        assert!(applies_alone(&[upright, level], 0));
+        assert!(applies_alone(&[upright, level], 1));
+        assert!(applies_alone(&[upright, slanted], 0));
+        assert!(!applies_alone(&[upright, slanted], 1));
+    }
+
+    #[test]
+    fn mirroring_adds_the_mirror_image_joined_on() {
+        // A triangle with its right side on the mirror line x = 10, its
+        // left corner painted.
+        let mut doc = Document::default();
+        assert!(doc.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(0.0, 5.0),
+                Point::new(10.0, 0.0),
+                Point::new(10.0, 10.0)
+            ],
+            snap: 0.0
+        }));
+        let red = Color::from_rgb(1.0, 0.0, 0.0);
+        assert!(doc.apply(Edit::Paint {
+            triangle: 0,
+            color: Some(red)
+        }));
+        let mirror = Mirror {
+            a: Point::new(10.0, -5.0),
+            b: Point::new(10.0, 20.0),
+        };
+        assert_eq!(mirror.reflect(Point::new(0.0, 5.0)), Point::new(20.0, 5.0));
+        assert!(!doc.overlaps_under(None, &[mirror.affine()]));
+
+        let shown = doc.with_mirror(mirror);
+        assert!(doc.apply(Edit::Mirror { mirror }));
+        // Joined along the line: four vertices, the image painted alike.
+        assert_eq!(doc.vertex_count(), 4);
+        assert_eq!(doc.triangle_ids().len(), 2);
+        assert!(doc.colors().all(|color| color == Some(red)));
+        assert!(
+            doc.unique_vertices()
+                .iter()
+                .any(|&v| doc.vertex(v) == Point::new(20.0, 5.0))
+        );
+        // As shown before applying.
+        assert_eq!(shown.vertex_count(), 4);
+        assert_eq!(shown.triangle_ids().len(), 2);
+
+        // A mirror through the drawing would mirror it over itself.
+        let through = Mirror {
+            a: Point::new(5.0, -5.0),
+            b: Point::new(5.0, 20.0),
+        };
+        assert!(doc.overlaps_under(None, &[through.affine()]));
+        assert!(!doc.apply(Edit::Mirror { mirror: through }));
     }
 
     #[test]

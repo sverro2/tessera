@@ -17,7 +17,7 @@ pub fn export(layers: &Layers) -> String {
     let bounds = layers
         .layers()
         .iter()
-        .filter_map(|layer| layer.document.bounds())
+        .filter_map(|layer| layer.drawing().bounds())
         .reduce(|(min1, max1), (min2, max2)| {
             (
                 iced::Point::new(min1.x.min(min2.x), min1.y.min(min2.y)),
@@ -85,7 +85,8 @@ fn write_node(svg: &mut String, node: &Node, depth: usize, count: &mut usize) {
 /// the average colour of the painted edges meeting there (see [`fade`]): a
 /// linear gradient, exactly as drawn.
 fn write_drawing(svg: &mut String, layer: &Layer, prefix: &str, depth: usize) {
-    let document = &layer.document;
+    // Mirrored, if it has a mirror.
+    let document = &layer.drawing();
     let crossfade_edges = layer.crossfade.edges;
     let indent = "  ".repeat(depth);
     for (i, ([a, b, c], color)) in document.triangles().zip(document.colors()).enumerate() {
@@ -174,6 +175,33 @@ mod tests {
     use crate::document::Document;
     use crate::document::{EdgeStyle, Edit};
     use iced::{Color, Point};
+
+    #[test]
+    fn a_mirror_is_exported_mirrored() {
+        let mut document = Document::default();
+        document.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(5.0, 10.0),
+            ],
+            snap: 0.0,
+        });
+        let mut layers = Layers::default();
+        let first = layers.first_layer();
+        layers.layer_mut(first).unwrap().document = std::sync::Arc::new(document);
+        layers.set_mirrors(
+            first,
+            vec![crate::document::Mirror {
+                a: Point::new(20.0, 0.0),
+                b: Point::new(20.0, 10.0),
+            }],
+        );
+        let svg = export(&layers);
+        assert_eq!(svg.matches("-face").count(), 2, "{svg}");
+        // Its mirror image is in view too.
+        assert!(svg.contains(r#"viewBox="-10 -10 60 30""#), "{svg}");
+    }
 
     #[test]
     fn hidden_edges_are_left_out() {

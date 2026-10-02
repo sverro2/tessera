@@ -22,7 +22,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use crate::background::Background;
 use crate::camera::Camera;
-use crate::document::{Document, EdgeStyle};
+use crate::document::{Document, EdgeStyle, Mirror};
 use crate::layers::{Crossfade, Group, Layer, Layers, Node};
 use crate::paint;
 
@@ -92,6 +92,14 @@ enum NodeV2 {
         /// paint kept). Added later; files without it show them.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         hide_edges: bool,
+        /// The mirrors its drawing is mirrored across, one after the other
+        /// (until applied), each as two points on it: `[ax, ay, bx, by]`.
+        /// Added later.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mirrors: Vec<[f32; 4]>,
+        /// A single mirror, as files had it briefly; read, not written.
+        #[serde(default, skip_serializing)]
+        mirror: Option<[f32; 4]>,
         #[serde(flatten)]
         drawing: DrawingV1,
     },
@@ -168,6 +176,12 @@ pub fn save(layers: &Layers, camera: Camera, background: Option<&Background>) ->
                 crossfade_edge_width: (layer.crossfade.width != Crossfade::WIDTH)
                     .then_some(layer.crossfade.width),
                 hide_edges: !layer.show_edges,
+                mirrors: layer
+                    .mirrors
+                    .iter()
+                    .map(|Mirror { a, b }| [a.x, a.y, b.x, b.y])
+                    .collect(),
+                mirror: None,
                 drawing: save_drawing(&layer.document),
             },
             Node::Group(group) => NodeV2::Group {
@@ -240,6 +254,8 @@ pub fn open(text: &str) -> Result<Contents, String> {
                 crossfade_edges: false,
                 crossfade_edge_width: None,
                 hide_edges: false,
+                mirrors: Vec::new(),
+                mirror: None,
                 drawing: file.drawing,
             };
             (file.view, vec![layer], file.background)
@@ -264,6 +280,8 @@ pub fn open(text: &str) -> Result<Contents, String> {
                 crossfade_edges,
                 crossfade_edge_width,
                 hide_edges,
+                mirrors,
+                mirror,
                 drawing,
             } => Node::Layer(Layer {
                 // Made unique by `Layers::from_nodes`.
@@ -276,6 +294,16 @@ pub fn open(text: &str) -> Result<Contents, String> {
                 },
                 show_edges: !hide_edges,
                 document: Arc::new(open_drawing(drawing)?),
+                mirrors: mirror
+                    .into_iter()
+                    .chain(mirrors)
+                    .filter(|m| m.iter().all(|c| c.is_finite()))
+                    .map(|[ax, ay, bx, by]| Mirror {
+                        a: Point::new(ax, ay),
+                        b: Point::new(bx, by),
+                    })
+                    .filter(|m| m.a != m.b)
+                    .collect(),
             }),
             NodeV2::Group {
                 name,
@@ -303,6 +331,7 @@ pub fn open(text: &str) -> Result<Contents, String> {
             pan: Vector::new(x, y),
             zoom: zoom.clamp(Camera::MIN_ZOOM, Camera::MAX_ZOOM),
             rotation,
+            image: None,
         }
     } else {
         Camera::default()
@@ -444,6 +473,7 @@ mod tests {
             pan: Vector::new(12.5, -3.0),
             zoom: 1.75,
             rotation: 0.5,
+            image: None,
         };
 
         let opened = open(&save(&layers, camera, None)).unwrap();
@@ -489,6 +519,27 @@ mod tests {
         assert_eq!(opened.camera.pan, camera.pan);
         assert_eq!(opened.camera.zoom, camera.zoom);
         assert_eq!(opened.camera.rotation, camera.rotation);
+    }
+
+    #[test]
+    fn keeps_a_layers_mirror() {
+        let mut layers = Layers::default();
+        let first = layers.first_layer();
+        let mirror = crate::document::Mirror {
+            a: Point::new(1.0, 2.0),
+            b: Point::new(3.0, 4.0),
+        };
+        let other = crate::document::Mirror {
+            a: Point::new(-5.0, 0.0),
+            b: Point::new(5.0, 0.0),
+        };
+        layers.set_mirrors(first, vec![mirror, other]);
+        let text = save(&layers, Camera::default(), None);
+        let opened = open(&text).unwrap();
+        assert_eq!(opened.layers.layers()[0].mirrors, [mirror, other]);
+        // Without them, files stay as they were.
+        layers.set_mirrors(first, Vec::new());
+        assert!(!save(&layers, Camera::default(), None).contains("mirror"));
     }
 
     #[test]

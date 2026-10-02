@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use crate::document::{Document, next_revision};
+use crate::document::{Document, Mirror, next_revision};
 
 /// Identifies a layer or group; unique within [`Layers`].
 pub type NodeId = u64;
@@ -25,6 +25,21 @@ pub struct Layer {
     pub show_edges: bool,
     /// Shared between undo steps until changed.
     pub document: Arc<Document>,
+    /// Mirrors its drawing is shown (and exported) mirrored across, one
+    /// after the other (each mirroring all there is so far), until applied;
+    /// see [`Self::drawing`].
+    pub mirrors: Vec<Mirror>,
+}
+
+impl Layer {
+    /// Its drawing as shown and exported: mirrored, if it has mirrors.
+    pub fn drawing(&self) -> Arc<Document> {
+        if self.mirrors.is_empty() {
+            self.document.clone()
+        } else {
+            Arc::new(self.document.with_mirrors(&self.mirrors))
+        }
+    }
 }
 
 /// Whether a layer's painted edges blend into their neighbours'.
@@ -446,6 +461,13 @@ impl Layers {
         }
     }
 
+    pub fn set_mirrors(&mut self, id: NodeId, mirrors: Vec<Mirror>) {
+        if let Some(layer) = self.layer_mut(id) {
+            layer.mirrors = mirrors;
+            self.changed();
+        }
+    }
+
     pub fn set_show_edges(&mut self, id: NodeId, show: bool) {
         if let Some(layer) = self.layer_mut(id) {
             layer.show_edges = show;
@@ -483,6 +505,7 @@ impl Layers {
             crossfade: Crossfade::default(),
             show_edges: true,
             document: Arc::new(Document::default()),
+            mirrors: Vec::new(),
         })
     }
 

@@ -4,6 +4,8 @@ use std::f32::consts::{PI, TAU};
 
 use iced::{Point, Vector};
 
+use crate::geometry::Affine;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Camera {
     /// Screen position (relative to the canvas) of the world origin.
@@ -11,6 +13,9 @@ pub struct Camera {
     pub zoom: f32,
     /// Clockwise rotation of the world on screen, in radians, in (-π, π].
     pub rotation: f32,
+    /// Seeing the world through this map first: to edit a drawing through
+    /// one of its mirror images, where that image is.
+    pub image: Option<Affine>,
 }
 
 impl Camera {
@@ -18,6 +23,7 @@ impl Camera {
     pub const MAX_ZOOM: f32 = 50.0;
 
     pub fn to_screen(self, world: Point) -> Point {
+        let world = self.image.map_or(world, |image| image.apply(world));
         let (sin, cos) = self.rotation.sin_cos();
         let (x, y) = (world.x * self.zoom, world.y * self.zoom);
         Point::new(x * cos - y * sin, x * sin + y * cos) + self.pan
@@ -26,10 +32,12 @@ impl Camera {
     pub fn to_world(self, screen: Point) -> Point {
         let (sin, cos) = self.rotation.sin_cos();
         let p = screen - self.pan;
-        Point::new(
+        let world = Point::new(
             (p.x * cos + p.y * sin) / self.zoom,
             (-p.x * sin + p.y * cos) / self.zoom,
-        )
+        );
+        self.image
+            .map_or(world, |image| image.inverse().apply(world))
     }
 
     /// Zooms by `factor`, keeping the world point under `anchor` fixed.
@@ -66,6 +74,7 @@ impl Default for Camera {
             pan: Vector::ZERO,
             zoom: 1.0,
             rotation: 0.0,
+            image: None,
         }
     }
 }
@@ -79,7 +88,25 @@ mod tests {
             pan: Vector::new(30.0, -12.0),
             zoom: 1.5,
             rotation: 0.4,
+            image: None,
         }
+    }
+
+    #[test]
+    fn flipped_it_sees_the_world_mirrored() {
+        let flip = Affine::reflection(Point::new(10.0, 0.0), Point::new(10.0, 5.0));
+        let flipped = Camera {
+            image: Some(flip),
+            ..camera()
+        };
+        let p = Point::new(3.0, 7.0);
+        assert!(
+            flipped
+                .to_screen(p)
+                .distance(camera().to_screen(Point::new(17.0, 7.0)))
+                < 1e-4
+        );
+        assert!(flipped.to_world(flipped.to_screen(p)).distance(p) < 1e-4);
     }
 
     #[test]
