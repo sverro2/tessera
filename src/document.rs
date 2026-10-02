@@ -152,36 +152,6 @@ pub fn images(mirrors: &[Mirror]) -> Vec<Affine> {
     images
 }
 
-/// Whether mirror `i` of `mirrors` can be applied on its own (making the
-/// drawing and its image across it the drawing, the other mirrors staying)
-/// and still show the same: if it mirrors the images of the mirrors before
-/// it just as it would the drawing (as when it's square to them, or
-/// parallel). The first always can.
-pub fn applies_alone(mirrors: &[Mirror], i: usize) -> bool {
-    let Some(mirror) = mirrors.get(i) else {
-        return false;
-    };
-    let rest: Vec<_> = mirrors
-        .iter()
-        .enumerate()
-        .filter(|&(j, _)| j != i)
-        .map(|(_, &m)| m)
-        .collect();
-    let now = images(mirrors);
-    let after: Vec<_> = [Affine::IDENTITY, mirror.affine()]
-        .into_iter()
-        .flat_map(|first| {
-            images(&rest)
-                .into_iter()
-                .map(move |image| first.then(image))
-        })
-        .collect();
-    now.len() == after.len()
-        && now
-            .iter()
-            .all(|&image| after.iter().any(|other| other.near(image)))
-}
-
 /// For drawings shown at `images`: the maps taking the drawing onto
 /// where another of its images shows, as seen from one (`g` then back from
 /// `h`). The images overlap each other iff the drawing overlaps itself
@@ -1120,26 +1090,6 @@ mod tests {
             snap: 0.0
         }));
         doc
-    }
-
-    #[test]
-    fn a_mirror_square_to_the_ones_before_applies_alone() {
-        let upright = Mirror {
-            a: Point::new(10.0, 0.0),
-            b: Point::new(10.0, 5.0),
-        };
-        let level = Mirror {
-            a: Point::new(0.0, 20.0),
-            b: Point::new(5.0, 20.0),
-        };
-        let slanted = Mirror {
-            a: Point::new(0.0, 20.0),
-            b: Point::new(5.0, 25.0),
-        };
-        assert!(applies_alone(&[upright, level], 0));
-        assert!(applies_alone(&[upright, level], 1));
-        assert!(applies_alone(&[upright, slanted], 0));
-        assert!(!applies_alone(&[upright, slanted], 1));
     }
 
     #[test]

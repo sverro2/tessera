@@ -92,14 +92,14 @@ enum NodeV2 {
         /// paint kept). Added later; files without it show them.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         hide_edges: bool,
-        /// The mirrors its drawing is mirrored across, one after the other
-        /// (until applied), each as two points on it: `[ax, ay, bx, by]`.
-        /// Added later.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        mirrors: Vec<[f32; 4]>,
-        /// A single mirror, as files had it briefly; read, not written.
-        #[serde(default, skip_serializing)]
+        /// The mirror its drawing is mirrored across (until applied), as
+        /// two points on it: `[ax, ay, bx, by]`. Added later.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         mirror: Option<[f32; 4]>,
+        /// Mirrors, as files had them briefly: the first is read as the
+        /// mirror; not written.
+        #[serde(default, skip_serializing)]
+        mirrors: Vec<[f32; 4]>,
         #[serde(flatten)]
         drawing: DrawingV1,
     },
@@ -176,12 +176,8 @@ pub fn save(layers: &Layers, camera: Camera, background: Option<&Background>) ->
                 crossfade_edge_width: (layer.crossfade.width != Crossfade::WIDTH)
                     .then_some(layer.crossfade.width),
                 hide_edges: !layer.show_edges,
-                mirrors: layer
-                    .mirrors
-                    .iter()
-                    .map(|Mirror { a, b }| [a.x, a.y, b.x, b.y])
-                    .collect(),
-                mirror: None,
+                mirror: layer.mirror.map(|Mirror { a, b }| [a.x, a.y, b.x, b.y]),
+                mirrors: Vec::new(),
                 drawing: save_drawing(&layer.document),
             },
             Node::Group(group) => NodeV2::Group {
@@ -294,16 +290,14 @@ pub fn open(text: &str) -> Result<Contents, String> {
                 },
                 show_edges: !hide_edges,
                 document: Arc::new(open_drawing(drawing)?),
-                mirrors: mirror
-                    .into_iter()
-                    .chain(mirrors)
+                mirror: mirror
+                    .or(mirrors.first().copied())
                     .filter(|m| m.iter().all(|c| c.is_finite()))
                     .map(|[ax, ay, bx, by]| Mirror {
                         a: Point::new(ax, ay),
                         b: Point::new(bx, by),
                     })
-                    .filter(|m| m.a != m.b)
-                    .collect(),
+                    .filter(|m| m.a != m.b),
             }),
             NodeV2::Group {
                 name,
@@ -529,16 +523,12 @@ mod tests {
             a: Point::new(1.0, 2.0),
             b: Point::new(3.0, 4.0),
         };
-        let other = crate::document::Mirror {
-            a: Point::new(-5.0, 0.0),
-            b: Point::new(5.0, 0.0),
-        };
-        layers.set_mirrors(first, vec![mirror, other]);
+        layers.set_mirror(first, Some(mirror));
         let text = save(&layers, Camera::default(), None);
         let opened = open(&text).unwrap();
-        assert_eq!(opened.layers.layers()[0].mirrors, [mirror, other]);
-        // Without them, files stay as they were.
-        layers.set_mirrors(first, Vec::new());
+        assert_eq!(opened.layers.layers()[0].mirror, Some(mirror));
+        // Without one, files stay as they were.
+        layers.set_mirror(first, None);
         assert!(!save(&layers, Camera::default(), None).contains("mirror"));
     }
 

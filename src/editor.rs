@@ -17,9 +17,10 @@
 //! In the paint mode, clicking a face or dragging over faces paints them
 //! with the brush; the shape can't be changed.
 //!
-//! A layer with mirrors shows its mirror images, which are edited (and
-//! painted) like the drawing itself: over one, the editor sees the layer
-//! through the mirrors (see [`Editor::flipped`]).
+//! A layer with a mirror shows its mirror image, which is edited (and
+//! painted) like the drawing itself: over there, the editor sees the layer
+//! through the mirror (see [`Editor::flipped`]). (What works with a mirror
+//! works with several one after the other, too; layers have one at most.)
 //!
 //! A dragged point snaps onto nearby vertices and edges, and the mirror line (see
 //! [`Editor::snaps`]); the document then joins things up by itself, so the
@@ -136,8 +137,9 @@ pub enum Message {
     /// Holding C while painting, the mouse moved this far across (screen
     /// px): make the colour lighter (or, to the left, darker).
     TweakLightness(f32),
-    /// A mirror was placed on the current layer, after those it has.
-    AddMirror(Mirror),
+    /// A mirror was placed on the current layer (instead of the one it
+    /// had).
+    SetMirror(Mirror),
     /// Holding Alt with a selection (proportional editing on), the mouse
     /// moved this far across (screen px): reach further (or less far).
     TweakReach(f32),
@@ -212,7 +214,8 @@ pub struct SceneLayer<'a> {
     pub crossfade: Crossfade,
     /// Whether its edges are drawn in the paint mode.
     pub show_edges: bool,
-    /// The mirrors it's shown mirrored across, one after the other.
+    /// The mirrors it's shown mirrored across, one after the other (a
+    /// layer has one at most).
     pub mirrors: &'a [Mirror],
 }
 
@@ -237,7 +240,6 @@ pub fn view<'a>(
     background: Option<&'a Background>,
     tool: Tool,
     proportional: Option<f32>,
-    highlighted: Option<usize>,
 ) -> Element<'a, Message> {
     let Scene {
         current,
@@ -264,7 +266,6 @@ pub fn view<'a>(
         background,
         tool,
         proportional,
-        highlighted,
         deadline: Cell::new(None),
     });
     // Apart, as images (the background) are drawn after shapes within a
@@ -318,7 +319,6 @@ struct Worker<'a> {
     background: Option<&'a Background>,
     tool: Tool,
     proportional: Option<f32>,
-    highlighted: Option<usize>,
     deadline: Option<std::time::Instant>,
 }
 
@@ -340,7 +340,6 @@ impl<'a> Worker<'a> {
             background: self.background,
             tool: self.tool,
             proportional: self.proportional,
-            highlighted: self.highlighted,
             deadline: Cell::new(self.deadline),
         }
     }
@@ -372,9 +371,6 @@ struct Editor<'a> {
     /// further zoomed out) of what's moved, vertices go along with it, the
     /// less the further.
     proportional: Option<f32>,
-    /// A mirror of the current layer to show what it mirrors (its
-    /// button hovered).
-    highlighted: Option<usize>,
     /// When working out what a drag does should give up, so a heavy case
     /// (e.g. a fill through crowded geometry) can't make it crawl.
     deadline: Cell<Option<std::time::Instant>>,
@@ -1074,7 +1070,7 @@ impl canvas::Program<Message> for Editor<'_> {
                     let mirror = Mirror { a: from, b: to };
                     return Some(
                         if long && self.fits(mirror) {
-                            canvas::Action::publish(Message::AddMirror(mirror))
+                            canvas::Action::publish(Message::SetMirror(mirror))
                         } else {
                             canvas::Action::request_redraw()
                         }
@@ -1336,10 +1332,6 @@ impl Editor<'_> {
                 ..canvas::Text::default()
             });
             return with_overlay(layers, overlay);
-        }
-
-        if let Some(k) = self.highlighted {
-            self.draw_highlighted_mirror(&mut overlay, k, bounds);
         }
 
         // Painting: what the stroke paints so far, what clicking would
@@ -1711,12 +1703,10 @@ impl Editor<'_> {
         (!image.near(Affine::IDENTITY)).then_some(image)
     }
 
-    /// Whether `mirror` can go after the mirrors there are: none of the
-    /// images it makes overlaps another.
+    /// Whether `mirror` can go on the current layer (instead of the one it
+    /// has): the drawing doesn't overlap its image across it.
     fn fits(&self, mirror: Mirror) -> bool {
-        let mirrors: Vec<_> = self.mirrors.iter().copied().chain([mirror]).collect();
-        let maps = doc::crossings(&doc::images(&mirrors));
-        mirror.a != mirror.b && !self.document.overlaps_under(None, &maps)
+        mirror.a != mirror.b && !self.document.overlaps_under(None, &[mirror.affine()])
     }
 
     /// This editor seeing the current layer through its mirror, if the
@@ -1746,26 +1736,22 @@ impl Editor<'_> {
             background: self.background,
             tool: self.tool,
             proportional: self.proportional,
-            highlighted: self.highlighted,
             deadline: self.deadline.clone(),
         })
     }
 
-    /// Where the drawing's vertices show, with those of its mirror images:
-    /// where a mirror can run through it and its images join up.
+    /// Where the drawing's vertices are: where a mirror can run through it
+    /// and its image join up.
     fn mirror_points(&self) -> Vec<Point> {
-        let used = self.document.unique_vertices();
-        doc::images(self.mirrors)
+        self.document
+            .unique_vertices()
             .into_iter()
-            .flat_map(|image| {
-                used.iter()
-                    .map(move |&v| image.apply(self.document.vertex(v)))
-            })
+            .map(|v| self.document.vertex(v))
             .collect()
     }
 
     /// Where an end of a mirror being placed snaps, the cursor at `screen`:
-    /// onto a vertex in reach (of the drawing or an image), so the mirror
+    /// onto a vertex of the drawing in reach, so the mirror
     /// runs right through it, and its image joins up there.
     fn mirror_end(&self, screen: Point) -> Option<Point> {
         self.mirror_points()
@@ -1777,7 +1763,7 @@ impl Editor<'_> {
     }
 
     /// A mirror being placed along `from` → `to`, snapped to run right
-    /// through a vertex it passes close by (of the drawing or an image):
+    /// through a vertex of the drawing it passes close by:
     /// turned around `from` if `turning` (it's on a vertex itself), else
     /// moved across, keeping its angle. Only to where the mirror fits. The
     /// line, and the vertex it now runs through.
@@ -1839,56 +1825,6 @@ impl Editor<'_> {
         frame.stroke(&Path::line(a - far, b + far), dashed);
     }
 
-    /// What mirror `k` mirrors (its button hovered): its line, what it
-    /// takes (the drawing and the images of the mirrors before it),
-    /// outlined, and what it makes of that, filled. (The mirrors after it
-    /// mirror that again, but that's theirs.)
-    fn draw_highlighted_mirror(&self, frame: &mut Frame, k: usize, bounds: Rectangle) {
-        let Some(&mirror) = self.mirrors.get(k) else {
-            return;
-        };
-        let camera = self.plain_camera();
-        let triangles: Vec<[Point; 3]> = self.document.triangles().collect();
-        let mesh = |images: &[Affine]| {
-            Path::new(|p| {
-                for image in images {
-                    for t in &triangles {
-                        let [a, b, c] = t.map(|q| camera.to_screen(image.apply(q)));
-                        p.move_to(a);
-                        p.line_to(b);
-                        p.line_to(c);
-                        p.close();
-                    }
-                }
-            })
-        };
-        let taken = doc::images(&self.mirrors[..k]);
-        let made: Vec<Affine> = taken
-            .iter()
-            .map(|image| image.then(mirror.affine()))
-            .collect();
-
-        let source = mesh(&taken);
-        frame.fill(&source, Color { a: 0.08, ..MIRROR });
-        let dashed = Stroke {
-            line_dash: LineDash {
-                segments: &[4.0, 3.0],
-                offset: 0,
-            },
-            ..stroke(Color { a: 0.8, ..MIRROR }, 1.5)
-        };
-        frame.stroke(&source, dashed);
-
-        let image = mesh(&made);
-        frame.fill(&image, Color { a: 0.35, ..MIRROR });
-        frame.stroke(&image, stroke(MIRROR, 1.5));
-
-        let (a, b) = (camera.to_screen(mirror.a), camera.to_screen(mirror.b));
-        let d = b - a;
-        let far = d * ((bounds.width + bounds.height) * 2.0 / d.x.hypot(d.y).max(1e-6));
-        frame.stroke(&Path::line(a - far, b + far), stroke(MIRROR, 3.0));
-    }
-
     /// Placing a mirror: where it can't go (over the drawing), the line
     /// being drawn (green if it does, red if it doesn't) and the mirror
     /// image it makes, and the cursor.
@@ -1909,16 +1845,12 @@ impl Editor<'_> {
             ..canvas::Text::default()
         });
 
-        // Lines crossing the drawing's outline (its convex hull, with the
-        // images of the mirrors there are) mirror it over itself; any line
-        // clear of it will do.
-        let used = self.document.unique_vertices();
-        let points: Vec<Point> = doc::images(self.mirrors)
+        // Lines crossing the drawing's outline (its convex hull) mirror it
+        // over itself; any line clear of it will do.
+        let points: Vec<Point> = self
+            .mirror_points()
             .into_iter()
-            .flat_map(|image| {
-                used.iter()
-                    .map(move |&v| camera.to_screen(image.apply(self.document.vertex(v))))
-            })
+            .map(|p| camera.to_screen(p))
             .collect();
         let hull = crate::geometry::convex_hull(&points);
         if let Some((first, rest)) = hull.split_first() {
@@ -1940,7 +1872,7 @@ impl Editor<'_> {
             frame.stroke(&outline, dashed);
         }
 
-        // The mirrors there are now, and their images.
+        // The mirror there is now, being replaced.
         for &mirror in self.mirrors {
             self.draw_mirror_line(frame, mirror, bounds, Color { a: 0.3, ..MIRROR });
         }
@@ -1950,24 +1882,15 @@ impl Editor<'_> {
         {
             let mirror = Mirror { a: from, b: to };
             let color = if state.mirror_fits { ADDED } else { REMOVED };
-            // The images it adds: of each there is so far, mirrored.
-            let added: Vec<[Point; 3]> = doc::images(self.mirrors)
-                .into_iter()
-                .flat_map(|image| {
-                    let map = image.then(mirror.affine());
-                    self.document
-                        .triangles()
-                        .map(move |t| t.map(|p| map.apply(p)))
-                })
-                .collect();
-            let mesh = self.mesh(added.into_iter());
+            let image = self.document.reflection(mirror);
+            let mesh = self.mesh(image.triangles());
             frame.fill(&mesh, Color { a: 0.2, ..color });
             frame.stroke(&mesh, stroke(Color { a: 0.6, ..color }, 1.0));
             self.draw_mirror_line(frame, mirror, bounds, Color { a: 0.7, ..color });
             let (a, b) = (camera.to_screen(from), camera.to_screen(to));
             frame.stroke(&Path::line(a, b), stroke(color, 2.5));
-            // Where it runs through the drawing (or an image): there it
-            // joins up with its image.
+            // Where it runs through the drawing: there it joins up with its
+            // image.
             if let Some(through) = state.mirror_through {
                 let at = camera.to_screen(through);
                 frame.stroke(&Path::circle(at, 11.0), stroke(MIRROR, 2.5));
@@ -2528,7 +2451,6 @@ impl Editor<'_> {
             background: self.background,
             tool: self.tool,
             proportional: self.proportional,
-            highlighted: self.highlighted,
             deadline: self.deadline.clone(),
         }
     }
@@ -2705,7 +2627,6 @@ impl Editor<'_> {
             background: self.background,
             tool: self.tool,
             proportional: self.proportional,
-            highlighted: self.highlighted,
             deadline: self.deadline.get(),
         }
     }
@@ -3681,7 +3602,6 @@ mod tests {
             background: None,
             tool: Tool::Shape,
             proportional: None,
-            highlighted: None,
             deadline: Cell::new(None),
         }
     }
@@ -4020,7 +3940,7 @@ mod tests {
                 }
             }
             published.into_iter().find_map(|m| match m {
-                Message::AddMirror(mirror) => Some(mirror),
+                Message::SetMirror(mirror) => Some(mirror),
                 _ => None,
             })
         };
@@ -4040,7 +3960,7 @@ mod tests {
         assert_eq!(mirror.a, Point::new(300.0, 300.0));
     }
 
-    /// Places a mirror (with `mirrors` there already) by dragging `from`
+    /// Places a mirror (instead of `mirrors`) by dragging `from`
     /// → `to`, holding `modifiers`; the one placed, if any.
     fn place_mirror(
         doc: &Document,
@@ -4072,7 +3992,7 @@ mod tests {
             }
         }
         published.into_iter().find_map(|m| match m {
-            Message::AddMirror(mirror) => Some(mirror),
+            Message::SetMirror(mirror) => Some(mirror),
             _ => None,
         })
     }
@@ -4096,16 +4016,6 @@ mod tests {
         let mirror = place_mirror(&doc, &[], none, (300.0, 300.0), (165.0, 22.0)).unwrap();
         assert_eq!(mirror.a, Point::new(300.0, 300.0));
         assert!(through(mirror, (200.0, 100.0)), "{mirror:?}");
-
-        // Onto a vertex of an image: corner 1 mirrored at (500, 300).
-        let first = Mirror {
-            a: Point::new(400.0, 0.0),
-            b: Point::new(400.0, 600.0),
-        };
-        let shift = keyboard::Modifiers::SHIFT;
-        let mirror = place_mirror(&doc, &[first], shift, (503.0, 298.0), (503.0, 550.0)).unwrap();
-        assert_eq!(mirror.a, Point::new(500.0, 300.0));
-        assert!((mirror.a.x - mirror.b.x).abs() < 1e-3, "{mirror:?}");
     }
 
     #[test]
@@ -4160,54 +4070,6 @@ mod tests {
                 color: brush.color()
             }]]
         );
-    }
-
-    #[test]
-    fn mirrors_chain_and_every_image_is_edited_like_the_drawing() {
-        let doc = one();
-        let cache = Caches::default();
-        let mut editor = editor(&doc, &cache);
-        // Right of the triangle (x 100 to 300), then below it and its image.
-        let mirrors = [
-            Mirror {
-                a: Point::new(400.0, 0.0),
-                b: Point::new(400.0, 600.0),
-            },
-            Mirror {
-                a: Point::new(0.0, 400.0),
-                b: Point::new(800.0, 400.0),
-            },
-        ];
-        editor.mirrors = &mirrors;
-
-        // Corner 1 (300, 300) shows mirrored twice at (500, 500): moved
-        // there right and down, it goes left and up.
-        let edits = drag(
-            &editor,
-            &[
-                (MOVE, 500.0, 500.0),
-                (PRESS, 500.0, 500.0),
-                (MOVE, 520.0, 520.0),
-                (RELEASE, 520.0, 520.0),
-            ],
-        );
-        let [edits] = &edits[..] else {
-            panic!("{edits:?}");
-        };
-        let [Edit::MoveVertex { id: 1, to }] = edits[..] else {
-            panic!("{edits:?}");
-        };
-        assert!(to.distance(Point::new(280.0, 280.0)) < 1e-3, "{to:?}");
-
-        // Another mirror must keep clear of the images too: through the
-        // first one's (x 500 to 700), it doesn't fit.
-        editor.mirrors = &mirrors[..1];
-        let through = Mirror {
-            a: Point::new(600.0, 0.0),
-            b: Point::new(600.0, 600.0),
-        };
-        assert!(!editor.fits(through));
-        assert!(editor.fits(mirrors[1]));
     }
 
     #[test]
@@ -5402,7 +5264,6 @@ mod bench {
                     background: None,
                     tool: Tool::Shape,
                     proportional: None,
-                    highlighted: None,
                     deadline: Cell::new(None),
                 };
                 let run = |f: &dyn Fn(&Editor)| {

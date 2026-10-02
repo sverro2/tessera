@@ -25,19 +25,17 @@ pub struct Layer {
     pub show_edges: bool,
     /// Shared between undo steps until changed.
     pub document: Arc<Document>,
-    /// Mirrors its drawing is shown (and exported) mirrored across, one
-    /// after the other (each mirroring all there is so far), until applied;
-    /// see [`Self::drawing`].
-    pub mirrors: Vec<Mirror>,
+    /// A mirror its drawing is shown (and exported) mirrored across, until
+    /// applied; see [`Self::drawing`].
+    pub mirror: Option<Mirror>,
 }
 
 impl Layer {
-    /// Its drawing as shown and exported: mirrored, if it has mirrors.
+    /// Its drawing as shown and exported: mirrored, if it has a mirror.
     pub fn drawing(&self) -> Arc<Document> {
-        if self.mirrors.is_empty() {
-            self.document.clone()
-        } else {
-            Arc::new(self.document.with_mirrors(&self.mirrors))
+        match self.mirror {
+            Some(mirror) => Arc::new(self.document.with_mirror(mirror)),
+            None => self.document.clone(),
         }
     }
 }
@@ -461,9 +459,9 @@ impl Layers {
         }
     }
 
-    pub fn set_mirrors(&mut self, id: NodeId, mirrors: Vec<Mirror>) {
+    pub fn set_mirror(&mut self, id: NodeId, mirror: Option<Mirror>) {
         if let Some(layer) = self.layer_mut(id) {
-            layer.mirrors = mirrors;
+            layer.mirror = mirror;
             self.changed();
         }
     }
@@ -505,7 +503,7 @@ impl Layers {
             crossfade: Crossfade::default(),
             show_edges: true,
             document: Arc::new(Document::default()),
-            mirrors: Vec::new(),
+            mirror: None,
         })
     }
 

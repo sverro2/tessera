@@ -190,12 +190,12 @@ mod tests {
         let mut layers = Layers::default();
         let first = layers.first_layer();
         layers.layer_mut(first).unwrap().document = std::sync::Arc::new(document);
-        layers.set_mirrors(
+        layers.set_mirror(
             first,
-            vec![crate::document::Mirror {
+            Some(crate::document::Mirror {
                 a: Point::new(20.0, 0.0),
                 b: Point::new(20.0, 10.0),
-            }],
+            }),
         );
         let svg = export(&layers);
         assert_eq!(svg.matches("-face").count(), 2, "{svg}");
