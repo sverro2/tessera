@@ -102,6 +102,9 @@ pub enum Edit {
     /// Add the drawing's mirror image across `mirror`, joined up with it
     /// where they meet (on the mirror line). Rejected if the two overlap.
     Mirror { mirror: Mirror },
+    /// Add a piece of drawing as it is (pasted), joined up where its
+    /// corners land on vertices. Rejected if it overlaps anything.
+    Paste { piece: Piece },
     /// Paint a face this colour; `None` clears it.
     Paint {
         triangle: TriangleId,
@@ -117,6 +120,45 @@ pub enum Edit {
     PaintAll { color: Option<Color> },
     /// Paint every edge this style; `None` clears them all.
     PaintAllEdges { style: Option<EdgeStyle> },
+}
+
+/// A piece of a drawing, apart from it (copied): its triangles' corners
+/// (wound positively), each face's colour, and its painted edges' styles.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Piece {
+    pub vertices: Vec<Point>,
+    pub triangles: Vec<[usize; 3]>,
+    pub colors: Vec<Option<Color>>,
+    pub edge_styles: Vec<(usize, usize, EdgeStyle)>,
+}
+
+impl Piece {
+    pub fn is_empty(&self) -> bool {
+        self.triangles.is_empty()
+    }
+
+    /// Moved by `by`.
+    pub fn moved(&self, by: iced::Vector) -> Piece {
+        Piece {
+            vertices: self.vertices.iter().map(|&p| p + by).collect(),
+            ..self.clone()
+        }
+    }
+
+    /// The middle of its bounds.
+    pub fn centre(&self) -> Point {
+        let mut points = self.vertices.iter().copied();
+        let Some(first) = points.next() else {
+            return Point::ORIGIN;
+        };
+        let (min, max) = points.fold((first, first), |(min, max), p| {
+            (
+                Point::new(min.x.min(p.x), min.y.min(p.y)),
+                Point::new(max.x.max(p.x), max.y.max(p.y)),
+            )
+        });
+        Point::new((min.x + max.x) / 2.0, (min.y + max.y) / 2.0)
+    }
 }
 
 /// A mirror: the line through `a` and `b`, reflecting what's on one side
@@ -474,12 +516,17 @@ impl Document {
                 return None;
             }
             if paint {
-                // A mirror image takes its paint from what it mirrors.
-                let mirrored;
+                // A mirror image takes its paint from what it mirrors; a
+                // pasted piece brings its own.
+                let added;
                 let source = match edit {
                     Edit::Mirror { mirror } => {
-                        mirrored = document.with_reflection(*mirror);
-                        &mirrored
+                        added = document.with_reflection(*mirror);
+                        &added
+                    }
+                    Edit::Paste { piece } => {
+                        added = document.with_piece(piece);
+                        &added
                     }
                     _ => &document,
                 };
@@ -490,6 +537,59 @@ impl Document {
         }
 
         Some((document, changes))
+    }
+
+    /// The faces with all their corners among `vertices`, as a piece
+    /// apart, painted alike (edges both of whose ends are in it too).
+    pub fn piece(&self, vertices: &[VertexId]) -> Piece {
+        let inside: HashSet<VertexId> = vertices.iter().copied().collect();
+        let mut index: BTreeMap<VertexId, usize> = BTreeMap::new();
+        let mut piece = Piece::default();
+        for &t in &self.triangles {
+            if !t.iter().all(|v| inside.contains(v)) {
+                continue;
+            }
+            let corners = t.map(|v| {
+                *index.entry(v).or_insert_with(|| {
+                    piece.vertices.push(self.vertices[v]);
+                    piece.vertices.len() - 1
+                })
+            });
+            piece.triangles.push(corners);
+            piece.colors.push(self.colors.get(&key(t)).copied());
+        }
+        for (&(a, b), &style) in &self.edge_styles {
+            if let (Some(&a), Some(&b)) = (index.get(&a), index.get(&b)) {
+                piece.edge_styles.push((a, b, style));
+            }
+        }
+        piece
+    }
+
+    /// The drawing and, beside it, `piece`: not joined up.
+    fn with_piece(&self, piece: &Piece) -> Document {
+        let n = self.vertices.len();
+        let mut both = self.clone();
+        both.vertices.extend(&piece.vertices);
+        for (&t, &color) in piece.triangles.iter().zip(&piece.colors) {
+            let t = t.map(|v| v + n);
+            both.push_triangle(t);
+            if let Some(color) = color {
+                both.colors.insert(key(t), color);
+            }
+        }
+        for &(a, b, style) in &piece.edge_styles {
+            let (a, b) = (a + n, b + n);
+            both.edge_styles.insert((a.min(b), a.max(b)), style);
+        }
+        both.revision = next_revision();
+        both
+    }
+
+    /// How many vertices there are room for: those added next are numbered
+    /// from here.
+    pub fn vertex_slots(&self) -> usize {
+        self.vertices.len()
     }
 
     /// Just the drawing's mirror image across `mirror`, painted alike.
@@ -617,6 +717,29 @@ impl Document {
             Edit::Mirror { mirror } => {
                 *self = self.with_reflection(mirror);
                 true
+            }
+            Edit::Paste { piece } => {
+                let fine = piece
+                    .vertices
+                    .iter()
+                    .all(|p| p.x.is_finite() && p.y.is_finite())
+                    && piece
+                        .triangles
+                        .iter()
+                        .flatten()
+                        .all(|&v| v < piece.vertices.len());
+                // A face landing right on one there is would be welded onto
+                // it, and dropped as the same: it lies over it all the same.
+                let same = |p: Point, q: Point| p.distance(q) <= tolerance(0.0);
+                let on_one = piece.triangles.iter().any(|t| {
+                    let corners = t.map(|v| piece.vertices[v]);
+                    self.triangles()
+                        .any(|u| corners.iter().all(|&p| u.iter().any(|&q| same(p, q))))
+                });
+                fine && !on_one && {
+                    *self = self.with_piece(&piece);
+                    true
+                }
             }
             Edit::MoveVertices { moves } => {
                 let used = self.unique_vertices();
@@ -1090,6 +1213,39 @@ mod tests {
             snap: 0.0
         }));
         doc
+    }
+
+    #[test]
+    fn a_piece_is_copied_and_pasted_joined_on_but_never_over_anything() {
+        let mut doc = Document::default();
+        assert!(doc.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(0.0, 10.0)
+            ],
+            snap: 0.0
+        }));
+        let red = Color::from_rgb(1.0, 0.0, 0.0);
+        assert!(doc.apply(Edit::Paint {
+            triangle: 0,
+            color: Some(red)
+        }));
+        let piece = doc.piece(&doc.unique_vertices());
+        assert_eq!(piece.triangles.len(), 1);
+        // Some of its corners only: no whole face.
+        assert!(doc.piece(&[0, 1]).is_empty());
+
+        // In place: over itself.
+        assert!(!doc.clone().apply(Edit::Paste {
+            piece: piece.clone()
+        }));
+        // Beside it, sharing an edge: joined on, painted alike.
+        let beside = piece.moved(iced::Vector::new(10.0, 0.0));
+        assert!(doc.apply(Edit::Paste { piece: beside }));
+        assert_eq!(doc.triangle_ids().len(), 2);
+        assert_eq!(doc.vertex_count(), 5);
+        assert!(doc.colors().all(|color| color == Some(red)));
     }
 
     #[test]

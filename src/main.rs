@@ -150,6 +150,8 @@ struct Tessera {
     picking: bool,
     /// Placing a mirror on the current layer (Ctrl+M).
     placing_mirror: bool,
+    /// What was copied (Ctrl+C), to paste on any layer (Ctrl+V).
+    clipboard: Option<document::Piece>,
     /// The modifier keys held (Shift turns painting a layer into painting
     /// all layers).
     modifiers: keyboard::Modifiers,
@@ -831,6 +833,27 @@ impl Tessera {
                 self.placing_mirror = placing;
                 return Task::none();
             }
+            Message::Editor(editor::Message::Copy(piece)) => {
+                let faces = piece.triangles.len();
+                self.clipboard = Some(piece);
+                let plural = if faces == 1 { "" } else { "s" };
+                self.notify(format!("Copied {faces} face{plural}"), false);
+                return Task::none();
+            }
+            Message::Editor(editor::Message::Cut {
+                piece,
+                edits,
+                revision,
+            }) => {
+                if revision != self.document().revision() {
+                    return Task::none();
+                }
+                let faces = piece.triangles.len();
+                self.clipboard = Some(piece);
+                let plural = if faces == 1 { "" } else { "s" };
+                self.notify(format!("Cut {faces} face{plural}"), false);
+                return self.update(Message::Editor(editor::Message::Edit { edits, revision }));
+            }
             Message::Editor(editor::Message::SetMirror(mirror)) => {
                 let before = self.layers.clone();
                 self.layers.set_mirror(self.current(), Some(mirror));
@@ -1310,7 +1333,7 @@ impl Tessera {
             self.mode_switch(),
             space::horizontal(),
             text(match self.mode {
-                Mode::Shape => "Tab/P: paint · Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Ctrl+drag: lasso · Shift+click: (de)select vertex · Ctrl+L: select shape · Drag/G: move selection · R: rotate · T: scale · O: proportional · Alt+move: its reach · Esc: deselect · Ctrl+M: mirror · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+                Mode::Shape => "Tab/P: paint · Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri (or selection) · Ctrl+drag: lasso · Shift+click: (de)select vertex · Ctrl+L: select shape · Ctrl+C/X/V: copy/cut/paste · Drag/G: move selection · R: rotate · T: scale · O: proportional · Alt+move: its reach · Esc: deselect · Ctrl+M: mirror · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
                 Mode::Paint => "Tab/S: shape · F/E: faces/edges · Click or drag: paint · I/Ctrl+click: pick · Alt+move: edge width · C+move: lighter/darker · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
             })
             .size(12),
@@ -1358,6 +1381,7 @@ impl Tessera {
                     self.background.as_ref(),
                     self.tool(),
                     self.proportional.then_some(self.reach),
+                    self.clipboard.as_ref(),
                 )
             }
             .map(Message::Editor),

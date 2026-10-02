@@ -5,7 +5,8 @@
 //! inside a face, it
 //! extends from the last edge the cursor crossed. Only middle-drag pans; the
 //! wheel zooms around the cursor, Shift+wheel rotates around it. C cuts the
-//! hovered edge at the cursor; D removes the triangle under it.
+//! hovered edge at the cursor; D removes the triangle under it (with a
+//! selection, the selected vertices: every triangle using one).
 //!
 //! Ctrl+drag draws a lasso, adding the vertices inside it to the
 //! selection; Shift+click adds or removes a vertex; Ctrl+L adds the whole
@@ -43,7 +44,7 @@ use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Size, Theme, Vector
 
 use crate::background::Background;
 use crate::camera::Camera;
-use crate::document::{self as doc, EdgeStyle, Mirror};
+use crate::document::{self as doc, EdgeStyle, Mirror, Piece};
 use crate::document::{Changes, Document, Edit, TriangleId, VertexId, opposite};
 use crate::fade;
 use crate::geometry::{
@@ -92,6 +93,8 @@ const REMOVED: Color = Color::from_rgb8(0xf7, 0x76, 0x8e);
 /// Where an action joins things up: edges that become shared, vertices
 /// welded together (and the cursor, when it lands on such a join).
 const JOINED: Color = Color::from_rgb8(0xe0, 0xaf, 0x68);
+/// What's selected (shape mode).
+const SELECTED: Color = Color::from_rgb8(0xff, 0x9e, 0x3b);
 /// A mirror line.
 const MIRROR: Color = Color::from_rgb8(0xbb, 0x9a, 0xf7);
 /// The hovered vertex or edge.
@@ -137,6 +140,15 @@ pub enum Message {
     /// Holding C while painting, the mouse moved this far across (screen
     /// px): make the colour lighter (or, to the left, darker).
     TweakLightness(f32),
+    /// Copied (Ctrl+C): the selected faces.
+    Copy(Piece),
+    /// Cut (Ctrl+X): the selected faces copied, and these edits removing
+    /// them (for the document `revision`).
+    Cut {
+        piece: Piece,
+        edits: Vec<Edit>,
+        revision: u64,
+    },
     /// A mirror was placed on the current layer (instead of the one it
     /// had).
     SetMirror(Mirror),
@@ -240,6 +252,7 @@ pub fn view<'a>(
     background: Option<&'a Background>,
     tool: Tool,
     proportional: Option<f32>,
+    clipboard: Option<&'a Piece>,
 ) -> Element<'a, Message> {
     let Scene {
         current,
@@ -266,6 +279,7 @@ pub fn view<'a>(
         background,
         tool,
         proportional,
+        clipboard,
         deadline: Cell::new(None),
     });
     // Apart, as images (the background) are drawn after shapes within a
@@ -319,6 +333,7 @@ struct Worker<'a> {
     background: Option<&'a Background>,
     tool: Tool,
     proportional: Option<f32>,
+    clipboard: Option<&'a Piece>,
     deadline: Option<std::time::Instant>,
 }
 
@@ -340,6 +355,7 @@ impl<'a> Worker<'a> {
             background: self.background,
             tool: self.tool,
             proportional: self.proportional,
+            clipboard: self.clipboard,
             deadline: Cell::new(self.deadline),
         }
     }
@@ -371,6 +387,8 @@ struct Editor<'a> {
     /// further zoomed out) of what's moved, vertices go along with it, the
     /// less the further.
     proportional: Option<f32>,
+    /// What Ctrl+V pastes.
+    clipboard: Option<&'a Piece>,
     /// When working out what a drag does should give up, so a heavy case
     /// (e.g. a fill through crowded geometry) can't make it crawl.
     deadline: Cell<Option<std::time::Instant>>,
@@ -403,6 +421,8 @@ pub struct State {
     /// together; as of document `selected_in`.
     selection: Vec<VertexId>,
     selected_in: u64,
+    /// The layer the selection is of.
+    selected_layer: NodeId,
     /// The lasso being drawn (world).
     lasso: Vec<Point>,
     /// Working on the current layer through one of its mirror images (the
@@ -498,6 +518,14 @@ enum Interaction {
         from: Point,
         to: Point,
     },
+    /// Pasting (Ctrl+V): the clipboard's piece, moved by `base` and as much
+    /// as the cursor moved `from` → `to`, follows the cursor; a click puts
+    /// it down, where it doesn't overlap anything.
+    Pasting {
+        base: Vector,
+        from: Point,
+        to: Point,
+    },
     /// Rotating (R) or scaling (T) the selection around `center` by as much
     /// as the cursor turned around it, or came closer or went further from
     /// it, going `from` → `to`; until a click.
@@ -535,6 +563,7 @@ impl Interaction {
             self,
             Interaction::MovingSelection { held: false, .. }
                 | Interaction::PivotingSelection { .. }
+                | Interaction::Pasting { .. }
         )
     }
 }
@@ -646,6 +675,10 @@ impl canvas::Program<Message> for Editor<'_> {
                 state.interaction = Interaction::Idle;
                 state.pending = None;
             }
+        } else if state.selected_layer != self.current {
+            // Another layer: its vertices are others.
+            state.selection.clear();
+            state.selected_layer = self.current;
         } else if state.selected_in != revision {
             let used = self.document.unique_vertices();
             state.selection.retain(|v| used.binary_search(v).is_ok());
@@ -732,6 +765,79 @@ impl canvas::Program<Message> for Editor<'_> {
                 state.tweaking = None;
                 Some(canvas::Action::request_redraw().and_capture())
             }
+            // Ctrl+C copies the selected faces, Ctrl+X cuts them; Ctrl+V
+            // picks up a copy of what was copied, to put down with a click.
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) if modifiers.command()
+                && self.tool == Tool::Shape
+                && self.shown
+                && matches!(state.interaction, Interaction::Idle)
+                && matches!(key.to_latin(*physical_key), Some('c' | 'x' | 'v')) =>
+            {
+                let latin = key.to_latin(*physical_key);
+                if latin == Some('c') {
+                    let piece = self.document.piece(&state.selection);
+                    return (!piece.is_empty())
+                        .then(|| canvas::Action::publish(Message::Copy(piece)).and_capture());
+                }
+                if latin == Some('x') {
+                    let piece = self.document.piece(&state.selection);
+                    if piece.is_empty() {
+                        return None;
+                    }
+                    // The faces copied: those with all corners selected
+                    // (last first, so the others keep their places).
+                    let edits = self
+                        .document
+                        .triangle_ids()
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .filter(|(_, t)| t.iter().all(|v| state.selection.contains(v)))
+                        .map(|(triangle, _)| Edit::RemoveTriangle { triangle })
+                        .collect();
+                    let revision = self.document.revision();
+                    return Some(
+                        canvas::Action::publish(Message::Cut {
+                            piece,
+                            edits,
+                            revision,
+                        })
+                        .and_capture(),
+                    );
+                }
+                let piece = self.clipboard.filter(|piece| !piece.is_empty())?;
+                let at = self.camera.to_world(inside?);
+                // Right where it was copied from, if it fits there (on
+                // another layer, say); else in the middle of the cursor.
+                let paste = |by: Vector| {
+                    self.check(
+                        vec![Edit::Paste {
+                            piece: piece.moved(by),
+                        }],
+                        at,
+                    )
+                };
+                let (base, pending) = match paste(Vector::ZERO) {
+                    Some(pending) => (Vector::ZERO, Some(pending)),
+                    None => {
+                        let base = at - piece.centre();
+                        (base, paste(base))
+                    }
+                };
+                state.selection.clear();
+                state.interaction = Interaction::Pasting {
+                    base,
+                    from: at,
+                    to: at,
+                };
+                state.pending = pending;
+                Some(canvas::Action::request_redraw().and_capture())
+            }
             // Ctrl+L selects the whole shape under the cursor; off the
             // drawing, the whole shapes the selection is in.
             Event::Keyboard(keyboard::Event::KeyPressed {
@@ -773,9 +879,11 @@ impl canvas::Program<Message> for Editor<'_> {
                 modifiers,
                 ..
             }) if !modifiers.command()
-                && !state.selection.is_empty()
-                && (*key == keyboard::Key::Named(keyboard::key::Named::Escape)
-                    || matches!(key.to_latin(*physical_key), Some('g' | 'r' | 't'))) =>
+                && ((*key == keyboard::Key::Named(keyboard::key::Named::Escape)
+                    && (!state.selection.is_empty()
+                        || matches!(state.interaction, Interaction::Pasting { .. })))
+                    || (!state.selection.is_empty()
+                        && matches!(key.to_latin(*physical_key), Some('g' | 'r' | 't')))) =>
             {
                 let latin = key.to_latin(*physical_key);
                 match (latin, state.interaction) {
@@ -821,19 +929,36 @@ impl canvas::Program<Message> for Editor<'_> {
             {
                 let pos = inside?;
 
-                let edit = match key.to_latin(*physical_key)? {
+                let edits = match key.to_latin(*physical_key)? {
                     // C cuts the hovered edge where the cursor is.
                     'c' => match self.hit_test(pos)? {
-                        Hover::Edge { at, .. } => Edit::InsertVertex { at },
+                        Hover::Edge { at, .. } => vec![Edit::InsertVertex { at }],
                         Hover::Vertex(_) | Hover::Face(_) => return None,
                     },
-                    // D removes the triangle under the cursor.
-                    'd' => Edit::RemoveTriangle {
+                    // D removes the selected vertices: every triangle using
+                    // one (last first, so the others keep their places).
+                    'd' if !state.selection.is_empty() => {
+                        let edits: Vec<_> = self
+                            .document
+                            .triangle_ids()
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .filter(|(_, t)| t.iter().any(|v| state.selection.contains(v)))
+                            .map(|(triangle, _)| Edit::RemoveTriangle { triangle })
+                            .collect();
+                        if edits.is_empty() {
+                            return None;
+                        }
+                        edits
+                    }
+                    // Else the triangle under the cursor.
+                    'd' => vec![Edit::RemoveTriangle {
                         triangle: self.document.triangle_at(self.camera.to_world(pos))?,
-                    },
+                    }],
                     _ => return None,
                 };
-                let edits = self.check(vec![edit], self.camera.to_world(pos))?.edits;
+                let edits = self.check(edits, self.camera.to_world(pos))?.edits;
 
                 let revision = self.document.revision();
                 Some(canvas::Action::publish(Message::Edit { edits, revision }).and_capture())
@@ -850,10 +975,30 @@ impl canvas::Program<Message> for Editor<'_> {
                     if let Some(world) = state.aim.take() {
                         self.follow(state, world);
                     }
+                    let pasting = matches!(state.interaction, Interaction::Pasting { .. });
+                    // Pasting, a click where it doesn't fit does nothing.
+                    if pasting && *button == mouse::Button::Left && state.pending.is_none() {
+                        return Some(canvas::Action::request_redraw().and_capture());
+                    }
                     let pending = state.pending.take();
                     state.interaction = Interaction::Idle;
                     let action = match (button, pending) {
                         (mouse::Button::Left, Some(pending)) => {
+                            // What was pasted is selected, to go on with.
+                            if pasting {
+                                let n = self.document.vertex_slots();
+                                let mut pasted: Vec<VertexId> = pending
+                                    .result
+                                    .unique_vertices()
+                                    .into_iter()
+                                    .filter(|&v| v >= n)
+                                    .collect();
+                                pasted.extend(pending.changes.welded.iter().map(|&(_, kept)| kept));
+                                pasted.sort_unstable();
+                                pasted.dedup();
+                                state.selection = pasted;
+                                state.selected_in = self.document.revision();
+                            }
                             canvas::Action::publish(Message::Edit {
                                 edits: pending.edits,
                                 revision: self.document.revision(),
@@ -1420,6 +1565,16 @@ impl Editor<'_> {
             }
         }
 
+        // Pasting where it doesn't fit: the piece, in red.
+        if let (Interaction::Pasting { base, from, to }, None, Some(piece)) =
+            (state.interaction, pending, self.clipboard)
+        {
+            let piece = piece.moved(base + (to - from));
+            let triangles = piece.triangles.iter().map(|t| t.map(|v| piece.vertices[v]));
+            let mesh = self.mesh(triangles);
+            overlay.fill(&mesh, Color { a: 0.3, ..REMOVED });
+            overlay.stroke(&mesh, stroke(REMOVED, 1.5));
+        }
         self.draw_selection(&mut overlay, state, pending, cursor_pos);
 
         match (state.interaction, &pending) {
@@ -1594,7 +1749,7 @@ impl Editor<'_> {
             for (v, w) in self.weights(&subjects) {
                 if w < 1.0 {
                     let p = camera.to_screen(at(v));
-                    frame.fill(&Path::circle(p, 3.5), Color { a: w, ..HOVER });
+                    frame.fill(&Path::circle(p, 3.5), Color { a: w, ..SELECTED });
                 }
             }
             if let (true, Some(p)) = (tweaking, cursor) {
@@ -1611,10 +1766,43 @@ impl Editor<'_> {
             }
         }
 
+        // The selection: its faces (all corners selected) tinted, its
+        // edges (both ends) lit, its vertices as dots of their own colour.
+        if !state.selection.is_empty() {
+            let selected: std::collections::HashSet<VertexId> =
+                state.selection.iter().copied().collect();
+            let faces = Path::new(|p| {
+                for t in self.document.triangle_ids() {
+                    if t.iter().all(|v| selected.contains(v)) {
+                        let [a, b, c] = t.map(|v| camera.to_screen(at(v)));
+                        p.move_to(a);
+                        p.line_to(b);
+                        p.line_to(c);
+                        p.close();
+                    }
+                }
+            });
+            frame.fill(
+                &faces,
+                Color {
+                    a: 0.18,
+                    ..SELECTED
+                },
+            );
+            let edges = Path::new(|p| {
+                for (a, b) in self.document.unique_edges() {
+                    if selected.contains(&a) && selected.contains(&b) {
+                        p.move_to(camera.to_screen(at(a)));
+                        p.line_to(camera.to_screen(at(b)));
+                    }
+                }
+            });
+            frame.stroke(&edges, stroke(SELECTED, 2.0));
+        }
         for &v in &state.selection {
             let p = camera.to_screen(at(v));
-            frame.fill(&Path::circle(p, 4.5), HOVER);
-            frame.stroke(&Path::circle(p, 4.5), stroke(BACKGROUND, 1.5));
+            frame.fill(&Path::circle(p, 5.0), SELECTED);
+            frame.stroke(&Path::circle(p, 5.0), stroke(BACKGROUND, 1.5));
         }
 
         if let Interaction::PivotingSelection { center, .. } = state.interaction {
@@ -1736,6 +1924,7 @@ impl Editor<'_> {
             background: self.background,
             tool: self.tool,
             proportional: self.proportional,
+            clipboard: self.clipboard,
             deadline: self.deadline.clone(),
         })
     }
@@ -1965,9 +2154,44 @@ impl Editor<'_> {
                     }
                 }
             }
+            Interaction::Pasting { base, from, to } => {
+                *to = world;
+                state.pending = self.clipboard.and_then(|piece| {
+                    let by = *base + (world - *from);
+                    // Snapped, so it joins up where it lands.
+                    let moved = piece.moved(by);
+                    self.snap_offsets(&moved.vertices, &|_| false)
+                        .into_iter()
+                        .chain([Vector::ZERO])
+                        .find_map(|snap| {
+                            let piece = piece.moved(by + snap);
+                            self.check(vec![Edit::Paste { piece }], world)
+                        })
+                });
+            }
             Interaction::MovingSelection { from, to, .. } => {
                 let by = world - *from;
-                if let Some(pending) = self.transform(&state.selection, world, |p, w| p + by * w) {
+                // Snapped, so it joins up where it lands; not onto what
+                // moves along.
+                let moving: std::collections::HashSet<VertexId> = self
+                    .weights(&state.selection)
+                    .into_iter()
+                    .map(|(v, _)| v)
+                    .collect();
+                let moved: Vec<Point> = state
+                    .selection
+                    .iter()
+                    .map(|&v| self.document.vertex(v) + by)
+                    .collect();
+                let found = self
+                    .snap_offsets(&moved, &|v| moving.contains(&v))
+                    .into_iter()
+                    .chain([Vector::ZERO])
+                    .find_map(|snap| {
+                        let by = by + snap;
+                        self.transform(&state.selection, world, |p, w| p + by * w)
+                    });
+                if let Some(pending) = found {
                     *to = world;
                     state.pending = Some(pending);
                 }
@@ -2170,7 +2394,9 @@ impl Editor<'_> {
             | Interaction::Lassoing
             | Interaction::PlacingMirror { .. } => None,
             // Worked out as they move (see `follow`); not moved yet, nothing.
-            Interaction::MovingSelection { .. } | Interaction::PivotingSelection { .. } => None,
+            Interaction::MovingSelection { .. }
+            | Interaction::PivotingSelection { .. }
+            | Interaction::Pasting { .. } => None,
             Interaction::Creating { from, to } => self.check(
                 vec![Edit::AddTriangle {
                     // Seen mirrored, the other way round, so it's still to
@@ -2289,6 +2515,33 @@ impl Editor<'_> {
             .map(|(_, p)| p)
             .chain([to])
             .find_map(|p| self.check(vec![Edit::MoveVertex { id, to: p }], p))
+    }
+
+    /// How far to move `points` (world, already moved, together) so that
+    /// one of them lands on something to snap to (see [`Self::snaps`]),
+    /// best first: onto vertices, nearest first, then onto the rest. What
+    /// `moving` says moves along isn't snapped to.
+    fn snap_offsets(&self, points: &[Point], moving: &dyn Fn(VertexId) -> bool) -> Vec<Vector> {
+        let mut found: Vec<(bool, f32, Vector)> = Vec::new();
+        for &p in points {
+            let at = self.camera.to_screen(p);
+            for (target, q) in self.snaps(at, moving, |u, v| moving(u) || moving(v), &[]) {
+                let distance = self.camera.to_screen(q).distance(at);
+                found.push((!matches!(target, Target::Vertex(_)), distance, q - p));
+            }
+        }
+        found.sort_by(|x, y| x.0.cmp(&y.0).then(x.1.total_cmp(&y.1)));
+        let mut offsets: Vec<Vector> = Vec::new();
+        for (_, _, offset) in found {
+            let near = |o: &Vector| (o.x - offset.x).hypot(o.y - offset.y) < 1e-4;
+            if !offsets.iter().any(near) {
+                offsets.push(offset);
+            }
+            if offsets.len() == MAX_SNAPS {
+                break;
+            }
+        }
+        offsets
     }
 
     /// Moving each of `selection` (and, editing proportionally, those
@@ -2451,6 +2704,7 @@ impl Editor<'_> {
             background: self.background,
             tool: self.tool,
             proportional: self.proportional,
+            clipboard: self.clipboard,
             deadline: self.deadline.clone(),
         }
     }
@@ -2627,6 +2881,7 @@ impl Editor<'_> {
             background: self.background,
             tool: self.tool,
             proportional: self.proportional,
+            clipboard: self.clipboard,
             deadline: self.deadline.get(),
         }
     }
@@ -3602,6 +3857,7 @@ mod tests {
             background: None,
             tool: Tool::Shape,
             proportional: None,
+            clipboard: None,
             deadline: Cell::new(None),
         }
     }
@@ -3738,6 +3994,23 @@ mod tests {
         assert!(run(&editor, &mut state, Event::Mouse(RELEASE), 310.0, 270.0).is_empty());
         // Still selected, to go on with.
         assert_eq!(state.selection.len(), 3);
+    }
+
+    #[test]
+    fn a_moved_selection_snaps_to_join_up() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let mut state = State::default();
+        lasso_right(&editor, &mut state);
+
+        // Corner 3 (250, 300) to within a few px of corner 1 (200, 300):
+        // onto it.
+        run(&editor, &mut state, key('g'), 300.0, 250.0);
+        run(&editor, &mut state, Event::Mouse(MOVE), 254.0, 253.0);
+        let edits = run(&editor, &mut state, Event::Mouse(PRESS), 254.0, 253.0);
+        let by = Vector::new(-50.0, 0.0);
+        assert_eq!(moves(&edits), [3, 4, 5].map(|v| (v, doc.vertex(v) + by)));
     }
 
     #[test]
@@ -4173,6 +4446,154 @@ mod tests {
         // Lassoing the right triangle again adds 3 back.
         lasso_right(&editor, &mut state);
         assert_eq!(state.selection.len(), 4);
+    }
+
+    #[test]
+    fn d_removes_the_selected_vertices() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let mut state = State::default();
+        let shift = |m| Event::Keyboard(keyboard::Event::ModifiersChanged(m));
+
+        // Corner 0 of the left triangle and 4 of the right one: both go,
+        // whatever's under the cursor.
+        run(
+            &editor,
+            &mut state,
+            shift(keyboard::Modifiers::SHIFT),
+            0.0,
+            0.0,
+        );
+        for (x, y) in [(100.0, 300.0), (350.0, 300.0)] {
+            run(&editor, &mut state, Event::Mouse(PRESS), x, y);
+            run(&editor, &mut state, Event::Mouse(RELEASE), x, y);
+        }
+        run(
+            &editor,
+            &mut state,
+            shift(keyboard::Modifiers::empty()),
+            0.0,
+            0.0,
+        );
+        let edits = run(&editor, &mut state, key('d'), 600.0, 500.0);
+        assert_eq!(
+            edits,
+            vec![vec![
+                Edit::RemoveTriangle { triangle: 1 },
+                Edit::RemoveTriangle { triangle: 0 },
+            ]]
+        );
+        let mut after = doc.clone();
+        assert!(after.apply_all(&edits[0]));
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn copied_faces_are_pasted_where_they_fit() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let mut editor = editor(&doc, &cache);
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+        let ctrl = |c: char| {
+            let key = keyboard::Key::Character(c.to_string().into());
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL,
+                text: None,
+                repeat: false,
+            })
+        };
+        let mut state = State::default();
+        lasso_right(&editor, &mut state);
+        let cursor = mouse::Cursor::Available(Point::new(300.0, 250.0));
+        let copied = editor
+            .update(&mut state, &ctrl('c'), bounds, cursor)
+            .and_then(|action| action.into_inner().0);
+        let Some(Message::Copy(piece)) = copied else {
+            panic!("{copied:?}");
+        };
+        assert_eq!(piece.triangles.len(), 1);
+
+        editor.clipboard = Some(&piece);
+        let mut state = State::default();
+        // Over the original (in its middle): it doesn't fit, a click does
+        // nothing.
+        run(&editor, &mut state, ctrl('v'), 300.0, 250.0);
+        assert!(matches!(state.interaction, Interaction::Pasting { .. }));
+        assert!(run(&editor, &mut state, Event::Mouse(PRESS), 300.0, 250.0).is_empty());
+        assert!(matches!(state.interaction, Interaction::Pasting { .. }));
+
+        // Below it, clear: put down there, and selected.
+        run(&editor, &mut state, Event::Mouse(MOVE), 300.0, 450.0);
+        let edits = run(&editor, &mut state, Event::Mouse(PRESS), 300.0, 450.0);
+        assert_eq!(
+            edits,
+            vec![vec![Edit::Paste {
+                piece: piece.moved(Vector::new(0.0, 200.0))
+            }]]
+        );
+        assert!(matches!(state.interaction, Interaction::Idle));
+        assert_eq!(state.selection.len(), 3);
+        let mut after = doc.clone();
+        assert!(after.apply_all(&edits[0]));
+        assert_eq!(after.triangle_ids().len(), 3);
+    }
+
+    #[test]
+    fn a_paste_snaps_to_join_up_and_a_cut_takes_the_faces_away() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let ctrl = |c: char| {
+            let key = keyboard::Key::Character(c.to_string().into());
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL,
+                text: None,
+                repeat: false,
+            })
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+        let mut state = State::default();
+        lasso_right(&editor, &mut state);
+        let cursor = mouse::Cursor::Available(Point::new(600.0, 500.0));
+        let cut = editor
+            .update(&mut state, &ctrl('x'), bounds, cursor)
+            .and_then(|action| action.into_inner().0);
+        let Some(Message::Cut { piece, edits, .. }) = cut else {
+            panic!("{cut:?}");
+        };
+        assert_eq!(piece.triangles.len(), 1);
+        assert_eq!(edits, [Edit::RemoveTriangle { triangle: 1 }]);
+
+        // The right triangle (corners 250..350 along y = 300), pasted so its
+        // left corner comes within a few px of corner 1 (200, 300) of the
+        // left one: snapped onto it, sharing it.
+        let mut after = doc.clone();
+        assert!(after.apply_all(&edits));
+        let mut editor = super::tests::editor(&after, &cache);
+        editor.clipboard = Some(&piece);
+        let mut state = State::default();
+        run(&editor, &mut state, ctrl('v'), 300.0, 250.0);
+        run(&editor, &mut state, Event::Mouse(MOVE), 254.0, 253.0);
+        let edits = run(&editor, &mut state, Event::Mouse(PRESS), 254.0, 253.0);
+        assert_eq!(
+            edits,
+            vec![vec![Edit::Paste {
+                piece: piece.moved(Vector::new(-50.0, 0.0))
+            }]]
+        );
     }
 
     #[test]
@@ -5264,6 +5685,7 @@ mod bench {
                     background: None,
                     tool: Tool::Shape,
                     proportional: None,
+                    clipboard: None,
                     deadline: Cell::new(None),
                 };
                 let run = |f: &dyn Fn(&Editor)| {
