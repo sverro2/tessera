@@ -1433,7 +1433,10 @@ impl Tessera {
             menu_button("Help", Menu::Help),
             self.mode_switch(),
             space::horizontal(),
-            text(self.hint()).size(12),
+            button(text(self.hint()).size(12))
+                .padding([3, 10])
+                .style(button::secondary)
+                .on_press(Message::ShowKeys(true)),
         ]
         .spacing(10)
         .padding([2, 8])
@@ -2465,36 +2468,12 @@ impl Tessera {
         opaque(mouse_area(backdrop).on_press(Message::ShowExportPng(false)))
     }
 
-    /// The status bar's hint: the most used keys in the mode, as set.
+    /// The label of the button showing the keyboard shortcuts: with its
+    /// key, if it has one.
     fn hint(&self) -> String {
-        let key = |action| self.keys.first(action);
-        match self.mode {
-            Mode::Shape => format!(
-                "{}: paint · Drag corner: move (Shift: line up) · Drag edge: extend · \
-                 Drag blank: new tri · {}: cut edge · {}: delete · Ctrl+drag: lasso · \
-                 {}/{}/{}: grab/rotate/scale · {}: proportional · {}: mirror · \
-                 Middle-drag: pan · Wheel: zoom · {}: all shortcuts",
-                key(Action::ToggleMode),
-                key(Action::CutEdge),
-                key(Action::Delete),
-                key(Action::Grab),
-                key(Action::Rotate),
-                key(Action::Scale),
-                key(Action::Proportional),
-                key(Action::Mirror),
-                key(Action::ShowKeys),
-            ),
-            Mode::Paint => format!(
-                "{}: shape · {}/{}: faces/edges · Click or drag: paint · \
-                 {}/Ctrl+click: pick · Alt+move: edge width · {}+move: lighter/darker · \
-                 Middle-drag: pan · Wheel: zoom · {}: all shortcuts",
-                key(Action::ToggleMode),
-                key(Action::PaintFaces),
-                key(Action::PaintEdges),
-                key(Action::Pipette),
-                key(Action::Lightness),
-                key(Action::ShowKeys),
-            ),
+        match self.keys.keys(Action::ShowKeys).first() {
+            Some(key) => format!("Keyboard shortcuts ({key})"),
+            None => "Keyboard shortcuts".to_string(),
         }
     }
 

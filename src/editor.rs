@@ -647,6 +647,11 @@ enum Guide {
     /// From a point that's no vertex yet (where a new triangle starts),
     /// level (or `upright`) as seen in the view.
     Axis { at: Point, upright: bool },
+    /// In line with edge `u`–`v` (of another shape): on it, or on past it.
+    Along { u: VertexId, v: VertexId },
+    /// From a point that's no vertex yet (where a new triangle starts), at
+    /// the same angle as edge `u`–`v`.
+    ParallelFrom { at: Point, u: VertexId, v: VertexId },
 }
 
 /// Where a guide runs (world).
@@ -665,6 +670,8 @@ impl Guide {
         let at = |v| document.vertex(v);
         match self {
             Guide::Level { n, upright } => level(at(n), upright, camera),
+            Guide::Along { u, v } => Shape::Line(at(u), at(v) - at(u)),
+            Guide::ParallelFrom { at: from, u, v } => Shape::Line(from, at(v) - at(u)),
             Guide::Axis { at, upright } => level(at, upright, camera),
             Guide::Straight { m, n } => Shape::Line(at(n), at(n) - at(m)),
             Guide::Square { m, n } => {
@@ -689,7 +696,9 @@ impl Guide {
     fn followed(self) -> Option<(VertexId, VertexId)> {
         match self {
             Guide::Straight { m, n } | Guide::Square { m, n } => Some((m, n)),
-            Guide::Parallel { u, v, .. } => Some((u, v)),
+            Guide::Parallel { u, v, .. }
+            | Guide::Along { u, v }
+            | Guide::ParallelFrom { u, v, .. } => Some((u, v)),
             Guide::Between { .. }
             | Guide::Corner { .. }
             | Guide::Level { .. }
@@ -708,7 +717,17 @@ impl Guide {
             Guide::Between { .. }
             | Guide::Corner { .. }
             | Guide::Middle { .. }
-            | Guide::Axis { .. } => None,
+            | Guide::Axis { .. }
+            | Guide::Along { .. }
+            | Guide::ParallelFrom { .. } => None,
+        }
+    }
+
+    /// Where the new edge it lines up starts (world), for those from one.
+    fn start(self, document: &Document) -> Option<Point> {
+        match self {
+            Guide::Axis { at, .. } | Guide::ParallelFrom { at, .. } => Some(at),
+            _ => self.from().map(|n| document.vertex(n)),
         }
     }
 }
@@ -2828,7 +2847,8 @@ impl Editor<'_> {
 
     /// Lining up the corner dragged out for a new triangle started at
     /// `from` (the cursor at `world`): level or upright with its start, or
-    /// with the vertices there are. As [`Self::guided`].
+    /// with the vertices there are; at the angle of the shapes' outlines,
+    /// or in line with them. As [`Self::guided`].
     fn guided_creation(&self, from: Point, world: Point) -> Guided {
         let mut guides = Vec::new();
         for upright in [false, true] {
@@ -2837,6 +2857,11 @@ impl Editor<'_> {
                 guides.push(Guide::Level { n, upright });
             }
         }
+        for (u, v) in self.outlines(|_| false) {
+            guides.push(Guide::ParallelFrom { at: from, u, v });
+            guides.push(Guide::Along { u, v });
+        }
+        let guides = self.unique(guides);
         let (near, candidates) = self.line_up(&guides, world);
         let attempt = |at: Point| {
             let pending = self.pending(Interaction::Creating { from, to: at })?;
@@ -2859,10 +2884,10 @@ impl Editor<'_> {
     /// with edges to `ends`, can line up with: straight on from the edges
     /// at its ends, or square to them; at the angle of the edges at its
     /// other ends; level or upright in the view from its ends; between two
-    /// ends, as far from both, or square at the point itself. Each once.
+    /// ends, as far from both, or square at the point itself; at the angle
+    /// of, or in line with, the outlines of other shapes. Each once.
     fn guides(&self, moving: Option<VertexId>, ends: &[VertexId]) -> Vec<Guide> {
         let document = self.document;
-        let camera = self.camera;
         let edges = document.unique_edges();
         let mut around: HashMap<VertexId, Vec<VertexId>> = HashMap::new();
         for &(u, v) in &edges {
@@ -2907,30 +2932,78 @@ impl Editor<'_> {
             }
         }
 
-        // The same line (or circle) from several edges: once.
-        let mut unique: Vec<Guide> = Vec::new();
-        for guide in guides {
-            let shape = guide.shape(document, camera);
-            let same = |other: &Guide| match (shape, other.shape(document, camera)) {
-                (Shape::Line(o, d), Shape::Line(p, e)) => {
-                    let length = d.x.hypot(d.y);
-                    cross(d, e).abs() <= 1e-4 * length * e.x.hypot(e.y)
-                        && cross(p - o, d).abs() <= 1e-3 * length
-                }
-                (Shape::Circle(c, r), Shape::Circle(k, s)) => {
-                    c.distance(k) <= 1e-3 && (r - s).abs() <= 1e-3
-                }
-                _ => false,
-            };
-            let empty = match shape {
-                Shape::Line(_, d) => d.x == 0.0 && d.y == 0.0,
-                Shape::Circle(_, r) => r == 0.0,
-            };
-            if !empty && !unique.iter().any(same) {
-                unique.push(guide);
+        // From the other shapes there are (their outlines): at the same
+        // angle (keeping them parallel), and in line with them.
+        let seed = moving.or(ends.first().copied());
+        let own: std::collections::HashSet<VertexId> = seed
+            .map(|v| document.connected(v).into_iter().flatten().collect())
+            .unwrap_or_default();
+        for (u, v) in self.outlines(|v| own.contains(&v)) {
+            for &n in ends {
+                guides.push(Guide::Parallel { n, u, v });
             }
+            guides.push(Guide::Along { u, v });
         }
-        unique
+
+        self.unique(guides)
+    }
+
+    /// The edges on the outlines of the shapes there are, but for those
+    /// with a vertex that's `left_out`.
+    fn outlines(&self, left_out: impl Fn(VertexId) -> bool) -> Vec<(VertexId, VertexId)> {
+        let mut count: HashMap<(VertexId, VertexId), usize> = HashMap::new();
+        for (u, v) in self.document.edges() {
+            *count.entry((u.min(v), u.max(v))).or_default() += 1;
+        }
+        let mut outlines: Vec<_> = count
+            .into_iter()
+            .filter(|&((u, v), n)| n == 1 && !left_out(u) && !left_out(v))
+            .map(|(edge, _)| edge)
+            .collect();
+        outlines.sort_unstable();
+        outlines
+    }
+
+    /// `guides`, each line (or circle) once: the first of those that run
+    /// alike. (Told apart by where they run, rounded; quick, even with
+    /// many.)
+    fn unique(&self, guides: Vec<Guide>) -> Vec<Guide> {
+        let (document, camera) = (self.document, self.camera);
+        let mut seen = std::collections::HashSet::new();
+        guides
+            .into_iter()
+            .filter(|guide| {
+                let key = match guide.shape(document, camera) {
+                    Shape::Line(o, d) => {
+                        let length = d.x.hypot(d.y);
+                        if length == 0.0 {
+                            return false;
+                        }
+                        // Its direction either way, and how far it runs from
+                        // the origin.
+                        let (mut x, mut y) = (d.x / length, d.y / length);
+                        if x < 0.0 || (x == 0.0 && y < 0.0) {
+                            (x, y) = (-x, -y);
+                        }
+                        let offset = o.y * x - o.x * y;
+                        (
+                            0,
+                            (y.atan2(x) * 1e4).round() as i64,
+                            (offset * 1e2).round() as i64,
+                            0,
+                        )
+                    }
+                    Shape::Circle(c, r) => {
+                        if r == 0.0 {
+                            return false;
+                        }
+                        let round = |n: f32| (n * 1e2).round() as i64;
+                        (1, round(c.x), round(c.y), round(r))
+                    }
+                };
+                seen.insert(key)
+            })
+            .collect()
     }
 
     /// Of `guides`, those coming up near the cursor (at `world`), nearest
@@ -2975,12 +3048,15 @@ impl Editor<'_> {
             // square or parallel, either way.
             let ways: &[f32] = match guide {
                 Guide::Straight { .. } => &[1.0],
-                Guide::Square { .. } | Guide::Parallel { .. } => &[1.0, -1.0],
+                Guide::Square { .. } | Guide::Parallel { .. } | Guide::ParallelFrom { .. } => {
+                    &[1.0, -1.0]
+                }
                 Guide::Between { .. }
                 | Guide::Corner { .. }
                 | Guide::Level { .. }
                 | Guide::Middle { .. }
-                | Guide::Axis { .. } => &[],
+                | Guide::Axis { .. }
+                | Guide::Along { .. } => &[],
             };
             if let Shape::Line(o, d) = shape {
                 for &way in ways {
@@ -3155,40 +3231,36 @@ impl Editor<'_> {
                     }
                     continue;
                 }
-                Guide::Axis { at, .. } => {
-                    frame.stroke(&Path::line(camera.to_screen(at), p), stroke(GUIDE, 2.0));
-                    continue;
-                }
                 Guide::Between { .. } => continue,
                 _ => {}
             }
-            let Some(from) = guide.from() else {
+            let Some(start) = guide.start(document).map(|at| camera.to_screen(at)) else {
                 continue;
             };
-            // The new edge, from the end it starts at; marked alike with
-            // the one it follows.
-            frame.stroke(&Path::line(screen(from), p), stroke(GUIDE, 2.0));
+            // The new edge, from where it starts; marked alike with the one
+            // it follows.
+            frame.stroke(&Path::line(start, p), stroke(GUIDE, 2.0));
             let Some((u, v)) = guide.followed() else {
                 continue;
             };
             match *guide {
-                Guide::Parallel { .. } => {
+                Guide::Parallel { .. } | Guide::ParallelFrom { .. } => {
                     // Pointing the same way.
                     let (a, b) = (screen(u), screen(v));
-                    let ahead = p - screen(from);
+                    let ahead = p - start;
                     let same_way = (b - a).x * ahead.x + (b - a).y * ahead.y >= 0.0;
                     let (a, b) = if same_way { (a, b) } else { (b, a) };
                     mark(frame, a, b, true);
-                    mark(frame, screen(from), p, true);
+                    mark(frame, start, p, true);
                 }
                 Guide::Square { m, n } => square(frame, screen(n), screen(m), p),
                 _ => {}
             }
             // Just as long: only if it is.
-            let new = screen(from).distance(p);
+            let new = start.distance(p);
             if (new - screen(u).distance(screen(v))).abs() < 0.75 {
                 mark(frame, screen(u), screen(v), false);
-                mark(frame, screen(from), p, false);
+                mark(frame, start, p, false);
             }
         }
         if lit.len() >= 2 {
@@ -5290,6 +5362,86 @@ mod tests {
         // Upright under corner 1 (300, 300) of the triangle there.
         let (to, _) = create((303.0, 450.0));
         assert_eq!(to, Point::new(300.0, 450.0));
+    }
+
+    #[test]
+    fn shapes_apart_line_up_with_each_other() {
+        // Two triangles apart: 0 1 2 on the left, 3 4 5 on the right.
+        let doc = two_apart();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let shift = |m| Event::Keyboard(keyboard::Event::ModifiersChanged(m));
+
+        // The top of the left one, 2 (150, 200), dragged up and over: edge
+        // 0 2 parallel to edge 3 5 of the other one.
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(MOVE), 150.0, 200.0);
+        run(&editor, &mut state, Event::Mouse(PRESS), 150.0, 200.0);
+        run(
+            &editor,
+            &mut state,
+            shift(keyboard::Modifiers::SHIFT),
+            150.0,
+            200.0,
+        );
+        run(&editor, &mut state, Event::Mouse(MOVE), 172.0, 158.0);
+        let pending = state.pending.as_ref().unwrap();
+        let lit = editor.lit(&state, pending);
+        assert!(
+            lit.contains(&Guide::Parallel { n: 0, u: 3, v: 5 }),
+            "{lit:?}"
+        );
+        let d = pending.at - doc.vertex(0);
+        assert!(
+            cross(d, doc.vertex(5) - doc.vertex(3)).abs() < 1e-2,
+            "{d:?}"
+        );
+
+        // A new triangle's corner in line with edge 3 5, past its end.
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(MOVE), 175.0, 580.0);
+        run(&editor, &mut state, Event::Mouse(PRESS), 175.0, 580.0);
+        run(
+            &editor,
+            &mut state,
+            shift(keyboard::Modifiers::SHIFT),
+            175.0,
+            580.0,
+        );
+        run(&editor, &mut state, Event::Mouse(MOVE), 178.0, 452.0);
+        let lit = editor.lit(&state, state.pending.as_ref().unwrap());
+        assert!(lit.contains(&Guide::Along { u: 3, v: 5 }), "{lit:?}");
+
+        // A new triangle's base parallel to edge 3 5 (and as long, at the
+        // point that's so).
+        let start = Point::new(500.0, 500.0);
+        let end = start + (doc.vertex(5) - doc.vertex(3));
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(MOVE), start.x, start.y);
+        run(&editor, &mut state, Event::Mouse(PRESS), start.x, start.y);
+        run(
+            &editor,
+            &mut state,
+            shift(keyboard::Modifiers::SHIFT),
+            start.x,
+            start.y,
+        );
+        run(
+            &editor,
+            &mut state,
+            Event::Mouse(MOVE),
+            end.x + 4.0,
+            end.y + 3.0,
+        );
+        let pending = state.pending.as_ref().unwrap();
+        assert!(pending.at.distance(end) < 1e-3, "{:?}", pending.at);
+        let lit = editor.lit(&state, pending);
+        // (Edge 0 2 of the other one runs alike: the guide is kept once.)
+        assert!(
+            lit.iter()
+                .any(|g| matches!(g, Guide::ParallelFrom { at, .. } if *at == start)),
+            "{lit:?}"
+        );
     }
 
     #[test]
