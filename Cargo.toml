@@ -13,6 +13,8 @@ base64 = "0.22"
 # Only to read an image's size; the same version iced decodes with.
 image = { version = "0.25", default-features = false }
 rayon = "1.12.0"
+# Rasterises the SVG export for the PNG export; the version iced uses.
+resvg = { version = "0.45", default-features = false }
 
 # Geometry and rendering are far too slow unoptimised; keep our own code
 # quick to build but optimise it a little, and dependencies fully.

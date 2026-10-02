@@ -52,6 +52,7 @@ use crate::geometry::{
 };
 use crate::icons;
 use crate::joints;
+use crate::keys::{Action, Chord, Context, Keymap};
 use crate::layers::{Crossfade, NodeId};
 use crate::paint::{self, Brush};
 
@@ -253,6 +254,17 @@ pub struct Scene<'a> {
     pub above: Vec<SceneLayer<'a>>,
 }
 
+/// How the canvas edits: with what, and how.
+pub struct Settings<'a> {
+    pub tool: Tool,
+    /// Proportional editing: how far it reaches (screen px), if on.
+    pub proportional: Option<f32>,
+    /// What pasting pastes.
+    pub clipboard: Option<&'a Piece>,
+    /// Which keys do what; none while they're being looked up (or set).
+    pub keys: Option<&'a Keymap>,
+}
+
 /// The canvas for editing the current layer of `scene`, over the backdrop
 /// (background image and grid).
 pub fn view<'a>(
@@ -260,9 +272,7 @@ pub fn view<'a>(
     camera: Camera,
     caches: &'a Caches,
     background: Option<&'a Background>,
-    tool: Tool,
-    proportional: Option<f32>,
-    clipboard: Option<&'a Piece>,
+    settings: Settings<'a>,
 ) -> Element<'a, Message> {
     let Scene {
         current,
@@ -270,6 +280,12 @@ pub fn view<'a>(
         below,
         above,
     } = scene;
+    let Settings {
+        tool,
+        proportional,
+        clipboard,
+        keys,
+    } = settings;
     let backdrop = Canvas::new(Backdrop {
         cache: &caches.grid,
         background,
@@ -290,6 +306,7 @@ pub fn view<'a>(
         tool,
         proportional,
         clipboard,
+        keys,
         deadline: Cell::new(None),
     });
     // Apart, as images (the background) are drawn after shapes within a
@@ -344,6 +361,7 @@ struct Worker<'a> {
     tool: Tool,
     proportional: Option<f32>,
     clipboard: Option<&'a Piece>,
+    keys: Option<&'a Keymap>,
     deadline: Option<std::time::Instant>,
 }
 
@@ -366,6 +384,7 @@ impl<'a> Worker<'a> {
             tool: self.tool,
             proportional: self.proportional,
             clipboard: self.clipboard,
+            keys: self.keys,
             deadline: Cell::new(self.deadline),
         }
     }
@@ -399,6 +418,8 @@ struct Editor<'a> {
     proportional: Option<f32>,
     /// What Ctrl+V pastes.
     clipboard: Option<&'a Piece>,
+    /// Which keys do what; none while they're being looked up (or set).
+    keys: Option<&'a Keymap>,
     /// When working out what a drag does should give up, so a heavy case
     /// (e.g. a fill through crowded geometry) can't make it crawl.
     deadline: Cell<Option<std::time::Instant>>,
@@ -623,6 +644,9 @@ enum Guide {
     Level { n: VertexId, upright: bool },
     /// Just as far from `a` as from `b`: edges to both as long.
     Middle { a: VertexId, b: VertexId },
+    /// From a point that's no vertex yet (where a new triangle starts),
+    /// level (or `upright`) as seen in the view.
+    Axis { at: Point, upright: bool },
 }
 
 /// Where a guide runs (world).
@@ -640,18 +664,8 @@ impl Guide {
     fn shape(self, document: &Document, camera: Camera) -> Shape {
         let at = |v| document.vertex(v);
         match self {
-            Guide::Level { n, upright } => {
-                // Across (or up) the screen, in the world.
-                let along = if upright {
-                    Vector::new(0.0, 1.0)
-                } else {
-                    Vector::new(1.0, 0.0)
-                };
-                let origin = camera.to_screen(at(n));
-                let d = camera.to_world(origin + along) - at(n);
-                let length = d.x.hypot(d.y).max(1e-9);
-                Shape::Line(at(n), d * (1.0 / length))
-            }
+            Guide::Level { n, upright } => level(at(n), upright, camera),
+            Guide::Axis { at, upright } => level(at, upright, camera),
             Guide::Straight { m, n } => Shape::Line(at(n), at(n) - at(m)),
             Guide::Square { m, n } => {
                 let d = at(n) - at(m);
@@ -679,7 +693,8 @@ impl Guide {
             Guide::Between { .. }
             | Guide::Corner { .. }
             | Guide::Level { .. }
-            | Guide::Middle { .. } => None,
+            | Guide::Middle { .. }
+            | Guide::Axis { .. } => None,
         }
     }
 
@@ -690,9 +705,26 @@ impl Guide {
             | Guide::Square { n, .. }
             | Guide::Parallel { n, .. }
             | Guide::Level { n, .. } => Some(n),
-            Guide::Between { .. } | Guide::Corner { .. } | Guide::Middle { .. } => None,
+            Guide::Between { .. }
+            | Guide::Corner { .. }
+            | Guide::Middle { .. }
+            | Guide::Axis { .. } => None,
         }
     }
+}
+
+/// The line through `at` (world) level (or `upright`) as seen through
+/// `camera`.
+fn level(at: Point, upright: bool, camera: Camera) -> Shape {
+    let along = if upright {
+        Vector::new(0.0, 1.0)
+    } else {
+        Vector::new(1.0, 0.0)
+    };
+    let origin = camera.to_screen(at);
+    let d = camera.to_world(origin + along) - at;
+    let length = d.x.hypot(d.y).max(1e-9);
+    Shape::Line(at, d * (1.0 / length))
 }
 
 /// Where a dragged point lined up, and what releasing there does.
@@ -814,6 +846,17 @@ impl canvas::Program<Message> for Editor<'_> {
             state.selected_in = revision;
         }
 
+        // What a key pressed does here, as the user has it.
+        let pressed = match event {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) => self.pressed(key, *physical_key, *modifiers),
+            _ => None,
+        };
+
         match event {
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
@@ -855,7 +898,8 @@ impl canvas::Program<Message> for Editor<'_> {
                     // Shift down or up mid-drag: guides on or off.
                     if matches!(
                         state.interaction,
-                        Interaction::MovingVertex { .. }
+                        Interaction::Creating { .. }
+                            | Interaction::MovingVertex { .. }
                             | Interaction::Extending { .. }
                             | Interaction::LeavingFace { .. }
                     ) && let Some(pos) = screen
@@ -867,23 +911,18 @@ impl canvas::Program<Message> for Editor<'_> {
                 // Holding Ctrl turns the brush into the pipette.
                 matches!(self.tool, Tool::Paint { .. }).then(canvas::Action::request_redraw)
             }
-            // Holding C while painting (with a colour) tweaks how light it
-            // is; the face or edge previewed stays meanwhile.
-            Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                physical_key,
-                modifiers,
-                repeat,
-                ..
-            }) if !modifiers.command()
-                && matches!(
-                    self.tool,
-                    Tool::Paint {
-                        brush: Brush::Color(_),
-                        ..
-                    }
-                )
-                && key.to_latin(*physical_key) == Some('c') =>
+            // Holding the lightness key (C) while painting (with a colour)
+            // tweaks how light it is; the face or edge previewed stays
+            // meanwhile.
+            Event::Keyboard(keyboard::Event::KeyPressed { repeat, .. })
+                if pressed == Some(Action::Lightness)
+                    && matches!(
+                        self.tool,
+                        Tool::Paint {
+                            brush: Brush::Color(_),
+                            ..
+                        }
+                    ) =>
             {
                 if !repeat && state.tweaking.is_none() {
                     state.tweaking = Some(Tweak {
@@ -896,34 +935,35 @@ impl canvas::Program<Message> for Editor<'_> {
             }
             Event::Keyboard(keyboard::Event::KeyReleased {
                 key, physical_key, ..
-            }) if key.to_latin(*physical_key) == Some('c')
-                && state
-                    .tweaking
-                    .is_some_and(|tweak| tweak.what == Tweaking::Lightness) =>
+            }) if state
+                .tweaking
+                .is_some_and(|tweak| tweak.what == Tweaking::Lightness)
+                && self.keys.is_some_and(|keys| {
+                    Chord::pressed(key, *physical_key, keyboard::Modifiers::empty())
+                        .is_some_and(|chord| keys.releases(&chord, Action::Lightness))
+                }) =>
             {
                 state.tweaking = None;
                 Some(canvas::Action::request_redraw().and_capture())
             }
-            // Ctrl+C copies the selected faces, Ctrl+X cuts them; Ctrl+V
-            // picks up a copy of what was copied, to put down with a click.
-            Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                physical_key,
-                modifiers,
-                ..
-            }) if modifiers.command()
-                && self.tool == Tool::Shape
-                && self.shown
-                && matches!(state.interaction, Interaction::Idle)
-                && matches!(key.to_latin(*physical_key), Some('c' | 'x' | 'v')) =>
+            // Copy (Ctrl+C) copies the selected faces, cut (Ctrl+X) cuts
+            // them; paste (Ctrl+V) picks up a copy of what was copied, to put
+            // down with a click.
+            Event::Keyboard(keyboard::Event::KeyPressed { .. })
+                if self.tool == Tool::Shape
+                    && self.shown
+                    && matches!(state.interaction, Interaction::Idle)
+                    && matches!(
+                        pressed,
+                        Some(Action::Copy | Action::CutFaces | Action::Paste)
+                    ) =>
             {
-                let latin = key.to_latin(*physical_key);
-                if latin == Some('c') {
+                if pressed == Some(Action::Copy) {
                     let piece = self.document.piece(&state.selection);
                     return (!piece.is_empty())
                         .then(|| canvas::Action::publish(Message::Copy(piece)).and_capture());
                 }
-                if latin == Some('x') {
+                if pressed == Some(Action::CutFaces) {
                     let piece = self.document.piece(&state.selection);
                     if piece.is_empty() {
                         return None;
@@ -977,18 +1017,13 @@ impl canvas::Program<Message> for Editor<'_> {
                 state.pending = pending;
                 Some(canvas::Action::request_redraw().and_capture())
             }
-            // Ctrl+L selects the whole shape under the cursor; off the
-            // drawing, the whole shapes the selection is in.
-            Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                physical_key,
-                modifiers,
-                ..
-            }) if modifiers.command()
-                && self.tool == Tool::Shape
-                && self.shown
-                && matches!(state.interaction, Interaction::Idle)
-                && key.to_latin(*physical_key) == Some('l') =>
+            // Select shape (Ctrl+L) selects the whole shape under the
+            // cursor; off the drawing, the whole shapes the selection is in.
+            Event::Keyboard(keyboard::Event::KeyPressed { .. })
+                if pressed == Some(Action::SelectShape)
+                    && self.tool == Tool::Shape
+                    && self.shown
+                    && matches!(state.interaction, Interaction::Idle) =>
             {
                 let hovered = inside
                     .and_then(|pos| self.hit_test(pos))
@@ -1010,29 +1045,22 @@ impl canvas::Program<Message> for Editor<'_> {
                 state.selected_in = self.document.revision();
                 Some(canvas::Action::request_redraw().and_capture())
             }
-            // With a selection: G grabs it, R rotates it, T scales it; Esc
-            // lets go of that, or else of the selection.
-            Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                physical_key,
-                modifiers,
-                ..
-            }) if !modifiers.command()
-                && ((*key == keyboard::Key::Named(keyboard::key::Named::Escape)
+            // With a selection: grab (G), rotate (R), scale (T); Esc lets go
+            // of that, or else of the selection.
+            Event::Keyboard(keyboard::Event::KeyPressed { key, .. })
+                if (*key == keyboard::Key::Named(keyboard::key::Named::Escape)
                     && (!state.selection.is_empty()
                         || matches!(state.interaction, Interaction::Pasting { .. })))
                     || (!state.selection.is_empty()
-                        && matches!(key.to_latin(*physical_key), Some('g' | 'r' | 't')))) =>
+                        && self.tool == Tool::Shape
+                        && matches!(
+                            pressed,
+                            Some(Action::Grab | Action::Rotate | Action::Scale)
+                        )) =>
             {
-                let latin = key.to_latin(*physical_key);
-                match (latin, state.interaction) {
-                    (None, Interaction::Idle) => state.selection.clear(),
-                    (None, _) => {
-                        state.interaction = Interaction::Idle;
-                        state.pending = None;
-                        state.aim = None;
-                    }
-                    (Some(key), Interaction::Idle) => {
+                let escape = *key == keyboard::Key::Named(keyboard::key::Named::Escape);
+                match (escape, state.interaction) {
+                    (false, Interaction::Idle) => {
                         let at = self.camera.to_world(inside?);
                         let center = self.centre(&state.selection);
                         let pivot = |pivot| Interaction::PivotingSelection {
@@ -1041,42 +1069,45 @@ impl canvas::Program<Message> for Editor<'_> {
                             from: at,
                             to: at,
                         };
-                        state.interaction = match key {
-                            'g' => Interaction::MovingSelection {
+                        state.interaction = match pressed {
+                            Some(Action::Grab) => Interaction::MovingSelection {
                                 from: at,
                                 to: at,
                                 held: false,
                             },
-                            'r' => pivot(Pivot::Rotate),
+                            Some(Action::Rotate) => pivot(Pivot::Rotate),
                             _ => pivot(Pivot::Scale),
                         };
                         state.pending = None;
                     }
-                    _ => return None,
+                    (false, _) => return None,
+                    (true, Interaction::Idle) => state.selection.clear(),
+                    (true, _) => {
+                        state.interaction = Interaction::Idle;
+                        state.pending = None;
+                        state.aim = None;
+                    }
                 }
                 Some(canvas::Action::request_redraw().and_capture())
             }
-            Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                physical_key,
-                modifiers,
-                ..
-            }) if !modifiers.command()
-                && self.tool == Tool::Shape
-                && self.shown
-                && matches!(state.interaction, Interaction::Idle) =>
+            Event::Keyboard(keyboard::Event::KeyPressed { .. })
+                if matches!(pressed, Some(Action::CutEdge | Action::Delete))
+                    && self.tool == Tool::Shape
+                    && self.shown
+                    && matches!(state.interaction, Interaction::Idle) =>
             {
                 let pos = inside?;
 
-                let edits = match key.to_latin(*physical_key)? {
-                    // C cuts the hovered edge where the cursor is.
-                    'c' => match self.hit_test(pos)? {
+                let edits = match pressed? {
+                    // Cutting (C) cuts the hovered edge where the cursor is.
+                    Action::CutEdge => match self.hit_test(pos)? {
                         Hover::Edge { at, .. } => vec![Edit::InsertVertex { at }],
                         Hover::Vertex(_) | Hover::Face(_) => return None,
                     },
-                    // D removes the selected vertices: every triangle using
-                    // one (last first, so the others keep their places).
-                    'd' if !state.selection.is_empty() => {
+                    // Deleting (D) removes the selected vertices: every
+                    // triangle using one (last first, so the others keep
+                    // their places).
+                    _ if !state.selection.is_empty() => {
                         let edits: Vec<_> = self
                             .document
                             .triangle_ids()
@@ -1092,10 +1123,9 @@ impl canvas::Program<Message> for Editor<'_> {
                         edits
                     }
                     // Else the triangle under the cursor.
-                    'd' => vec![Edit::RemoveTriangle {
+                    _ => vec![Edit::RemoveTriangle {
                         triangle: self.document.triangle_at(self.camera.to_world(pos))?,
                     }],
-                    _ => return None,
                 };
                 let edits = self.check(edits, self.camera.to_world(pos))?.edits;
 
@@ -1104,6 +1134,9 @@ impl canvas::Program<Message> for Editor<'_> {
             }
             Event::Mouse(mouse::Event::ButtonPressed(button)) => {
                 let pos = inside?;
+                // Guides are a drag's own: none from the one before.
+                state.guides.clear();
+                state.near_guides.clear();
                 let world = self.camera.to_world(pos);
                 if *button == mouse::Button::Left && !self.editable() {
                     return None;
@@ -1342,6 +1375,8 @@ impl canvas::Program<Message> for Editor<'_> {
                 }
                 let finished = std::mem::take(&mut state.interaction);
                 let pending = state.pending.take();
+                state.guides.clear();
+                state.near_guides.clear();
 
                 // A mirror where it was let go, if it's long enough to tell
                 // its direction and clear of the drawing.
@@ -1707,7 +1742,8 @@ impl Editor<'_> {
         if !state.near_guides.is_empty()
             && matches!(
                 state.interaction,
-                Interaction::MovingVertex { .. }
+                Interaction::Creating { .. }
+                    | Interaction::MovingVertex { .. }
                     | Interaction::Extending { .. }
                     | Interaction::LeavingFace { .. }
             )
@@ -2074,6 +2110,7 @@ impl Editor<'_> {
             tool: self.tool,
             proportional: self.proportional,
             clipboard: self.clipboard,
+            keys: self.keys,
             deadline: self.deadline.clone(),
         })
     }
@@ -2266,7 +2303,20 @@ impl Editor<'_> {
             found
         };
         match &mut state.interaction {
-            Interaction::Creating { to, .. } => {
+            Interaction::Creating { from, to } => {
+                let from = *from;
+                // With Shift, the corner dragged lines up level or upright
+                // with where it started, or with the vertices there are.
+                if shift {
+                    let (fine, near, found) = self.guided_creation(from, world);
+                    (state.guides, state.near_guides) = (fine, near);
+                    if let Some((at, pending)) = found {
+                        *to = at;
+                        state.pending = Some(pending);
+                        self.deadline.set(None);
+                        return;
+                    }
+                }
                 *to = world;
                 state.pending = self.pending(state.interaction);
             }
@@ -2776,6 +2826,35 @@ impl Editor<'_> {
         Some((fine, near, found))
     }
 
+    /// Lining up the corner dragged out for a new triangle started at
+    /// `from` (the cursor at `world`): level or upright with its start, or
+    /// with the vertices there are. As [`Self::guided`].
+    fn guided_creation(&self, from: Point, world: Point) -> Guided {
+        let mut guides = Vec::new();
+        for upright in [false, true] {
+            guides.push(Guide::Axis { at: from, upright });
+            for n in self.document.unique_vertices() {
+                guides.push(Guide::Level { n, upright });
+            }
+        }
+        let (near, candidates) = self.line_up(&guides, world);
+        let attempt = |at: Point| {
+            let pending = self.pending(Interaction::Creating { from, to: at })?;
+            self.keeps_shape(&pending).then_some(pending)
+        };
+        let found = candidates
+            .into_iter()
+            .take(2 * MAX_SNAPS)
+            .find_map(|at| Some((at, attempt(at)?)));
+        let fine = near
+            .iter()
+            .filter(|&&(_, closest)| attempt(closest).is_some())
+            .map(|&(guide, _)| guide)
+            .collect();
+        let near = near.into_iter().map(|(guide, _)| guide).collect();
+        (fine, near, found)
+    }
+
     /// The guides a point dragged (`moving`, if it's a vertex already),
     /// with edges to `ends`, can line up with: straight on from the edges
     /// at its ends, or square to them; at the angle of the edges at its
@@ -2900,7 +2979,8 @@ impl Editor<'_> {
                 Guide::Between { .. }
                 | Guide::Corner { .. }
                 | Guide::Level { .. }
-                | Guide::Middle { .. } => &[],
+                | Guide::Middle { .. }
+                | Guide::Axis { .. } => &[],
             };
             if let Shape::Line(o, d) = shape {
                 for &way in ways {
@@ -3073,6 +3153,10 @@ impl Editor<'_> {
                         frame.stroke(&Path::line(screen(v), p), stroke(GUIDE, 2.0));
                         mark(frame, screen(v), p, false);
                     }
+                    continue;
+                }
+                Guide::Axis { at, .. } => {
+                    frame.stroke(&Path::line(camera.to_screen(at), p), stroke(GUIDE, 2.0));
                     continue;
                 }
                 Guide::Between { .. } => continue,
@@ -3307,6 +3391,7 @@ impl Editor<'_> {
             tool: self.tool,
             proportional: self.proportional,
             clipboard: self.clipboard,
+            keys: self.keys,
             deadline: self.deadline.clone(),
         }
     }
@@ -3484,6 +3569,7 @@ impl Editor<'_> {
             tool: self.tool,
             proportional: self.proportional,
             clipboard: self.clipboard,
+            keys: self.keys,
             deadline: self.deadline.get(),
         }
     }
@@ -3829,6 +3915,22 @@ impl Editor<'_> {
                 ..
             }
         )
+    }
+
+    /// What a key pressed does on the canvas now (in its mode), if anything.
+    fn pressed(
+        &self,
+        key: &keyboard::Key,
+        physical: keyboard::key::Physical,
+        modifiers: keyboard::Modifiers,
+    ) -> Option<Action> {
+        let context = match self.tool {
+            Tool::Shape => Context::Shape,
+            Tool::Paint { .. } => Context::Paint,
+            Tool::Background { .. } | Tool::Mirror => return None,
+        };
+        let chord = Chord::pressed(key, physical, modifiers)?;
+        self.keys?.action(&chord, context)
     }
 
     /// Whether a click picks the brush up rather than paints: with the
@@ -4491,6 +4593,7 @@ mod tests {
             tool: Tool::Shape,
             proportional: None,
             clipboard: None,
+            keys: Some(crate::keys::defaults()),
             deadline: Cell::new(None),
         }
     }
@@ -5121,6 +5224,72 @@ mod tests {
         );
         let lit = editor.lit(&state, pending);
         assert!(lit.contains(&Guide::Middle { a: 0, b: 1 }), "{lit:?}");
+    }
+
+    #[test]
+    fn guides_go_with_the_drag_they_came_up_in() {
+        let doc = one();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let shift = |m| Event::Keyboard(keyboard::Event::ModifiersChanged(m));
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 100.0);
+        run(&editor, &mut state, Event::Mouse(PRESS), 200.0, 100.0);
+        run(
+            &editor,
+            &mut state,
+            shift(keyboard::Modifiers::SHIFT),
+            200.0,
+            100.0,
+        );
+        run(&editor, &mut state, Event::Mouse(MOVE), 205.0, 60.0);
+        assert!(!state.near_guides.is_empty());
+        run(&editor, &mut state, Event::Mouse(RELEASE), 205.0, 60.0);
+        run(
+            &editor,
+            &mut state,
+            shift(keyboard::Modifiers::empty()),
+            205.0,
+            60.0,
+        );
+        assert!(state.near_guides.is_empty() && state.guides.is_empty());
+    }
+
+    #[test]
+    fn with_shift_a_new_triangle_lines_up_too() {
+        let doc = one();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let shift = |m| Event::Keyboard(keyboard::Event::ModifiersChanged(m));
+        let create = |to: (f32, f32)| {
+            let mut state = State::default();
+            run(&editor, &mut state, Event::Mouse(MOVE), 500.0, 400.0);
+            run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
+            run(
+                &editor,
+                &mut state,
+                shift(keyboard::Modifiers::SHIFT),
+                500.0,
+                400.0,
+            );
+            run(&editor, &mut state, Event::Mouse(MOVE), to.0, to.1);
+            let Interaction::Creating { to, .. } = state.interaction else {
+                panic!("{:?}", state.interaction);
+            };
+            (to, state)
+        };
+
+        // Level with where it started: its base level.
+        let (to, state) = create((600.0, 404.0));
+        assert_eq!(to, Point::new(600.0, 400.0));
+        let lit = editor.lit(&state, state.pending.as_ref().unwrap());
+        assert!(lit.contains(&Guide::Axis {
+            at: Point::new(500.0, 400.0),
+            upright: false
+        }));
+        // Upright under corner 1 (300, 300) of the triangle there.
+        let (to, _) = create((303.0, 450.0));
+        assert_eq!(to, Point::new(300.0, 450.0));
     }
 
     #[test]
@@ -6502,6 +6671,7 @@ mod bench {
                     tool: Tool::Shape,
                     proportional: None,
                     clipboard: None,
+                    keys: Some(crate::keys::defaults()),
                     deadline: Cell::new(None),
                 };
                 let run = |f: &dyn Fn(&Editor)| {

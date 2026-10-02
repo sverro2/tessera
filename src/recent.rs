@@ -64,15 +64,20 @@ impl Recent {
     }
 }
 
-/// Where the list is kept: in `$XDG_CONFIG_HOME`, else `~/.config` (or,
-/// on Windows, `%APPDATA%`).
+/// Where the list is kept.
 fn config_file() -> Option<PathBuf> {
+    Some(config_folder()?.join("recent.json"))
+}
+
+/// Tessera's config folder: in `$XDG_CONFIG_HOME`, else `~/.config` (or,
+/// on Windows, `%APPDATA%`).
+pub fn config_folder() -> Option<PathBuf> {
     let folder = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|folder| !folder.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))?;
-    Some(folder.join("tessera").join("recent.json"))
+    Some(folder.join("tessera"))
 }
 
 #[cfg(test)]

@@ -13,7 +13,9 @@ const PADDING: f32 = 10.0;
 /// How wide unpainted edges are drawn.
 const PLAIN_EDGE: f32 = 1.5;
 
-pub fn export(layers: &Layers) -> String {
+/// The area exported: around everything drawn (mirrored too), with some
+/// room; its top left corner and size (world units, a pixel each).
+pub fn area(layers: &Layers) -> (iced::Point, iced::Size) {
     let bounds = layers
         .layers()
         .iter()
@@ -25,11 +27,16 @@ pub fn export(layers: &Layers) -> String {
             )
         });
     let (min, max) = bounds.unwrap_or((iced::Point::ORIGIN, iced::Point::ORIGIN));
+    (
+        iced::Point::new(min.x - PADDING, min.y - PADDING),
+        iced::Size::new(max.x - min.x + 2.0 * PADDING, max.y - min.y + 2.0 * PADDING),
+    )
+}
 
-    let x = min.x - PADDING;
-    let y = min.y - PADDING;
-    let width = max.x - min.x + 2.0 * PADDING;
-    let height = max.y - min.y + 2.0 * PADDING;
+pub fn export(layers: &Layers) -> String {
+    let (corner, size) = area(layers);
+    let (x, y) = (corner.x, corner.y);
+    let (width, height) = (size.width, size.height);
 
     let mut svg = String::new();
 

@@ -8,8 +8,10 @@ mod file;
 mod geometry;
 mod icons;
 mod joints;
+mod keys;
 mod layers;
 mod paint;
+mod raster;
 mod recent;
 mod svg;
 mod wheel;
@@ -30,6 +32,7 @@ use background::Background;
 use camera::Camera;
 use document::{Document, Edit};
 use editor::Tool;
+use keys::{Action, Chord, Context, Keymap};
 use layers::{Layers, NodeId, Place, Signature};
 use paint::{Brush, Hsv, Target};
 
@@ -152,6 +155,18 @@ struct Tessera {
     placing_mirror: bool,
     /// What was copied (Ctrl+C), to paste on any layer (Ctrl+V).
     clipboard: Option<document::Piece>,
+    /// Which keys do what (kept in the config folder).
+    keys: Keymap,
+    /// Exporting a PNG: its dialog open, and how large and on what (as last
+    /// chosen).
+    png_open: bool,
+    png_scale: f32,
+    png_backdrop: raster::Backdrop,
+    /// The keyboard shortcuts shown (F1); and one being set: the next key
+    /// pressed goes to this action (instead of its key at that place, or
+    /// as another).
+    keys_open: bool,
+    rebinding: Option<(Action, Option<usize>)>,
     /// The modifier keys held (Shift turns painting a layer into painting
     /// all layers).
     modifiers: keyboard::Modifiers,
@@ -254,6 +269,16 @@ enum Message {
     EdgeWidth(f32),
     /// Turns proportional editing on or off (O).
     ToggleProportional,
+    /// Shows the keyboard shortcuts (F1), or closes them.
+    ShowKeys(bool),
+    /// Sets a key for an action: the next one pressed, instead of its key
+    /// at that place (else as another); `None` stops.
+    Rebind(Option<(Action, Option<usize>)>),
+    /// Takes an action's key (at that place) away.
+    Unbind(Action, usize),
+    /// An action's keys back to out of the box; or all of them.
+    ResetKey(Action),
+    ResetKeys,
     /// Starts placing a mirror on the current layer (Ctrl+M), or stops.
     PlaceMirror(bool),
     /// Makes the current layer's mirror image actual geometry.
@@ -283,6 +308,13 @@ enum Message {
     Undo,
     Redo,
     ExportSvg,
+    /// Opens the PNG export's dialog, or closes it.
+    ShowExportPng(bool),
+    /// How large the PNG is (pixels to a unit), and on what.
+    PngScale(f32),
+    PngBackdrop(raster::Backdrop),
+    /// Exports the PNG as chosen: asks where.
+    ExportPng,
     ResetView,
     /// Show (`true`) or close the about box.
     About(bool),
@@ -634,6 +666,8 @@ impl Tessera {
             hsv: Hsv::from_color(color, 0.0),
             edge_width: 2.0,
             reach: 100.0,
+            keys: Keymap::load(),
+            png_scale: 2.0,
             brush,
             recent_files: recent::Recent::load(),
             ..Tessera::default()
@@ -713,7 +747,7 @@ impl Tessera {
                     Mode::Shape => Mode::Paint,
                     Mode::Paint => Mode::Shape,
                 };
-                return Task::done(Message::SetMode(mode));
+                return self.update(Message::SetMode(mode));
             }
             Message::PickBrush(brush) => {
                 self.set_brush(brush);
@@ -885,6 +919,32 @@ impl Tessera {
                 self.push_undo(before);
                 return Task::none();
             }
+            Message::ShowKeys(open) => {
+                self.keys_open = open;
+                self.rebinding = None;
+                self.menu = None;
+                return Task::none();
+            }
+            Message::Rebind(rebinding) => {
+                self.rebinding = rebinding;
+                return Task::none();
+            }
+            Message::Unbind(action, index) => {
+                self.keys.unbind(action, index);
+                self.rebinding = None;
+                return Task::none();
+            }
+            Message::ResetKey(action) => {
+                self.keys.reset(action);
+                self.rebinding = None;
+                return Task::none();
+            }
+            Message::ResetKeys => {
+                self.keys.reset_all();
+                self.rebinding = None;
+                self.notify("All shortcuts back to their defaults".into(), false);
+                return Task::none();
+            }
             Message::ToggleProportional => {
                 self.proportional = !self.proportional;
                 return Task::none();
@@ -1049,6 +1109,27 @@ impl Tessera {
                 let svg = svg::export(&self.layers);
                 return Task::perform(save_svg(svg), Message::Exported);
             }
+            Message::ShowExportPng(open) => {
+                self.menu = None;
+                self.png_open = open;
+                return Task::none();
+            }
+            Message::PngScale(scale) => {
+                self.png_scale = scale;
+                return Task::none();
+            }
+            Message::PngBackdrop(backdrop) => {
+                self.png_backdrop = backdrop;
+                return Task::none();
+            }
+            Message::ExportPng => {
+                self.png_open = false;
+                let svg = svg::export(&self.layers);
+                return Task::perform(
+                    save_png(svg, self.png_scale.max(0.1), self.png_backdrop),
+                    Message::Exported,
+                );
+            }
             Message::Exported(result) => {
                 match result {
                     Ok(Some(path)) => {
@@ -1067,43 +1148,65 @@ impl Tessera {
                 modifiers,
                 ..
             }) => {
-                if key == Key::Named(keyboard::key::Named::Escape) {
+                let escape = key == Key::Named(keyboard::key::Named::Escape);
+                // Setting a key: the next one pressed (Esc: never mind).
+                if let Some((action, index)) = self.rebinding {
+                    if escape {
+                        self.rebinding = None;
+                    } else if let Some(chord) = Chord::pressed(&key, physical_key, modifiers) {
+                        self.rebinding = None;
+                        let taken = self.keys.bind(action, index, chord.clone());
+                        if !taken.is_empty() {
+                            let from: Vec<_> = taken.iter().map(|a| a.label()).collect();
+                            self.notify(
+                                format!("{chord} was taken from: {}", from.join(", ")),
+                                false,
+                            );
+                        }
+                    }
+                    return Task::none();
+                }
+                if escape {
                     self.menu = None;
                     self.confirming = None;
                     self.about = false;
+                    self.keys_open = false;
+                    self.png_open = false;
                     self.editing_background = false;
                     self.picking = false;
                     self.placing_mirror = false;
                     return Task::none();
                 }
-                if self.confirming.is_some() || self.about {
+                if self.confirming.is_some() || self.about || self.keys_open || self.png_open {
                     return Task::none();
                 }
-                if !modifiers.command() {
-                    if key == Key::Named(keyboard::key::Named::Tab) {
-                        return Task::done(Message::ToggleMode);
-                    }
-                    let message = match key.to_latin(physical_key) {
-                        Some('f') if self.mode == Mode::Paint => Message::SetTarget(Target::Faces),
-                        Some('e') if self.mode == Mode::Paint => Message::SetTarget(Target::Edges),
-                        Some('i') => Message::TogglePicking,
-                        Some('o') if self.mode == Mode::Shape => Message::ToggleProportional,
-                        _ => return Task::none(),
-                    };
-                    return Task::done(message);
-                }
-                let message = match key.to_latin(physical_key) {
-                    Some('n') => Message::New,
-                    Some('m') => Message::PlaceMirror(!self.placing_mirror),
-                    Some('o') => Message::Open,
-                    Some('s') if modifiers.shift() => Message::SaveAs,
-                    Some('s') => Message::Save,
-                    Some('z') if modifiers.shift() => Message::Redo,
-                    Some('z') => Message::Undo,
-                    Some('y') => Message::Redo,
+                let context = match self.mode {
+                    Mode::Shape => Context::Shape,
+                    Mode::Paint => Context::Paint,
+                };
+                let Some(action) = Chord::pressed(&key, physical_key, modifiers)
+                    .and_then(|chord| self.keys.action(&chord, context))
+                else {
+                    return Task::none();
+                };
+                // The rest are the canvas's.
+                let message = match action {
+                    Action::ToggleMode => Message::ToggleMode,
+                    Action::New => Message::New,
+                    Action::Open => Message::Open,
+                    Action::Save => Message::Save,
+                    Action::SaveAs => Message::SaveAs,
+                    Action::Undo => Message::Undo,
+                    Action::Redo => Message::Redo,
+                    Action::Mirror => Message::PlaceMirror(!self.placing_mirror),
+                    Action::ShowKeys => Message::ShowKeys(true),
+                    Action::Proportional => Message::ToggleProportional,
+                    Action::PaintFaces => Message::SetTarget(Target::Faces),
+                    Action::PaintEdges => Message::SetTarget(Target::Edges),
+                    Action::Pipette => Message::TogglePicking,
                     _ => return Task::none(),
                 };
-                return Task::done(message);
+                return self.update(message);
             }
             Message::Key(keyboard::Event::ModifiersChanged(modifiers)) => {
                 self.modifiers = modifiers;
@@ -1330,11 +1433,7 @@ impl Tessera {
             menu_button("Help", Menu::Help),
             self.mode_switch(),
             space::horizontal(),
-            text(match self.mode {
-                Mode::Shape => "Tab: paint · Drag corner: move (Shift: line up) · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri (or selection) · Ctrl+drag: lasso · Shift+click: (de)select vertex · Ctrl+L: select shape · Ctrl+C/X/V: copy/cut/paste · Drag/G: move selection · R: rotate · T: scale · O: proportional · Alt+move: its reach · Esc: deselect · Ctrl+M: mirror · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
-                Mode::Paint => "Tab: shape · F/E: faces/edges · Click or drag: paint · I/Ctrl+click: pick · Alt+move: edge width · C+move: lighter/darker · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
-            })
-            .size(12),
+            text(self.hint()).size(12),
         ]
         .spacing(10)
         .padding([2, 8])
@@ -1377,9 +1476,13 @@ impl Tessera {
                     self.camera,
                     &self.caches,
                     self.background.as_ref(),
-                    self.tool(),
-                    self.proportional.then_some(self.reach),
-                    self.clipboard.as_ref(),
+                    editor::Settings {
+                        tool: self.tool(),
+                        proportional: self.proportional.then_some(self.reach),
+                        clipboard: self.clipboard.as_ref(),
+                        // Not while they're being looked up (or set).
+                        keys: (!self.keys_open).then_some(&self.keys),
+                    },
                 )
             }
             .map(Message::Editor),
@@ -1414,6 +1517,12 @@ impl Tessera {
         }
         if self.about {
             screen = screen.push(self.about_box());
+        }
+        if self.keys_open {
+            screen = screen.push(self.shortcuts());
+        }
+        if self.png_open {
+            screen = screen.push(self.png_dialog());
         }
         if self.confirming.is_some() {
             screen = screen.push(self.confirmation());
@@ -2127,7 +2236,7 @@ impl Tessera {
     /// The open menu's items, below its button; clicking anywhere else
     /// (but another menu's button) closes it.
     fn dropdown(&self, menu: Menu) -> Element<'_, Message> {
-        let item = |label, shortcut, message: Option<Message>| {
+        let item = |label, shortcut: String, message: Option<Message>| {
             button(
                 row![
                     text(label).size(14),
@@ -2146,8 +2255,12 @@ impl Tessera {
         let (offset, items) = match menu {
             Menu::File => {
                 let mut items = column![
-                    item("New", "Ctrl+N", has_content.then_some(Message::New)),
-                    item("Open…", "Ctrl+O", Some(Message::Open)),
+                    item(
+                        "New",
+                        self.keys.first(Action::New),
+                        has_content.then_some(Message::New)
+                    ),
+                    item("Open…", self.keys.first(Action::Open), Some(Message::Open)),
                 ];
                 // The recent files: their names, their folders dimmed.
                 let recent = self.recent_files.paths();
@@ -2186,18 +2299,35 @@ impl Tessera {
                             .on_press(Message::OpenRecent(path.clone())),
                         );
                     }
-                    items = items.push(item("Clear recent", "", Some(Message::ClearRecent)));
+                    items = items.push(item(
+                        "Clear recent",
+                        String::new(),
+                        Some(Message::ClearRecent),
+                    ));
                     items = items.push(iced::widget::rule::horizontal(1));
                 }
                 (
                     0.0,
                     items
-                        .push(item("Save", "Ctrl+S", Some(Message::Save)))
-                        .push(item("Save As…", "Ctrl+Shift+S", Some(Message::SaveAs)))
+                        .push(item(
+                            "Save",
+                            self.keys.first(Action::Save),
+                            Some(Message::Save),
+                        ))
+                        .push(item(
+                            "Save As…",
+                            self.keys.first(Action::SaveAs),
+                            Some(Message::SaveAs),
+                        ))
                         .push(item(
                             "Export SVG…",
-                            "",
+                            String::new(),
                             has_content.then_some(Message::ExportSvg),
+                        ))
+                        .push(item(
+                            "Export PNG…",
+                            String::new(),
+                            has_content.then_some(Message::ShowExportPng(true)),
                         )),
                 )
             }
@@ -2206,23 +2336,30 @@ impl Tessera {
                 column![
                     item(
                         "Undo",
-                        "Ctrl+Z",
+                        self.keys.first(Action::Undo),
                         (!self.undo.is_empty()).then_some(Message::Undo)
                     ),
                     item(
                         "Redo",
-                        "Ctrl+Shift+Z",
+                        self.keys.first(Action::Redo),
                         (!self.redo.is_empty()).then_some(Message::Redo)
                     ),
                 ],
             ),
             Menu::View => (
                 2.0 * (MENU_WIDTH + 10.0),
-                column![item("Reset view", "", Some(Message::ResetView))],
+                column![item("Reset view", String::new(), Some(Message::ResetView))],
             ),
             Menu::Help => (
                 3.0 * (MENU_WIDTH + 10.0),
-                column![item("About Tessera…", "", Some(Message::About(true)))],
+                column![
+                    item(
+                        "Keyboard shortcuts…",
+                        self.keys.first(Action::ShowKeys),
+                        Some(Message::ShowKeys(true))
+                    ),
+                    item("About Tessera…", String::new(), Some(Message::About(true))),
+                ],
             ),
         };
 
@@ -2250,6 +2387,241 @@ impl Tessera {
     /// Asks what to do with unsaved changes, over the dimmed window.
     /// What Tessera is, its version, and whose work it builds on (with
     /// their licences).
+    /// Exporting a PNG: how large (with its size in pixels) and on what,
+    /// then where.
+    fn png_dialog(&self) -> Element<'_, Message> {
+        let small = |label: String| text(label).size(13);
+        let (_, area) = svg::area(&self.layers);
+        let (width, height) = raster::pixels(area.width, area.height, self.png_scale);
+        let fits = width <= raster::MAX_SIDE && height <= raster::MAX_SIDE;
+        let scales: Vec<_> = [1.0, 2.0, 4.0, 8.0]
+            .into_iter()
+            .map(|scale| {
+                (
+                    match scale {
+                        1.0 => "1×",
+                        2.0 => "2×",
+                        4.0 => "4×",
+                        _ => "8×",
+                    },
+                    self.png_scale == scale,
+                    Message::PngScale(scale),
+                )
+            })
+            .collect();
+        let backdrops: Vec<_> = raster::Backdrop::ALL
+            .into_iter()
+            .map(|backdrop| {
+                (
+                    backdrop.label(),
+                    self.png_backdrop == backdrop,
+                    Message::PngBackdrop(backdrop),
+                )
+            })
+            .collect();
+        let size = if fits {
+            text(format!("{width} × {height} pixels"))
+                .size(12)
+                .style(text::secondary)
+        } else {
+            text(format!("{width} × {height} pixels: too large"))
+                .size(12)
+                .style(text::danger)
+        };
+
+        let dialog = container(
+            column![
+                text("Export PNG").size(20),
+                row![small("Size".into()).width(80), joined(scales), size]
+                    .spacing(10)
+                    .align_y(Center),
+                row![small("Background".into()).width(80), joined(backdrops)]
+                    .spacing(10)
+                    .align_y(Center),
+                text("Hidden layers are left out, as in the SVG.")
+                    .size(12)
+                    .style(text::secondary),
+                row![
+                    space::horizontal(),
+                    button("Cancel")
+                        .style(button::secondary)
+                        .on_press(Message::ShowExportPng(false)),
+                    button("Export…").on_press_maybe(fits.then_some(Message::ExportPng)),
+                ]
+                .spacing(8),
+            ]
+            .spacing(14)
+            .width(440),
+        )
+        .padding(20)
+        .style(container::bordered_box);
+
+        let backdrop = center(opaque(dialog)).style(|_| {
+            container::Style::default().background(Color {
+                a: 0.5,
+                ..Color::BLACK
+            })
+        });
+        opaque(mouse_area(backdrop).on_press(Message::ShowExportPng(false)))
+    }
+
+    /// The status bar's hint: the most used keys in the mode, as set.
+    fn hint(&self) -> String {
+        let key = |action| self.keys.first(action);
+        match self.mode {
+            Mode::Shape => format!(
+                "{}: paint · Drag corner: move (Shift: line up) · Drag edge: extend · \
+                 Drag blank: new tri · {}: cut edge · {}: delete · Ctrl+drag: lasso · \
+                 {}/{}/{}: grab/rotate/scale · {}: proportional · {}: mirror · \
+                 Middle-drag: pan · Wheel: zoom · {}: all shortcuts",
+                key(Action::ToggleMode),
+                key(Action::CutEdge),
+                key(Action::Delete),
+                key(Action::Grab),
+                key(Action::Rotate),
+                key(Action::Scale),
+                key(Action::Proportional),
+                key(Action::Mirror),
+                key(Action::ShowKeys),
+            ),
+            Mode::Paint => format!(
+                "{}: shape · {}/{}: faces/edges · Click or drag: paint · \
+                 {}/Ctrl+click: pick · Alt+move: edge width · {}+move: lighter/darker · \
+                 Middle-drag: pan · Wheel: zoom · {}: all shortcuts",
+                key(Action::ToggleMode),
+                key(Action::PaintFaces),
+                key(Action::PaintEdges),
+                key(Action::Pipette),
+                key(Action::Lightness),
+                key(Action::ShowKeys),
+            ),
+        }
+    }
+
+    /// The keyboard shortcuts, by where they work, to look up and to set:
+    /// click a key, then press the new one; add one; take one away; back
+    /// to the defaults. What the mouse does with keys held is listed too,
+    /// fixed.
+    fn shortcuts(&self) -> Element<'_, Message> {
+        let small = |label: String| text(label).size(13);
+        let tip = |label: String| {
+            container(text(label).size(12))
+                .padding([4, 8])
+                .style(container::dark)
+        };
+        let waiting = || text("Press a key…").size(12);
+
+        let mut sections = column![].spacing(16);
+        for context in Context::ALL {
+            let mut rows = column![text(context.label()).size(16)].spacing(6);
+            for action in Action::ALL.into_iter().filter(|a| a.context() == context) {
+                let mut keys = row![].spacing(6).align_y(Center);
+                for (i, chord) in self.keys.keys(action).iter().enumerate() {
+                    let setting = self.rebinding == Some((action, Some(i)));
+                    let label = if setting {
+                        waiting()
+                    } else {
+                        text(chord.to_string()).size(12)
+                    };
+                    keys = keys.push(
+                        row![
+                            button(label)
+                                .padding([2, 8])
+                                .style(if setting {
+                                    button::primary
+                                } else {
+                                    button::secondary
+                                })
+                                .on_press(Message::Rebind(Some((action, Some(i))))),
+                            button(text("×").size(12))
+                                .padding([2, 6])
+                                .style(button::text)
+                                .on_press(Message::Unbind(action, i)),
+                        ]
+                        .align_y(Center),
+                    );
+                }
+                let adding = self.rebinding == Some((action, None));
+                keys = keys.push(tooltip(
+                    button(if adding {
+                        waiting()
+                    } else {
+                        text("+").size(12)
+                    })
+                    .padding([2, 8])
+                    .style(if adding {
+                        button::primary
+                    } else {
+                        button::text
+                    })
+                    .on_press(Message::Rebind(Some((action, None)))),
+                    tip("Add a key".into()),
+                    tooltip::Position::Bottom,
+                ));
+                if !self.keys.is_default(action) {
+                    keys = keys.push(tooltip(
+                        button(text("Default").size(11))
+                            .padding([2, 6])
+                            .style(button::text)
+                            .on_press(Message::ResetKey(action)),
+                        tip(format!("Back to {}", action_defaults(action))),
+                        tooltip::Position::Bottom,
+                    ));
+                }
+                rows = rows.push(
+                    row![small(action.label().into()).width(280), keys]
+                        .spacing(8)
+                        .align_y(Center),
+                );
+            }
+            for (_, keys, what) in keys::GESTURES.iter().filter(|g| g.0 == context) {
+                rows = rows.push(
+                    row![
+                        small((*what).into()).width(280),
+                        text(*keys).size(12).style(text::secondary),
+                    ]
+                    .spacing(8)
+                    .align_y(Center),
+                );
+            }
+            sections = sections.push(rows);
+        }
+
+        let dialog = container(
+            column![
+                text("Keyboard shortcuts").size(22),
+                text(
+                    "Click a key to change it, then press the new one (Esc: never mind). \
+                     The mouse with keys held (in grey) can't be changed. Kept in your \
+                     config folder, in tessera/keys.json."
+                )
+                .size(12)
+                .style(text::secondary),
+                scrollable(sections).height(440),
+                row![
+                    button(text("Reset all to defaults").size(13))
+                        .style(button::secondary)
+                        .on_press(Message::ResetKeys),
+                    space::horizontal(),
+                    button("Close").on_press(Message::ShowKeys(false)),
+                ]
+                .align_y(Center),
+            ]
+            .spacing(12)
+            .width(620),
+        )
+        .padding(20)
+        .style(container::bordered_box);
+
+        let backdrop = center(opaque(dialog)).style(|_| {
+            container::Style::default().background(Color {
+                a: 0.5,
+                ..Color::BLACK
+            })
+        });
+        opaque(mouse_area(backdrop).on_press(Message::ShowKeys(false)))
+    }
+
     fn about_box(&self) -> Element<'_, Message> {
         let dialog = container(
             column![
@@ -2351,6 +2723,17 @@ fn scene_layer(layer: &layers::Layer) -> editor::SceneLayer<'_> {
         crossfade: layer.crossfade,
         show_edges: layer.show_edges,
         mirrors: layer.mirror.as_slice(),
+    }
+}
+
+/// An action's keys out of the box, written out.
+fn action_defaults(action: Action) -> String {
+    let keys = Keymap::default();
+    let chords: Vec<_> = keys.keys(action).iter().map(ToString::to_string).collect();
+    if chords.is_empty() {
+        "no key".into()
+    } else {
+        chords.join(", ")
     }
 }
 
@@ -2479,6 +2862,34 @@ async fn save_svg(svg: String) -> Result<Option<PathBuf>, String> {
 
     let path = file.path().to_path_buf();
     std::fs::write(&path, svg).map_err(|e| e.to_string())?;
+
+    Ok(Some(path))
+}
+
+/// Asks where to save a PNG of `svg` (`scale` pixels to its unit, on
+/// `backdrop`), and saves it there; rasterised on a thread of its own, so a
+/// large one doesn't hold the window up.
+async fn save_png(
+    svg: String,
+    scale: f32,
+    backdrop: raster::Backdrop,
+) -> Result<Option<PathBuf>, String> {
+    let Some(file) = rfd::AsyncFileDialog::new()
+        .add_filter("PNG", &["png"])
+        .set_file_name("tessera.png")
+        .save_file()
+        .await
+    else {
+        return Ok(None);
+    };
+    let path = file.path().to_path_buf();
+
+    let (done, png) = iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(raster::png(&svg, scale, backdrop));
+    });
+    let png = png.await.map_err(|_| "rasterising stopped".to_string())??;
+    std::fs::write(&path, png).map_err(|e| e.to_string())?;
 
     Ok(Some(path))
 }
@@ -2835,6 +3246,54 @@ mod tests {
         let _ = app.update(Message::Undo);
         assert_eq!(app.document().triangle_ids().len(), faces);
         assert_eq!(app.layers.layer(current).unwrap().mirror, Some(mirror));
+    }
+
+    #[test]
+    fn keys_are_looked_up_and_set() {
+        let mut app = Tessera::new();
+        let press = |app: &mut Tessera, key: Key, modifiers| {
+            let _ = app.update(Message::Key(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: None,
+                repeat: false,
+            }));
+        };
+        let none = keyboard::Modifiers::empty();
+        let letter = |c: &str| Key::Character(c.into());
+
+        press(&mut app, Key::Named(keyboard::key::Named::F1), none);
+        assert!(app.keys_open);
+        // While they're open, keys don't do what they do.
+        press(&mut app, Key::Named(keyboard::key::Named::Tab), none);
+        assert_eq!(app.mode, Mode::Shape);
+
+        // Switching modes on Q instead of Tab.
+        let _ = app.update(Message::Rebind(Some((Action::ToggleMode, Some(0)))));
+        press(&mut app, letter("q"), none);
+        assert_eq!(app.rebinding, None);
+        assert_eq!(app.keys.first(Action::ToggleMode), "Q");
+        // Esc while setting one: never mind; then closes.
+        let _ = app.update(Message::Rebind(Some((Action::ToggleMode, None))));
+        press(&mut app, Key::Named(keyboard::key::Named::Escape), none);
+        assert!(app.keys_open);
+        assert_eq!(app.keys.keys(Action::ToggleMode).len(), 1);
+        press(&mut app, Key::Named(keyboard::key::Named::Escape), none);
+        assert!(!app.keys_open);
+
+        // Now Q switches, Tab doesn't.
+        press(&mut app, Key::Named(keyboard::key::Named::Tab), none);
+        assert_eq!(app.mode, Mode::Shape);
+        press(&mut app, letter("q"), none);
+        assert_eq!(app.mode, Mode::Paint);
+
+        let _ = app.update(Message::ResetKeys);
+        assert_eq!(app.keys, Keymap::default());
     }
 
     #[test]

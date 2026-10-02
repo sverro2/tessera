@@ -3778,6 +3778,7 @@ dependencies = [
  "iced",
  "image",
  "rayon",
+ "resvg",
  "rfd",
  "serde",
  "serde_json",
