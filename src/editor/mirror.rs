@@ -76,6 +76,7 @@ impl Editor<'_> {
             proportional: self.proportional,
             clipboard: self.clipboard,
             keys: self.keys,
+            lit: self.lit.clone(),
             deadline: self.deadline.clone(),
         })
     }

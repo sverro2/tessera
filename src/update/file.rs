@@ -112,6 +112,16 @@ impl Tessera {
                     self.background_version += 1;
                     self.saved_background = self.background_version;
                     self.refresh_fields();
+                    // Where the user left off there, if remembered.
+                    if let Some(place) = self.places.get(&path) {
+                        if let Some(camera) = place.camera() {
+                            self.camera = camera;
+                        }
+                        if let Some(layer) = self.layers.layers().get(place.layer) {
+                            self.current = layer.id;
+                            self.selected = layer.id;
+                        }
+                    }
                     self.recent_files.add(path.clone());
                     self.path = Some(path);
                     self.notify(format!("Opened {}", self.name()), false);
@@ -140,6 +150,7 @@ impl Tessera {
                     Ok(Some(path)) => {
                         self.recent_files.add(path.clone());
                         self.path = Some(path);
+                        self.remember_place();
                         self.notify(format!("Saved {}", self.name()), false);
                         self.saved = Some(versions.layers);
                         self.saved_background = versions.background;

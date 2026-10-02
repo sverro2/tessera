@@ -412,36 +412,46 @@ impl Tessera {
             };
             let editing = id == current;
             let into = place == Some(Place::Into(id));
-            let content = container(
-                row![space().width(row.depth as f32 * 14.0), expander, eye, name,]
-                    .spacing(2)
-                    .align_y(Center),
-            )
-            .width(Fill)
-            .height(LAYER_ROW - 4.0)
-            .padding([0, 4])
-            .align_y(Center)
-            .style(move |theme: &Theme| {
-                let palette = theme.palette();
-                // Dropping in, selected, or else the layer being edited.
-                let (background, text) = if into || selected {
-                    (palette.primary.weak.color, palette.primary.weak.text)
-                } else if editing {
-                    (palette.background.weak.color, palette.background.weak.text)
-                } else {
-                    return container::Style::default();
-                };
-                container::Style {
-                    background: Some(background.into()),
-                    text_color: Some(text),
-                    border: iced::Border {
-                        radius: 3.0.into(),
-                        color: palette.primary.base.color,
-                        width: if into { 1.5 } else { 0.0 },
-                    },
-                    ..container::Style::default()
-                }
+            // Nothing drawn on it (or in it, a group): said so.
+            let empty = self.layers.layers_of(id).iter().all(|&layer| {
+                self.layers
+                    .layer(layer)
+                    .is_none_or(|layer| layer.document.is_empty())
             });
+            let mut line = row![space().width(row.depth as f32 * 14.0), expander, eye, name]
+                .spacing(2)
+                .align_y(Center);
+            if empty && self.naming != Some(id) {
+                line = line
+                    .push(space::horizontal())
+                    .push(text("empty").size(11).style(text::secondary));
+            }
+            let content = container(line)
+                .width(Fill)
+                .height(LAYER_ROW - 4.0)
+                .padding([0, 4])
+                .align_y(Center)
+                .style(move |theme: &Theme| {
+                    let palette = theme.palette();
+                    // Dropping in, selected, or else the layer being edited.
+                    let (background, text) = if into || selected {
+                        (palette.primary.weak.color, palette.primary.weak.text)
+                    } else if editing {
+                        (palette.background.weak.color, palette.background.weak.text)
+                    } else {
+                        return container::Style::default();
+                    };
+                    container::Style {
+                        background: Some(background.into()),
+                        text_color: Some(text),
+                        border: iced::Border {
+                            radius: 3.0.into(),
+                            color: palette.primary.base.color,
+                            width: if into { 1.5 } else { 0.0 },
+                        },
+                        ..container::Style::default()
+                    }
+                });
             // Where dropping would put it: a line above or below.
             let marker = |shown: bool| {
                 container(space().height(2))
@@ -458,7 +468,9 @@ impl Tessera {
             ];
             let mut area = mouse_area(line)
                 .on_press(Message::Layers(Press(id)))
-                .on_double_click(Message::Layers(StartRename(id)));
+                .on_double_click(Message::Layers(StartRename(id)))
+                .on_enter(Message::Layers(Point(id)))
+                .on_exit(Message::Layers(Unpoint(id)));
             if dragged.is_some() {
                 area = area.on_move(move |p| Message::Layers(Hover(id, p.y / LAYER_ROW)));
             }

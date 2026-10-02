@@ -14,6 +14,7 @@ mod keys;
 mod layers;
 mod paint;
 mod panels;
+mod places;
 mod raster;
 mod recent;
 mod svg;
@@ -102,6 +103,9 @@ struct Tessera {
     /// A layer or group being dragged in the layers panel, and where
     /// dropping it would put it.
     dragging: Option<(NodeId, Option<Place>)>,
+    /// The layer (or group) pointed at in the layers panel: lit up on the
+    /// canvas.
+    pointed_layer: Option<NodeId>,
     /// The layers as they were before each change, most recent last; and
     /// as they were before each undo. Unchanged drawings are shared.
     undo: Vec<Layers>,
@@ -144,6 +148,8 @@ struct Tessera {
     brush: Brush,
     /// Files opened or saved lately, most recent first.
     recent_files: recent::Recent,
+    /// Where the user left off in each file lately.
+    places: places::Places,
     /// Colours painted with lately, most recent first.
     recent: Vec<Color>,
     /// The paint panel's colour field: as typed, or the colour picked.
@@ -468,6 +474,7 @@ impl Tessera {
             png_scale: 2.0,
             brush,
             recent_files: recent::Recent::load(),
+            places: places::Places::load(),
             ..Tessera::default()
         }
     }
@@ -686,12 +693,31 @@ impl Tessera {
 
     /// Does `replace`, first asking what to do with unsaved changes.
     fn replace(&mut self, replace: Replace) -> Task<Message> {
+        // Leaving this file (unless that's cancelled): where the user was.
+        self.remember_place();
         if self.is_unsaved() {
             self.confirming = Some(replace);
             Task::none()
         } else {
             Task::done(Message::File(FileMessage::Replace(replace)))
         }
+    }
+
+    /// Remembers where the user is in the file (the current layer, the
+    /// view), for opening it again; if it's a file.
+    fn remember_place(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let current = self.current();
+        let layer = self
+            .layers
+            .layers()
+            .iter()
+            .position(|layer| layer.id == current)
+            .unwrap_or(0);
+        self.places
+            .remember(path, places::Place::new(layer, self.camera));
     }
 
     /// Saves to where the document came from, or (if `choose`, or it never
@@ -784,6 +810,13 @@ impl Tessera {
                         clipboard: self.clipboard.as_ref(),
                         // Not while they're being looked up (or set).
                         keys: (!self.keys_open).then_some(&self.keys),
+                        lit: self
+                            .pointed_layer
+                            .map(|id| self.layers.layers_of(id))
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|&id| self.layers.shown(id))
+                            .collect(),
                     },
                 )
             }
@@ -1027,6 +1060,56 @@ mod tests {
         let _ = app.update(Message::Undo);
         let _ = app.update(Message::Undo);
         assert_eq!(app.layers.layers().len(), 1);
+    }
+
+    #[test]
+    fn pointing_at_a_layer_lights_it_up_until_off_it() {
+        let mut app = Tessera::default();
+        let back = app.current();
+        let _ = app.update(Message::Layers(LayerAction::Add));
+        let front = app.current();
+        let before = app.layers.signature();
+
+        let _ = app.update(Message::Layers(LayerAction::Point(back)));
+        assert_eq!(app.pointed_layer, Some(back));
+        // Onto the next line before off the last: the next one stays.
+        let _ = app.update(Message::Layers(LayerAction::Point(front)));
+        let _ = app.update(Message::Layers(LayerAction::Unpoint(back)));
+        assert_eq!(app.pointed_layer, Some(front));
+        let _ = app.update(Message::Layers(LayerAction::Unpoint(front)));
+        assert_eq!(app.pointed_layer, None);
+        // Not a change (nothing to undo).
+        assert_eq!(app.layers.signature(), before);
+        assert_eq!(app.undo.len(), 1);
+    }
+
+    #[test]
+    fn opening_a_file_again_picks_up_where_it_was_left() {
+        let mut app = Tessera::new();
+        edit(&mut app, 0.0);
+        let _ = app.update(Message::Layers(LayerAction::Add));
+        let text = file::save(&app.layers, app.camera, &app.backgrounds);
+        let path = PathBuf::from("/drawings/flower.tessera");
+        let _ = app.update(Message::File(FileMessage::Opened(Ok(Some((
+            path.clone(),
+            text.clone(),
+        ))))));
+
+        // Working on the back layer, zoomed in; then leaving the file.
+        let back_index = 1;
+        let back = app.layers.layers()[back_index].id;
+        let _ = app.update(Message::Layers(LayerAction::Press(back)));
+        let _ = app.update(Message::Layers(LayerAction::Drop));
+        app.camera.zoom = 3.0;
+        app.camera.pan = iced::Vector::new(12.0, -4.0);
+        let _ = app.update(Message::File(FileMessage::New));
+        let _ = app.update(Message::File(FileMessage::Replace(Replace::New)));
+        assert_eq!(app.camera.zoom, 1.0);
+
+        let _ = app.update(Message::File(FileMessage::Opened(Ok(Some((path, text))))));
+        assert_eq!(app.camera.zoom, 3.0);
+        assert_eq!(app.camera.pan, iced::Vector::new(12.0, -4.0));
+        assert_eq!(app.current(), app.layers.layers()[back_index].id);
     }
 
     #[test]

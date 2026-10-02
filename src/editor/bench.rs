@@ -198,6 +198,7 @@ fn bench_editor() {
                 proportional: None,
                 clipboard: None,
                 keys: Some(crate::keys::defaults()),
+                lit: Vec::new(),
                 deadline: Cell::new(None),
             };
             let run = |f: &dyn Fn(&Editor)| {

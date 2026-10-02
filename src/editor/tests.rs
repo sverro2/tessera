@@ -40,6 +40,7 @@ pub(super) fn editor<'a>(doc: &'a Document, caches: &'a Caches) -> Editor<'a> {
         proportional: None,
         clipboard: None,
         keys: Some(crate::keys::defaults()),
+        lit: Vec::new(),
         deadline: Cell::new(None),
     }
 }

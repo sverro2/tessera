@@ -24,6 +24,10 @@ pub enum LayerAction {
     Group,
     Ungroup,
     Remove,
+    /// The pointer moved onto a line, or off it: what's on that layer (or
+    /// group) lights up on the canvas meanwhile.
+    Point(NodeId),
+    Unpoint(NodeId),
     /// Shows a line's name as a field to type in.
     StartRename(NodeId),
     EndRename,
@@ -45,6 +49,17 @@ impl Tessera {
             self.renaming = None;
         }
         let changed = match action {
+            LayerAction::Point(id) => {
+                self.pointed_layer = Some(id);
+                return Task::none();
+            }
+            // (Only if still on it: onto the next one may come first.)
+            LayerAction::Unpoint(id) => {
+                if self.pointed_layer == Some(id) {
+                    self.pointed_layer = None;
+                }
+                return Task::none();
+            }
             LayerAction::Press(id) => {
                 if self.naming != Some(id) {
                     self.naming = None;

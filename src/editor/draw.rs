@@ -245,7 +245,38 @@ impl Editor<'_> {
                     .any(|layer| layer.id == *id)
         });
 
+        // Layers pointed at in the layers panel: on their own (ish), the
+        // rest (and the backdrop) faded far back, they over it as they look.
+        if !self.lit.is_empty() {
+            let mut wash = Frame::new(renderer, size);
+            wash.fill_rectangle(
+                Point::ORIGIN,
+                size,
+                Color {
+                    a: 0.85,
+                    ..BACKGROUND
+                },
+            );
+            layers.push(wash.into_geometry());
+            let current = SceneLayer {
+                id: self.current,
+                document: self.document,
+                crossfade: self.crossfade,
+                show_edges: self.show_edges,
+                mirrors: self.mirrors,
+            };
+            let lit: Vec<SceneLayer> = std::iter::once(current)
+                .chain(self.below.iter().copied())
+                .chain(self.above.iter().copied())
+                .filter(|layer| self.lit.contains(&layer.id))
+                .collect();
+            for layer in lit {
+                self.draw_cached(renderer, size, layer, look, &mut layers);
+            }
+        }
+
         let mut overlay = Frame::new(renderer, bounds.size());
+        self.draw_lit(&mut overlay);
         let cursor_pos = cursor.position_in(bounds);
 
         // Adjusting the background: just its outline; the drawing rests.
@@ -732,6 +763,55 @@ impl Editor<'_> {
                 layer.mirrors,
             );
         }));
+    }
+
+    /// The layers pointed at in the layers panel, lit up (more than the
+    /// current one ever is), whatever the mode: their faces tinted a little,
+    /// their outlines bright; with their mirror images, as seen. (Everything
+    /// else is faded back meanwhile: see `draw_scene`.)
+    fn draw_lit(&self, frame: &mut Frame) {
+        if self.lit.is_empty() {
+            return;
+        }
+        let camera = self.plain_camera();
+        let current = SceneLayer {
+            id: self.current,
+            document: self.document,
+            crossfade: self.crossfade,
+            show_edges: self.show_edges,
+            mirrors: self.mirrors,
+        };
+        let layers = std::iter::once(&current)
+            .chain(&self.below)
+            .chain(&self.above)
+            .filter(|layer| self.lit.contains(&layer.id));
+        for layer in layers {
+            let document = layer.document;
+            let images = doc::images(layer.mirrors);
+            let faces = Path::new(|p| {
+                for image in &images {
+                    for t in document.triangles() {
+                        let [a, b, c] = t.map(|q| camera.to_screen(image.apply(q)));
+                        p.move_to(a);
+                        p.line_to(b);
+                        p.line_to(c);
+                        p.close();
+                    }
+                }
+            });
+            // Lightly: they're shown as they look underneath.
+            frame.fill(&faces, Color { a: 0.06, ..HOVER });
+            let outline = Path::new(|p| {
+                for image in &images {
+                    for (a, b) in outline(document) {
+                        p.move_to(camera.to_screen(image.apply(document.vertex(a))));
+                        p.line_to(camera.to_screen(image.apply(document.vertex(b))));
+                    }
+                }
+            });
+            frame.stroke(&outline, stroke(BACKGROUND, 4.0));
+            frame.stroke(&outline, stroke(HOVER, 2.0));
+        }
     }
 
     /// Stripes across `triangles` (world), on screen: one pattern over them

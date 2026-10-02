@@ -266,6 +266,8 @@ pub struct Settings<'a> {
     pub clipboard: Option<&'a Piece>,
     /// Which keys do what; none while they're being looked up (or set).
     pub keys: Option<&'a Keymap>,
+    /// Layers to light up (pointed at in the layers panel).
+    pub lit: Vec<NodeId>,
 }
 
 /// The canvas for editing the current layer of `scene`, over the backdrop
@@ -288,6 +290,7 @@ pub fn view<'a>(
         proportional,
         clipboard,
         keys,
+        lit,
     } = settings;
     let backdrop = Canvas::new(Backdrop {
         cache: &caches.grid,
@@ -310,6 +313,7 @@ pub fn view<'a>(
         proportional,
         clipboard,
         keys,
+        lit,
         deadline: Cell::new(None),
     });
     // Apart, as images (the background) are drawn after shapes within a
@@ -388,6 +392,7 @@ impl<'a> Worker<'a> {
             proportional: self.proportional,
             clipboard: self.clipboard,
             keys: self.keys,
+            lit: Vec::new(),
             deadline: Cell::new(self.deadline),
         }
     }
@@ -423,6 +428,9 @@ struct Editor<'a> {
     clipboard: Option<&'a Piece>,
     /// Which keys do what; none while they're being looked up (or set).
     keys: Option<&'a Keymap>,
+    /// Layers to light up, whatever the mode (pointed at in the layers
+    /// panel): to see what's on them.
+    lit: Vec<NodeId>,
     /// When working out what a drag does should give up, so a heavy case
     /// (e.g. a fill through crowded geometry) can't make it crawl.
     deadline: Cell<Option<std::time::Instant>>,
@@ -2064,6 +2072,7 @@ impl Editor<'_> {
             proportional: self.proportional,
             clipboard: self.clipboard,
             keys: self.keys,
+            lit: self.lit.clone(),
             deadline: self.deadline.clone(),
         }
     }
