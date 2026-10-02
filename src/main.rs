@@ -20,6 +20,7 @@ mod svg;
 mod update;
 mod wheel;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -125,7 +126,9 @@ struct Tessera {
     /// A short message about what just happened, fading out.
     notice: Option<Notice>,
     /// An image to draw over, kept with the document (not part of undo).
-    background: Option<Background>,
+    /// The layers' background images (each layer's own), by layer: kept
+    /// apart from the layers, so undoing edits doesn't move them.
+    backgrounds: HashMap<NodeId, Background>,
     /// Counts changes to the background, like the document's revision.
     background_version: u64,
     /// The background version last saved or opened.
@@ -317,7 +320,12 @@ impl Tessera {
 
     /// Nothing drawn, no background: nothing a new document would change.
     fn is_blank(&self) -> bool {
-        self.layers.is_empty() && self.background.is_none()
+        self.layers.is_empty()
+            && !self
+                .layers
+                .layers()
+                .iter()
+                .any(|layer| self.backgrounds.contains_key(&layer.id))
     }
 
     /// The layer being edited: `current`, or (if that's gone, e.g. after an
@@ -328,6 +336,16 @@ impl Tessera {
         } else {
             self.layers.first_layer()
         }
+    }
+
+    /// The current layer's background image, if it has one.
+    fn background(&self) -> Option<&Background> {
+        self.backgrounds.get(&self.current())
+    }
+
+    fn background_mut(&mut self) -> Option<&mut Background> {
+        let current = self.current();
+        self.backgrounds.get_mut(&current)
     }
 
     /// The current layer's drawing.
@@ -455,6 +473,17 @@ impl Tessera {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let current = self.current();
+        let task = self.handle(message);
+        // Another layer, another background image.
+        if self.current() != current {
+            self.caches.grid.clear();
+        }
+        task
+    }
+
+    /// What `message` does (see `update`).
+    fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Editor(message) => self.update_canvas(message),
             Message::Layers(action) => self.layer_action(action),
@@ -606,6 +635,7 @@ impl Tessera {
             Action::Undo => Message::Undo,
             Action::Redo => Message::Redo,
             Action::Mirror => Message::Shape(ShapeMessage::PlaceMirror(!self.placing_mirror)),
+            Action::DuplicateLayer => Message::Layers(LayerAction::Duplicate),
             Action::ShowKeys => Message::Keys(KeysMessage::ShowKeys(true)),
             Action::Proportional => Message::Shape(ShapeMessage::ToggleProportional),
             Action::PaintFaces => Message::Paint(PaintMessage::SetTarget(Target::Faces)),
@@ -633,7 +663,7 @@ impl Tessera {
 
     /// Fills the background panel's fields in from the background.
     fn refresh_fields(&mut self) {
-        let Some(background) = &self.background else {
+        let Some(background) = self.background() else {
             self.fields = Fields::default();
             return;
         };
@@ -667,7 +697,7 @@ impl Tessera {
     /// Saves to where the document came from, or (if `choose`, or it never
     /// was saved) to a file picked first; then does `then`.
     fn save(&mut self, choose: bool, then: Option<Replace>) -> Task<Message> {
-        let text = file::save(&self.layers, self.camera, self.background.as_ref());
+        let text = file::save(&self.layers, self.camera, &self.backgrounds);
         let versions = self.versions();
         let path = self.path.clone().filter(|_| !choose);
         let name = match &self.path {
@@ -747,7 +777,7 @@ impl Tessera {
                     scene,
                     self.camera,
                     &self.caches,
-                    self.background.as_ref(),
+                    self.background(),
                     editor::Settings {
                         tool: self.tool(),
                         proportional: self.proportional.then_some(self.reach),
@@ -966,8 +996,37 @@ mod tests {
         // Edges too, the current layer only.
         let _ = app.update(Message::Paint(PaintMessage::SetTarget(Target::Edges)));
         let _ = app.update(Message::Paint(PaintMessage::PaintEverything(false)));
-        let styled = |id| app.layers.layer(id).unwrap().document.edge_styles().count();
-        assert_eq!((styled(app.current()), styled(back)), (3, 0));
+        let red_edges = |id| {
+            let document = &app.layers.layer(id).unwrap().document;
+            document
+                .edge_styles()
+                .filter(|(_, _, style)| style.color == red)
+                .count()
+        };
+        assert_eq!((red_edges(app.current()), red_edges(back)), (3, 0));
+    }
+
+    #[test]
+    fn a_duplicate_is_worked_on_leaving_the_original_be() {
+        let mut app = Tessera::default();
+        edit(&mut app, 0.0);
+        let original = app.current();
+        let faces = app.document().triangle_ids().len();
+
+        let _ = app.update(Message::Layers(LayerAction::Duplicate));
+        let copy = app.current();
+        assert_ne!(copy, original);
+        assert_eq!(app.layers.layers().len(), 2);
+        // Going nuts with the copy: the original keeps its drawing.
+        edit(&mut app, 400.0);
+        assert_eq!(app.document().triangle_ids().len(), faces + 1);
+        let kept = &app.layers.layer(original).unwrap().document;
+        assert_eq!(kept.triangle_ids().len(), faces);
+
+        // One undo step each.
+        let _ = app.update(Message::Undo);
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.layers.layers().len(), 1);
     }
 
     #[test]
@@ -1075,7 +1134,7 @@ mod tests {
     #[test]
     fn recent_files() {
         let mut app = Tessera::default();
-        let text = file::save(&app.layers, app.camera, None);
+        let text = file::save(&app.layers, app.camera, &app.backgrounds);
         let path = PathBuf::from("/drawings/flower.tessera");
         let _ = app.update(Message::File(FileMessage::Opened(Ok(Some((
             path.clone(),
@@ -1437,8 +1496,9 @@ mod tests {
         assert_eq!(app.document().color(0), Some(red));
         assert_eq!(app.recent, vec![red]);
 
+        // Back to the colour it had: the default, as made.
         let _ = app.update(Message::Undo);
-        assert_eq!(app.document().color(0), None);
+        assert_eq!(app.document().color(0), Some(document::DEFAULT_FACE));
         assert_eq!(app.document().triangle_ids().len(), 1);
     }
 
@@ -1451,16 +1511,45 @@ mod tests {
     }
 
     #[test]
+    fn each_layer_has_its_own_background_image() {
+        let mut app = with_background();
+        let first = app.current();
+        assert!(app.background().is_some());
+
+        // A new layer: none of its own.
+        let _ = app.update(Message::Layers(LayerAction::Add));
+        assert_ne!(app.current(), first);
+        assert!(app.background().is_none());
+        let _ = app.update(Message::Layers(LayerAction::Press(first)));
+        assert!(app.background().is_some());
+
+        // A duplicate: its own, of the same image (not a copy of it).
+        let _ = app.update(Message::Layers(LayerAction::Duplicate));
+        let copy = app.current();
+        assert_ne!(copy, first);
+        let (a, b) = (&app.backgrounds[&first], &app.backgrounds[&copy]);
+        assert!(a.same_image(b));
+        // Moving the copy's leaves the original's be.
+        let _ = app.update(Message::Editor(editor::Message::MoveBackground(
+            iced::Vector::new(5.0, 0.0),
+        )));
+        assert_ne!(
+            app.backgrounds[&first].center,
+            app.backgrounds[&copy].center
+        );
+    }
+
+    #[test]
     fn a_background_image_fills_the_view() {
         let mut app = with_background();
-        assert!(app.background.is_some());
+        assert!(app.background().is_some());
         assert!(app.is_unsaved());
 
         // The window, less the menu bar: 800×600 for a 4×2 image.
         let _ = app.update(Message::Background(BackgroundMessage::BackgroundFitted(
             iced::Size::new(800.0 + LAYERS_WIDTH, 600.0 + MENU_BAR_HEIGHT),
         )));
-        let background = app.background.as_ref().unwrap();
+        let background = app.background().unwrap();
         assert!((background.scale - 200.0).abs() < 1e-3);
         assert_eq!(background.center, Point::new(400.0, 300.0));
     }
@@ -1489,7 +1578,7 @@ mod tests {
             Field::Y,
             "-".into(),
         )));
-        let background = app.background.as_ref().unwrap();
+        let background = app.background().unwrap();
         assert_eq!(background.center, Point::new(12.5, 0.0));
         assert_eq!(background.scale, 0.5);
         assert!((background.rotation - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
@@ -1505,9 +1594,9 @@ mod tests {
         let _ = app.update(Message::Background(
             BackgroundMessage::ToggleBackgroundVisible,
         ));
-        assert!(!app.background.as_ref().unwrap().visible);
+        assert!(!app.background().unwrap().visible);
         let _ = app.update(Message::Background(BackgroundMessage::RemoveBackground));
-        assert!(app.background.is_none());
+        assert!(app.background().is_none());
     }
 
     #[test]
@@ -1523,9 +1612,9 @@ mod tests {
         let _ = app.update(Message::Background(BackgroundMessage::BackgroundPicked(
             Ok(Some(background::tests::pixel())),
         )));
-        assert_eq!(app.background.as_ref().unwrap().center.x, 40.0);
+        assert_eq!(app.background().unwrap().center.x, 40.0);
         // A new image is always shown.
-        assert!(app.background.as_ref().unwrap().visible);
+        assert!(app.background().unwrap().visible);
     }
 
     #[test]
@@ -1546,7 +1635,7 @@ mod tests {
         let _ = app.update(Message::File(FileMessage::New));
         assert!(matches!(app.confirming, Some(Replace::New)));
         let _ = app.update(Message::File(FileMessage::Replace(Replace::New)));
-        assert!(app.background.is_none());
+        assert!(app.background().is_none());
         assert!(!app.is_unsaved());
     }
 
@@ -1612,7 +1701,7 @@ mod tests {
         let mut source = Tessera::default();
         edit(&mut source, 0.0);
         source.camera.zoom = 3.0;
-        let text = file::save(&source.layers, source.camera, None);
+        let text = file::save(&source.layers, source.camera, &source.backgrounds);
 
         let mut app = Tessera::default();
         let path = PathBuf::from("/tmp/drawing.tessera");

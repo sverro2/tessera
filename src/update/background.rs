@@ -40,11 +40,13 @@ impl Tessera {
                 };
                 // A new image takes the old one's place; a first one fills
                 // the view.
-                let first = self.background.is_none();
-                self.background = Some(match &self.background {
+                let first = self.background().is_none();
+                let current = self.current();
+                let background = match self.backgrounds.remove(&current) {
                     Some(old) => old.replaced_by(picked),
                     None => picked,
-                });
+                };
+                self.backgrounds.insert(current, background);
                 self.background_changed();
                 if first {
                     return Task::done(Message::Background(BackgroundMessage::FitBackground));
@@ -60,27 +62,29 @@ impl Tessera {
                 .map(|value| Message::Background(BackgroundMessage::BackgroundFitted(value))),
             BackgroundMessage::BackgroundFitted(window) => {
                 let viewport = Self::canvas_size(window);
-                if let Some(background) = &mut self.background {
-                    background.fit(self.camera, viewport);
+                let camera = self.camera;
+                if let Some(background) = self.background_mut() {
+                    background.fit(camera, viewport);
                     self.background_changed();
                 }
                 Task::none()
             }
             BackgroundMessage::ToggleBackgroundVisible => {
-                if let Some(background) = &mut self.background {
+                if let Some(background) = self.background_mut() {
                     background.visible = !background.visible;
                     self.background_changed();
                 }
                 Task::none()
             }
             BackgroundMessage::RemoveBackground => {
-                if self.background.take().is_some() {
+                let current = self.current();
+                if self.backgrounds.remove(&current).is_some() {
                     self.background_changed();
                 }
                 Task::none()
             }
             BackgroundMessage::BackgroundOpacity(opacity) => {
-                if let Some(background) = &mut self.background {
+                if let Some(background) = self.background_mut() {
                     background.opacity = opacity;
                     self.background_changed();
                 }
@@ -95,7 +99,7 @@ impl Tessera {
                     Field::Rotation => &mut self.fields.rotation,
                 };
                 *draft = typed;
-                if let (Some(background), Some(value)) = (&mut self.background, value)
+                if let (Some(background), Some(value)) = (self.background_mut(), value)
                     && value.is_finite()
                 {
                     match field {

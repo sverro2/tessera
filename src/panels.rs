@@ -484,6 +484,7 @@ impl Tessera {
 
         let mut buttons = row![
             action("+ Layer", Add),
+            action("Duplicate", Duplicate),
             action("+ Group", Group),
             action("Delete", Remove),
         ]
@@ -495,7 +496,8 @@ impl Tessera {
         container(
             column![
                 text("Layers").size(13),
-                buttons,
+                // Onto a second line if they don't fit.
+                buttons.wrap().vertical_spacing(4),
                 list,
                 text("Drag to order, onto a group to put it in · Double-click: rename")
                     .size(11)
@@ -522,10 +524,7 @@ impl Tessera {
         } else {
             button::secondary
         };
-        let visible = self
-            .background
-            .as_ref()
-            .map(|background| background.visible);
+        let visible = self.background().map(|background| background.visible);
         let toggle = button(small("Background"))
             .padding([4, 10])
             .style(move |theme: &Theme, status| {
@@ -573,9 +572,9 @@ impl Tessera {
         .align_x(iced::Right);
 
         if self.editing_background {
-            let body: Element<'_, Message> = match &self.background {
+            let body: Element<'_, Message> = match self.background() {
                 None => column![
-                    small("No background image yet."),
+                    small("This layer has no background image yet."),
                     row![
                         button(small("Choose image…"))
                             .on_press(Message::Background(BackgroundMessage::PickBackground)),

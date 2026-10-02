@@ -1,5 +1,6 @@
 //! SVG export of the [`Layers`]: each layer and group an Inkscape layer,
-//! each face a path of its own, painted edges paths over them.
+//! each painted face a path of its own, painted edges paths over them;
+//! what isn't painted isn't there.
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -10,8 +11,6 @@ use crate::layers::{Layer, Layers, Node};
 use crate::paint;
 
 const PADDING: f32 = 10.0;
-/// How wide unpainted edges are drawn.
-const PLAIN_EDGE: f32 = 1.5;
 
 /// The area exported: around everything drawn (mirrored too), with some
 /// room; its top left corner and size (world units, a pixel each).
@@ -96,15 +95,16 @@ fn write_drawing(svg: &mut String, layer: &Layer, prefix: &str, depth: usize) {
     let document = &layer.drawing();
     let crossfade_edges = layer.crossfade.edges;
     let indent = "  ".repeat(depth);
-    for (i, ([a, b, c], color)) in document.triangles().zip(document.colors()).enumerate() {
-        // Painted faces are solid.
-        let fill = match color {
-            Some(color) => format!(r#"fill="{}""#, paint::to_hex(color)),
-            None => r##"fill="#7aa2f7" fill-opacity="0.35""##.to_string(),
-        };
+    // The painted faces, solid; those not painted aren't there.
+    let painted = document
+        .triangles()
+        .zip(document.colors())
+        .filter_map(|(t, color)| Some((t, color?)));
+    for (i, ([a, b, c], color)) in painted.enumerate() {
+        let fill = paint::to_hex(color);
         let _ = writeln!(
             svg,
-            r#"{indent}<path id="{prefix}face{i}" d="M {},{} L {},{} L {},{} Z" {fill}/>"#,
+            r#"{indent}<path id="{prefix}face{i}" d="M {},{} L {},{} L {},{} Z" fill="{fill}"/>"#,
             a.x, a.y, b.x, b.y, c.x, c.y
         );
     }
@@ -113,15 +113,12 @@ fn write_drawing(svg: &mut String, layer: &Layer, prefix: &str, depth: usize) {
         return;
     }
 
-    // The edges over them, each its own outline, so edges of different
-    // widths meet without lying over each other.
+    // The painted edges over them (those not painted aren't there), each
+    // its own outline, so edges of different widths meet without lying over
+    // each other.
     let edges: Vec<_> = document
-        .unique_edges()
-        .into_iter()
-        .map(|(a, b)| match document.edge_style(a, b) {
-            Some(style) => (a, b, style.width, paint::to_hex(style.color)),
-            None => (a, b, PLAIN_EDGE, "#c0caf5".to_string()),
-        })
+        .edge_styles()
+        .map(|(a, b, style)| (a, b, style.width, paint::to_hex(style.color)))
         .collect();
     let outlines = joints::outlines(
         &edges
@@ -194,6 +191,11 @@ mod tests {
             ],
             snap: 0.0,
         });
+        let color = Color::from_rgb8(255, 0, 0);
+        document.apply(Edit::PaintAll { color: Some(color) });
+        document.apply(Edit::PaintAllEdges {
+            style: Some(EdgeStyle { color, width: 1.0 }),
+        });
         let mut layers = Layers::default();
         let first = layers.first_layer();
         layers.layer_mut(first).unwrap().document = std::sync::Arc::new(document);
@@ -221,6 +223,11 @@ mod tests {
             ],
             snap: 0.0,
         });
+        let color = Color::from_rgb8(255, 0, 0);
+        document.apply(Edit::PaintAll { color: Some(color) });
+        document.apply(Edit::PaintAllEdges {
+            style: Some(EdgeStyle { color, width: 1.0 }),
+        });
         let mut layers = Layers::default();
         let first = layers.first_layer();
         layers.layer_mut(first).unwrap().document = std::sync::Arc::new(document);
@@ -242,6 +249,8 @@ mod tests {
             ],
             snap: 0.0,
         });
+        // Two edges painted, the third erased.
+        document.apply(Edit::PaintAllEdges { style: None });
         let (red, blue) = (Color::from_rgb8(255, 0, 0), Color::from_rgb8(0, 0, 255));
         for ((a, b), color) in [((0, 1), red), ((1, 2), blue)] {
             assert!(document.apply(Edit::PaintEdge {
@@ -288,6 +297,9 @@ mod tests {
         document.apply(Edit::InsertVertex {
             at: Point::new(5.0, 4.0),
         });
+        // All erased, but for a face and an edge.
+        document.apply(Edit::PaintAll { color: None });
+        document.apply(Edit::PaintAllEdges { style: None });
         let red = Color::from_rgb8(255, 0, 0);
         document.apply(Edit::Paint {
             triangle: 0,
@@ -311,8 +323,9 @@ mod tests {
         layers.set_visible(hidden, false);
 
         let svg = export(&layers);
-        // Three faces, and six edges (each its own outline, painted or not).
-        assert_eq!(svg.matches("<path ").count(), 3 + 6, "{svg}");
+        // The painted face and edge only (of three and six): what isn't
+        // painted isn't there.
+        assert_eq!(svg.matches("<path ").count(), 1 + 1, "{svg}");
         assert!(!svg.contains("stroke"), "{svg}");
         // Back to front; the hidden layer hidden.
         let back = svg.find(r#"inkscape:label="Layer 1""#).unwrap();
@@ -322,7 +335,7 @@ mod tests {
         assert!(back < front, "{svg}");
         // The red face and the red edge.
         assert_eq!(svg.matches(r##"fill="#ff0000""##).count(), 2, "{svg}");
-        assert_eq!(svg.matches(r#"id="l1-edge"#).count(), 6, "{svg}");
+        assert_eq!(svg.matches(r#"id="l1-edge"#).count(), 1, "{svg}");
         for other in ["<polygon", "<line"] {
             assert!(!svg.contains(other), "{svg}");
         }

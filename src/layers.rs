@@ -347,6 +347,65 @@ impl Layers {
         id
     }
 
+    /// A copy of `id` (a layer, or a group and all in it), named so, in
+    /// front of it; returns the copy's id. Copied drawings are shared until
+    /// either is changed.
+    pub fn duplicate(&mut self, id: NodeId) -> Option<NodeId> {
+        fn renumber(node: &mut Node, next: &mut NodeId) {
+            match node {
+                Node::Layer(layer) => layer.id = *next,
+                Node::Group(group) => {
+                    group.id = *next;
+                    *next += 1;
+                    for child in &mut group.children {
+                        renumber(child, next);
+                    }
+                    return;
+                }
+            }
+            *next += 1;
+        }
+        let mut copy = self.find(id)?.clone();
+        let mut next = self.next_id;
+        renumber(&mut copy, &mut next);
+        self.next_id = next;
+        let name = copy.name_mut();
+        *name = format!("{name} copy");
+        let copied = copy.id();
+        let (siblings, i) = self.siblings_mut(id)?;
+        siblings.insert(i, copy);
+        self.changed();
+        Some(copied)
+    }
+
+    /// The layers of `id`, front first: itself, if a layer; those in it,
+    /// if a group.
+    pub fn layers_of(&self, id: NodeId) -> Vec<NodeId> {
+        fn walk(node: &Node, out: &mut Vec<NodeId>) {
+            match node {
+                Node::Layer(layer) => out.push(layer.id),
+                Node::Group(group) => group.children.iter().for_each(|c| walk(c, out)),
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(node) = self.find(id) {
+            walk(node, &mut out);
+        }
+        out
+    }
+
+    /// The first (frontmost) layer of `id`: itself, if a layer; the first
+    /// in it, if a group (if any).
+    pub fn first_layer_of(&self, id: NodeId) -> Option<NodeId> {
+        fn first(node: &Node) -> Option<NodeId> {
+            match node {
+                Node::Layer(layer) => Some(layer.id),
+                Node::Group(group) => group.children.iter().find_map(first),
+            }
+        }
+        first(self.find(id)?)
+    }
+
     /// Puts `id` in a new group, in its place; returns the group's id.
     pub fn group(&mut self, id: NodeId) -> Option<NodeId> {
         let group_id = self.next_id;
@@ -646,6 +705,28 @@ mod tests {
         assert!(left[0].document.is_empty());
         assert_ne!(left[0].id, one);
         assert!(!layers.contains(group));
+    }
+
+    #[test]
+    fn duplicating_copies_in_front_with_new_ids() {
+        let mut layers = Layers::default();
+        let first = layers.first_layer();
+        draw(&mut layers, first);
+        layers.rename(first, "Sky".into());
+        let copy = layers.duplicate(first).unwrap();
+        assert_ne!(copy, first);
+        assert_eq!(names(&layers), [(0, "Sky copy".into()), (0, "Sky".into())]);
+        // The same drawing, until either changes.
+        let (a, b) = (layers.layer(copy).unwrap(), layers.layer(first).unwrap());
+        assert!(Arc::ptr_eq(&a.document, &b.document));
+
+        // A group and what's in it, every one anew.
+        let group = layers.group(first).unwrap();
+        let copied = layers.duplicate(group).unwrap();
+        let inner = layers.first_layer_of(copied).unwrap();
+        assert!(![first, copy, group, copied].contains(&inner));
+        assert_eq!(layers.layers().len(), 3);
+        assert!(layers.layer(inner).unwrap().name.starts_with("Sky"));
     }
 
     #[test]

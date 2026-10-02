@@ -263,6 +263,50 @@ fn t_scales_the_selection_around_its_centre() {
 }
 
 #[test]
+fn slash_frames_the_shape_pointed_at_else_the_layer() {
+    let doc = two_apart();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let slash = || press(letter('/'), keyboard::Modifiers::empty());
+    let framed = |x: f32, y: f32| {
+        let mut state = State::default();
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+        let cursor = mouse::Cursor::Available(Point::new(x, y));
+        let published = editor
+            .update(&mut state, &slash(), bounds, cursor)
+            .and_then(|action| action.into_inner().0);
+        match published {
+            Some(Message::Frame(points)) => {
+                let mut points: Vec<_> = points.iter().map(|p| (p.x, p.y)).collect();
+                points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                points.dedup();
+                points
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    // Over the left triangle: it.
+    let left = [0, 1, 2].map(|v| (doc.vertex(v).x, doc.vertex(v).y));
+    let mut left = left.to_vec();
+    left.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(framed(150.0, 280.0), left);
+    // Off the drawing: all of it.
+    assert_eq!(framed(700.0, 550.0).len(), 6);
+}
+
+#[test]
+fn ctrl_a_selects_every_vertex_of_the_layer() {
+    let doc = two_apart();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    run(&editor, &mut state, ctrl('a'), 600.0, 500.0);
+    let mut selected = state.selection.clone();
+    selected.sort_unstable();
+    assert_eq!(selected, doc.unique_vertices());
+}
+
+#[test]
 fn ctrl_l_selects_the_whole_shape() {
     let doc = two_apart();
     let cache = Caches::default();
@@ -1272,7 +1316,7 @@ fn ctrl_click_picks_instead_of_painting() {
         bounds,
         mouse::Cursor::Unavailable,
     );
-    // The painted face, an unpainted one, and nothing.
+    // The face painted red, one as made (the default), and nothing.
     let picked = |messages: Vec<Message>| match &messages[..] {
         [Message::Pick(picked)] => Some(*picked),
         [] => None,
@@ -1284,7 +1328,7 @@ fn ctrl_click_picks_instead_of_painting() {
     );
     assert_eq!(
         picked(click(&mut state, 150.0, 280.0)),
-        Some(Picked::Face(None))
+        Some(Picked::Face(Some(crate::document::DEFAULT_FACE)))
     );
     assert_eq!(picked(click(&mut state, 500.0, 500.0)), None);
 

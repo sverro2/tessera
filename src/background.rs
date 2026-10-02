@@ -73,6 +73,12 @@ impl Background {
     }
 
     /// The image file's contents.
+    /// Whether `other` is the same image (placed alike or not): the same
+    /// bytes, shared.
+    pub fn same_image(&self, other: &Background) -> bool {
+        Arc::ptr_eq(&self.bytes, &other.bytes)
+    }
+
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }

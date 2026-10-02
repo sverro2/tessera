@@ -67,6 +67,17 @@ pub(crate) fn next_revision() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The colour of faces made in empty space (a muted blue): painted from the
+/// start, until painted otherwise or erased.
+pub const DEFAULT_FACE: Color = Color::from_rgb8(0x3d, 0x4a, 0x6e);
+
+/// The style of edges made anew (but for pieces of edges there were):
+/// fine and light.
+pub const DEFAULT_EDGE: EdgeStyle = EdgeStyle {
+    color: Color::from_rgb8(0xc0, 0xca, 0xf5),
+    width: 1.0,
+};
+
 /// How a painted edge is drawn.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EdgeStyle {
@@ -283,6 +294,17 @@ impl Document {
             .zip(colors)
             .filter_map(|(&t, color)| Some((key(t), color?)))
             .collect();
+    }
+
+    /// Paints what isn't painted with the defaults (as older files had it
+    /// drawn). Not an edit.
+    pub fn paint_unpainted(&mut self) {
+        for t in &self.triangles {
+            self.colors.entry(key(*t)).or_insert(DEFAULT_FACE);
+        }
+        for edge in self.unique_edges() {
+            self.edge_styles.entry(edge).or_insert(DEFAULT_EDGE);
+        }
     }
 
     /// The style edge `a`–`b` is painted, if any.
@@ -795,12 +817,10 @@ impl Document {
     }
 
     /// After an edit from `before`: edges that kept their ends keep their
-    /// style; new edges lying along a styled edge from before (a piece of
-    /// it) take its style. Styles of edges gone are dropped.
+    /// style; new edges lying along an edge from before (a piece of it) take
+    /// its style (none, if erased); other new edges, the default. Styles of
+    /// edges gone are dropped.
     fn inherit_edge_styles(&mut self, before: &Document) {
-        if self.edge_styles.is_empty() && before.edge_styles.is_empty() {
-            return;
-        }
         let existed = before.unique_edges();
         let on = |p: Point, a: Point, b: Point| {
             crate::geometry::closest_on_segment(p, a, b).1 <= tolerance(a.distance(b))
@@ -814,10 +834,14 @@ impl Document {
                     self.edge_styles.get(&edge).copied()
                 } else {
                     let (p, q) = (self.vertices[edge.0], self.vertices[edge.1]);
-                    before.edge_styles().find_map(|(a, b, style)| {
+                    let along = existed.iter().find(|&&(a, b)| {
                         let (a, b) = (before.vertices[a], before.vertices[b]);
-                        (on(p, a, b) && on(q, a, b)).then_some(style)
-                    })
+                        on(p, a, b) && on(q, a, b)
+                    });
+                    match along {
+                        Some(&(a, b)) => before.edge_style(a, b),
+                        None => Some(DEFAULT_EDGE),
+                    }
                 };
                 Some((edge, style?))
             })
@@ -825,12 +849,10 @@ impl Document {
     }
 
     /// After an edit from `before`: faces that kept their corners keep
-    /// their colour; new faces take that of the face they lay in before
-    /// (by their centre), if painted. Colours of faces gone are dropped.
+    /// their colour; new faces take that of the face they lay in before (by
+    /// their centre; none, if erased); new faces in empty space, the
+    /// default. Colours of faces gone are dropped.
     fn inherit_colors(&mut self, before: &Document) {
-        if self.colors.is_empty() && before.colors.is_empty() {
-            return;
-        }
         let existed: BTreeSet<_> = before.triangles.iter().map(|&t| key(t)).collect();
 
         self.colors = self
@@ -843,7 +865,10 @@ impl Document {
                 } else {
                     let [a, b, c] = t.map(|v| self.vertices[v]);
                     let centre = Point::new((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0);
-                    before.triangle_at(centre).and_then(|u| before.color(u))
+                    match before.triangle_at(centre) {
+                        Some(u) => before.color(u),
+                        None => Some(DEFAULT_FACE),
+                    }
                 };
                 Some((k, color?))
             })
@@ -1341,12 +1366,12 @@ mod tests {
         assert_eq!(doc.triangle_ids().len(), 3);
         assert!(doc.colors().all(|c| c == Some(red)));
 
-        // A face added beside it is unpainted.
+        // A face added beside it (in empty space) gets the default.
         assert!(doc.apply(Edit::AddTriangle {
             corners: [doc.vertex(0), doc.vertex(1), Point::new(5.0, -10.0)],
             snap: 0.0
         }));
-        assert_eq!(doc.colors().filter(Option::is_none).count(), 1);
+        assert_eq!(doc.colors().filter(|c| *c == Some(DEFAULT_FACE)).count(), 1);
 
         // Clearing.
         assert!(doc.apply(Edit::Paint {
@@ -1354,7 +1379,17 @@ mod tests {
             color: None,
         }));
         assert_eq!(doc.color(0), None);
-        assert_eq!(doc.colors().filter(Option::is_none).count(), 2);
+        assert_eq!(doc.colors().filter(Option::is_none).count(), 1);
+
+        // Splitting an erased face: its pieces stay erased.
+        let erased = doc
+            .triangles()
+            .position(|_| true)
+            .filter(|&t| doc.color(t).is_none());
+        let [a, b, c] = doc.triangles().nth(erased.unwrap()).unwrap();
+        let centre = Point::new((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0);
+        assert!(doc.apply(Edit::InsertVertex { at: centre }));
+        assert_eq!(doc.colors().filter(Option::is_none).count(), 3);
     }
 
     #[test]
@@ -1406,7 +1441,7 @@ mod tests {
         }));
         assert_eq!(doc.edge_style(0, 1), Some(style));
 
-        // Cut: both pieces keep it; the new edge inside doesn't get it.
+        // Cut: both pieces keep it; the new edge inside gets the default.
         assert!(doc.apply(Edit::InsertVertex {
             at: Point::new(6.0, 0.0),
         }));
@@ -1414,8 +1449,20 @@ mod tests {
         assert_eq!(doc.edge_style(0, 1), None);
         assert_eq!(doc.edge_style(0, cut), Some(style));
         assert_eq!(doc.edge_style(cut, 1), Some(style));
-        assert_eq!(doc.edge_style(cut, 2), None);
-        assert_eq!(doc.edge_styles().count(), 2);
+        assert_eq!(doc.edge_style(cut, 2), Some(DEFAULT_EDGE));
+        // An erased edge, cut: its pieces stay erased.
+        assert!(doc.apply(Edit::PaintEdge {
+            a: 1,
+            b: 2,
+            style: None,
+        }));
+        let (p, q) = (doc.vertex(1), doc.vertex(2));
+        assert!(doc.apply(Edit::InsertVertex {
+            at: p + (q - p) * 0.5
+        }));
+        let half = doc.last_vertex();
+        assert_eq!(doc.edge_style(1, half), None);
+        assert_eq!(doc.edge_style(half, 2), None);
 
         // Clearing.
         assert!(doc.apply(Edit::PaintEdge {
@@ -1423,7 +1470,8 @@ mod tests {
             b: cut,
             style: None,
         }));
-        assert_eq!(doc.edge_styles().count(), 1);
+        assert_eq!(doc.edge_style(0, cut), None);
+        assert_eq!(doc.edge_style(cut, 1), Some(style));
     }
 
     #[test]

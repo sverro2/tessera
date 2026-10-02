@@ -69,7 +69,7 @@ impl Tessera {
                 self.path = None;
                 self.saved = None;
                 self.notice = None;
-                self.background = None;
+                self.backgrounds.clear();
                 self.editing_background = false;
                 self.saved_background = self.background_version;
                 self.view_changed()
@@ -107,7 +107,7 @@ impl Tessera {
                     self.undo.clear();
                     self.redo.clear();
                     self.camera = contents.camera;
-                    self.background = contents.background;
+                    self.backgrounds = contents.backgrounds;
                     self.editing_background = false;
                     self.background_version += 1;
                     self.saved_background = self.background_version;

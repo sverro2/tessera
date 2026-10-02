@@ -54,6 +54,8 @@ pub enum Action {
     Undo,
     Redo,
     Mirror,
+    DuplicateLayer,
+    FrameShape,
     ShowKeys,
     // Shape mode.
     CutEdge,
@@ -62,6 +64,7 @@ pub enum Action {
     Rotate,
     Scale,
     SelectShape,
+    SelectAll,
     Copy,
     CutFaces,
     Paste,
@@ -74,7 +77,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 23] = [
+    pub const ALL: [Action; 26] = [
         Action::ToggleMode,
         Action::New,
         Action::Open,
@@ -83,6 +86,8 @@ impl Action {
         Action::Undo,
         Action::Redo,
         Action::Mirror,
+        Action::DuplicateLayer,
+        Action::FrameShape,
         Action::ShowKeys,
         Action::CutEdge,
         Action::Delete,
@@ -90,6 +95,7 @@ impl Action {
         Action::Rotate,
         Action::Scale,
         Action::SelectShape,
+        Action::SelectAll,
         Action::Copy,
         Action::CutFaces,
         Action::Paste,
@@ -103,11 +109,10 @@ impl Action {
     pub fn context(self) -> Context {
         use Action::*;
         match self {
-            ToggleMode | New | Open | Save | SaveAs | Undo | Redo | Mirror | ShowKeys => {
-                Context::Global
-            }
-            CutEdge | Delete | Grab | Rotate | Scale | SelectShape | Copy | CutFaces | Paste
-            | Proportional => Context::Shape,
+            ToggleMode | New | Open | Save | SaveAs | Undo | Redo | Mirror | DuplicateLayer
+            | FrameShape | ShowKeys => Context::Global,
+            CutEdge | Delete | Grab | Rotate | Scale | SelectShape | SelectAll | Copy
+            | CutFaces | Paste | Proportional => Context::Shape,
             PaintFaces | PaintEdges | Pipette | Lightness => Context::Paint,
         }
     }
@@ -124,6 +129,8 @@ impl Action {
             Undo => "Undo",
             Redo => "Redo",
             Mirror => "Place a mirror on the layer",
+            DuplicateLayer => "Duplicate the selected layer (or group)",
+            FrameShape => "Fit the shape in view (the selection, else the one pointed at)",
             ShowKeys => "Show these shortcuts",
             CutEdge => "Cut the hovered edge",
             Delete => "Delete the hovered face (or the selection)",
@@ -131,6 +138,7 @@ impl Action {
             Rotate => "Rotate the selection",
             Scale => "Scale the selection",
             SelectShape => "Select the whole shape",
+            SelectAll => "Select every vertex of the layer",
             Copy => "Copy the selected faces",
             CutFaces => "Cut the selected faces",
             Paste => "Paste (click to put down)",
@@ -154,6 +162,8 @@ impl Action {
             Undo => &["Ctrl+Z"],
             Redo => &["Ctrl+Shift+Z", "Ctrl+Y"],
             Mirror => &["Ctrl+M"],
+            DuplicateLayer => &["Ctrl+Shift+D"],
+            FrameShape => &["/"],
             ShowKeys => &["F1"],
             CutEdge => &["C"],
             Delete => &["D"],
@@ -161,6 +171,7 @@ impl Action {
             Rotate => &["R"],
             Scale => &["T"],
             SelectShape => &["Ctrl+L"],
+            SelectAll => &["Ctrl+A"],
             Copy => &["Ctrl+C"],
             CutFaces => &["Ctrl+X"],
             Paste => &["Ctrl+V"],

@@ -30,6 +30,13 @@ impl Tessera {
                 }
                 Task::none()
             }
+            editor::Message::Frame(points) => {
+                // Clear of the edges, and of the panels over the canvas.
+                const MARGIN: f32 = 60.0;
+                let canvas = Self::canvas_size(self.window_size.unwrap_or(WINDOW_SIZE));
+                self.camera = self.camera.framing(&points, canvas, MARGIN);
+                self.view_changed()
+            }
             editor::Message::Pan(delta) => {
                 self.camera.pan += delta;
                 self.view_changed()
@@ -109,21 +116,21 @@ impl Tessera {
                 Task::none()
             }
             editor::Message::MoveBackground(delta) => {
-                if let Some(background) = &mut self.background {
+                if let Some(background) = self.background_mut() {
                     background.center += delta;
                     self.background_changed();
                 }
                 Task::none()
             }
             editor::Message::ScaleBackground { anchor, factor } => {
-                if let Some(background) = &mut self.background {
+                if let Some(background) = self.background_mut() {
                     background.scale_at(anchor, factor);
                     self.background_changed();
                 }
                 Task::none()
             }
             editor::Message::RotateBackground { anchor, angle } => {
-                if let Some(background) = &mut self.background {
+                if let Some(background) = self.background_mut() {
                     background.rotate_at(anchor, angle);
                     self.background_changed();
                 }

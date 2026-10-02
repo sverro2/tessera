@@ -29,6 +29,49 @@ impl Camera {
         Point::new(x * cos - y * sin, x * sin + y * cos) + self.pan
     }
 
+    /// This camera (turned as it is) moved and zoomed so that `points`
+    /// (world) fill a `viewport` of this size but for `margin` (screen px)
+    /// all round, in its middle. A single point (or none) keeps the zoom.
+    pub fn framing(self, points: &[Point], viewport: iced::Size, margin: f32) -> Camera {
+        let (sin, cos) = self.rotation.sin_cos();
+        // As they're turned on screen, before zooming and panning.
+        let turned = points
+            .iter()
+            .map(|p| Point::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos));
+        let Some((min, max)) = turned.fold(None, |bounds: Option<(Point, Point)>, p| {
+            Some(match bounds {
+                None => (p, p),
+                Some((min, max)) => (
+                    Point::new(min.x.min(p.x), min.y.min(p.y)),
+                    Point::new(max.x.max(p.x), max.y.max(p.y)),
+                ),
+            })
+        }) else {
+            return self;
+        };
+        let (width, height) = (max.x - min.x, max.y - min.y);
+        let room = (
+            (viewport.width - 2.0 * margin).max(1.0),
+            (viewport.height - 2.0 * margin).max(1.0),
+        );
+        let zoom = if width.max(height) < 1e-6 {
+            self.zoom
+        } else {
+            (room.0 / width.max(1e-6))
+                .min(room.1 / height.max(1e-6))
+                .clamp(Self::MIN_ZOOM, Self::MAX_ZOOM)
+        };
+        let middle = Point::new((min.x + max.x) / 2.0, (min.y + max.y) / 2.0);
+        Camera {
+            pan: Vector::new(
+                viewport.width / 2.0 - middle.x * zoom,
+                viewport.height / 2.0 - middle.y * zoom,
+            ),
+            zoom,
+            ..self
+        }
+    }
+
     pub fn to_world(self, screen: Point) -> Point {
         let (sin, cos) = self.rotation.sin_cos();
         let p = screen - self.pan;
@@ -90,6 +133,28 @@ mod tests {
             rotation: 0.4,
             image: None,
         }
+    }
+
+    #[test]
+    fn framing_fills_the_view_in_its_middle() {
+        let points = [Point::new(10.0, 20.0), Point::new(110.0, 70.0)];
+        let viewport = iced::Size::new(800.0, 600.0);
+        let framed = camera().framing(&points, viewport, 50.0);
+        assert_eq!(framed.rotation, camera().rotation);
+        let screen: Vec<_> = points.iter().map(|&p| framed.to_screen(p)).collect();
+        // Within the margin, and touching it one way.
+        let (xs, ys): (Vec<_>, Vec<_>) = screen.iter().map(|p| (p.x, p.y)).unzip();
+        let low = xs.iter().chain(&ys).copied().fold(f32::INFINITY, f32::min);
+        assert!(low >= 50.0 - 1e-2, "{screen:?}");
+        let fills = xs.iter().copied().fold(f32::INFINITY, f32::min) - 50.0 < 1e-2
+            || ys.iter().copied().fold(f32::INFINITY, f32::min) - 50.0 < 1e-2;
+        assert!(fills, "{screen:?}");
+        // Centred.
+        let middle = framed.to_screen(Point::new(60.0, 45.0));
+        assert!(
+            middle.distance(Point::new(400.0, 300.0)) < 1e-2,
+            "{middle:?}"
+        );
     }
 
     #[test]

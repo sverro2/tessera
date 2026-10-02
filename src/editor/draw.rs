@@ -544,14 +544,23 @@ impl Editor<'_> {
             }
         }
 
-        // Unpainted faces, then the painted ones by colour.
+        // Unpainted faces hatched, as they're not exported: plainly not
+        // painted (and not some colour). Then the painted ones by colour.
         let screen = |v| self.camera.to_screen(document.vertex(v));
-        let unpainted = document
+        let unpainted: Vec<_> = document
             .triangles()
             .zip(document.colors())
             .filter(|(_, color)| color.is_none())
-            .map(|(t, _)| t);
-        frame.fill(&self.mesh(unpainted), FILL);
+            .map(|(t, _)| t)
+            .collect();
+        frame.fill(
+            &self.mesh(unpainted.iter().copied()),
+            Color { a: 0.05, ..EDGE },
+        );
+        frame.stroke(
+            &self.hatch(&unpainted),
+            stroke(Color { a: 0.3, ..EDGE }, 1.0),
+        );
         for (color, triangles) in painted_faces(document) {
             frame.fill(&self.mesh(triangles.into_iter()), color);
         }
@@ -559,15 +568,29 @@ impl Editor<'_> {
             return;
         }
 
-        // The edges, each its own outline, so edges of different widths
-        // meet without lying over each other.
+        // Unpainted edges dashed, thin: not exported either.
+        let dashed = Stroke {
+            line_dash: LineDash {
+                segments: &[4.0, 4.0],
+                offset: 0,
+            },
+            ..stroke(Color { a: 0.5, ..EDGE }, 1.0)
+        };
+        let unpainted = Path::new(|p| {
+            for (a, b) in document.unique_edges() {
+                if document.edge_style(a, b).is_none() {
+                    p.move_to(screen(a));
+                    p.line_to(screen(b));
+                }
+            }
+        });
+        frame.stroke(&unpainted, dashed);
+
+        // The painted edges, each its own outline, so edges of different
+        // widths meet without lying over each other.
         let edges: Vec<_> = document
-            .unique_edges()
-            .into_iter()
-            .map(|(a, b)| match document.edge_style(a, b) {
-                Some(style) => (a, b, self.edge_width(style.width), style.color),
-                None => (a, b, 1.5, EDGE),
-            })
+            .edge_styles()
+            .map(|(a, b, style)| (a, b, self.edge_width(style.width), style.color))
             .collect();
         let outlines = joints::outlines(
             &edges
@@ -709,6 +732,40 @@ impl Editor<'_> {
                 layer.mirrors,
             );
         }));
+    }
+
+    /// Stripes across `triangles` (world), on screen: one pattern over them
+    /// all, so faces next to each other look one.
+    fn hatch(&self, triangles: &[[Point; 3]]) -> Path {
+        /// How far apart the stripes are (screen px, across them).
+        const SPACING: f32 = 7.0;
+        let step = SPACING * std::f32::consts::SQRT_2;
+        Path::new(|p| {
+            for t in triangles {
+                let corners = t.map(|q| self.camera.to_screen(q));
+                // Along x + y = c: where each stripe runs.
+                let along = corners.map(|q| q.x + q.y);
+                let low = along.iter().copied().fold(f32::INFINITY, f32::min);
+                let high = along.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut c = (low / step).ceil() * step;
+                while c <= high {
+                    let mut ends = Vec::with_capacity(2);
+                    for k in 0..3 {
+                        let (i, j) = (k, (k + 1) % 3);
+                        let (si, sj) = (along[i], along[j]);
+                        if (si - c) * (sj - c) <= 0.0 && si != sj {
+                            let t = (c - si) / (sj - si);
+                            ends.push(corners[i] + (corners[j] - corners[i]) * t);
+                        }
+                    }
+                    if let [a, b, ..] = ends[..] {
+                        p.move_to(a);
+                        p.line_to(b);
+                    }
+                    c += step;
+                }
+            }
+        })
     }
 
     /// A painted edge's width on screen: never too thin to see.

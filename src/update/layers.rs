@@ -18,6 +18,8 @@ pub enum LayerAction {
     Drop,
     /// A new layer in front of the selected one.
     Add,
+    /// A copy of the selected layer (or group) in front of it.
+    Duplicate,
     /// The selected one in a new group.
     Group,
     Ungroup,
@@ -33,7 +35,12 @@ pub enum LayerAction {
 impl Tessera {
     pub(crate) fn layer_action(&mut self, action: LayerAction) -> Task<Message> {
         let before = self.layers.clone();
-        let selected = self.selected;
+        // None selected (yet, or any more): the current layer.
+        let selected = if self.layers.contains(self.selected) {
+            self.selected
+        } else {
+            self.current()
+        };
         if !matches!(action, LayerAction::Rename(_)) {
             self.renaming = None;
         }
@@ -124,6 +131,29 @@ impl Tessera {
                 self.selected = id;
                 true
             }
+            // The copy in front, and worked on (the original kept as it is).
+            LayerAction::Duplicate => match self.layers.duplicate(selected) {
+                Some(copy) => {
+                    // Their background images too (the image itself shared).
+                    let pairs: Vec<_> = self
+                        .layers
+                        .layers_of(selected)
+                        .into_iter()
+                        .zip(self.layers.layers_of(copy))
+                        .collect();
+                    for (original, copied) in pairs {
+                        if let Some(background) = self.backgrounds.get(&original).cloned() {
+                            self.backgrounds.insert(copied, background);
+                        }
+                    }
+                    self.selected = copy;
+                    if let Some(layer) = self.layers.first_layer_of(copy) {
+                        self.current = layer;
+                    }
+                    true
+                }
+                None => false,
+            },
             LayerAction::Group => match self.layers.group(selected) {
                 Some(group) => {
                     self.selected = group;

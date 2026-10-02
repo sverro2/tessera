@@ -177,6 +177,8 @@ pub enum Message {
         anchor: Point,
         angle: f32,
     },
+    /// Fit these points (world) in view: the shape to frame.
+    Frame(Vec<Point>),
     /// Move the background image by this much (world).
     MoveBackground(Vector),
     /// Scale the background image by `factor` around `anchor` (world).
@@ -735,6 +737,39 @@ impl canvas::Program<Message> for Editor<'_> {
 }
 
 impl Editor<'_> {
+    /// The shape to frame (world, as seen: with its mirror images): the
+    /// selection; else the shape under the cursor (at `inside`); else the
+    /// one last highlighted; else all of the layer.
+    fn shape_to_frame(&self, state: &State, inside: Option<Point>) -> Vec<Point> {
+        let document = self.document;
+        let vertices: Vec<VertexId> = if !state.selection.is_empty() {
+            state.selection.clone()
+        } else if let Some(hover) = inside.and_then(|pos| self.hit_test(pos)) {
+            document
+                .connected(self.hover_vertex(hover))
+                .into_iter()
+                .flatten()
+                .collect()
+        } else if let Some(shape) = state
+            .shape
+            .as_ref()
+            .filter(|shape| shape.revision == document.revision())
+        {
+            shape.triangles.iter().flatten().copied().collect()
+        } else {
+            document.unique_vertices()
+        };
+        let images = doc::images(self.mirrors);
+        vertices
+            .iter()
+            .flat_map(|&v| {
+                images
+                    .iter()
+                    .map(move |image| image.apply(document.vertex(v)))
+            })
+            .collect()
+    }
+
     /// Keeping up with what changed since the last event: the shapes
     /// highlighted after an edit, what's moved after proportional editing
     /// changed, the selection (only the shape mode's, of vertices still
@@ -963,6 +998,27 @@ impl Editor<'_> {
                     to: at,
                 };
                 state.pending = pending;
+                Some(canvas::Action::request_redraw().and_capture())
+            }
+            // Framing (/): the shape, as seen (mirrored too), in view.
+            keyboard::Event::KeyPressed { .. }
+                if pressed == Some(Action::FrameShape)
+                    && self.shown
+                    && matches!(state.interaction, Interaction::Idle) =>
+            {
+                let points = self.shape_to_frame(state, inside);
+                (!points.is_empty())
+                    .then(|| canvas::Action::publish(Message::Frame(points)).and_capture())
+            }
+            // Select all (Ctrl+A): every vertex of the layer.
+            keyboard::Event::KeyPressed { .. }
+                if pressed == Some(Action::SelectAll)
+                    && self.tool == Tool::Shape
+                    && self.shown
+                    && matches!(state.interaction, Interaction::Idle) =>
+            {
+                state.selection = self.document.unique_vertices();
+                state.selected_in = self.document.revision();
                 Some(canvas::Action::request_redraw().and_capture())
             }
             // Select shape (Ctrl+L) selects the whole shape under the

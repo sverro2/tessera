@@ -116,6 +116,25 @@ mod tests {
 
         assert!(super::png(&svg, 1000.0, Backdrop::White).is_err());
 
+        // Unpainted, nothing: see-through there.
+        layers.layer_mut(first).unwrap().document = std::sync::Arc::new({
+            let mut document = (*layers.layers()[0].document).clone();
+            document.apply(Edit::PaintAll { color: None });
+            document.apply(Edit::PaintAllEdges { style: None });
+            document
+        });
+        let bare = crate::svg::export(&layers);
+        let png = super::png(&bare, 2.0, Backdrop::Transparent).unwrap();
+        let image = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert!(image.pixels().all(|pixel| pixel.0[3] == 0));
+        layers.layer_mut(first).unwrap().document = std::sync::Arc::new({
+            let mut document = (*layers.layers()[0].document).clone();
+            document.apply(Edit::PaintAll {
+                color: Some(Color::from_rgb8(255, 0, 0)),
+            });
+            document
+        });
+
         // A hidden layer isn't in it, as in the SVG.
         layers.set_visible(first, false);
         let png = super::png(&crate::svg::export(&layers), 2.0, Backdrop::White).unwrap();
