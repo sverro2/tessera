@@ -1333,7 +1333,7 @@ impl Tessera {
             self.mode_switch(),
             space::horizontal(),
             text(match self.mode {
-                Mode::Shape => "Tab/P: paint · Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri (or selection) · Ctrl+drag: lasso · Shift+click: (de)select vertex · Ctrl+L: select shape · Ctrl+C/X/V: copy/cut/paste · Drag/G: move selection · R: rotate · T: scale · O: proportional · Alt+move: its reach · Esc: deselect · Ctrl+M: mirror · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+                Mode::Shape => "Tab/P: paint · Drag corner: move (Shift: line up) · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri (or selection) · Ctrl+drag: lasso · Shift+click: (de)select vertex · Ctrl+L: select shape · Ctrl+C/X/V: copy/cut/paste · Drag/G: move selection · R: rotate · T: scale · O: proportional · Alt+move: its reach · Esc: deselect · Ctrl+M: mirror · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
                 Mode::Paint => "Tab/S: shape · F/E: faces/edges · Click or drag: paint · I/Ctrl+click: pick · Alt+move: edge width · C+move: lighter/darker · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
             })
             .size(12),
