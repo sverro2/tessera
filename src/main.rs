@@ -551,7 +551,7 @@ impl Tessera {
         let before = self.layers.clone();
         for id in ids {
             let layer = self.layers.layer_mut(id).expect("layer");
-            Arc::make_mut(&mut layer.document).apply(edit);
+            Arc::make_mut(&mut layer.document).apply(edit.clone());
         }
         if let Some(color) = self.brush.color() {
             paint::remember(&mut self.recent, color);
@@ -715,6 +715,17 @@ impl Tessera {
             Message::Editor(editor::Message::TweakWidth(across)) => {
                 // In proportion: fine when thin, quicker when thick.
                 self.edge_width = (self.edge_width * (across * 0.01).exp()).clamp(0.5, 12.0);
+                return Task::none();
+            }
+            Message::Editor(editor::Message::TweakLightness(across)) => {
+                // On the colour's value itself: through black and back, its
+                // hue and saturation stay.
+                if let Brush::Color(_) = self.brush {
+                    self.hsv.value = (self.hsv.value + across * 0.004).clamp(0.0, 2.0);
+                    let color = self.hsv.to_color();
+                    self.brush = Brush::Color(color);
+                    self.hex = paint::to_hex(color);
+                }
                 return Task::none();
             }
             Message::Editor(editor::Message::Pick(picked)) => {
@@ -1229,8 +1240,8 @@ impl Tessera {
             self.mode_switch(),
             space::horizontal(),
             text(match self.mode {
-                Mode::Shape => "Tab/P: paint · Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
-                Mode::Paint => "Tab/S: shape · F/E: faces/edges · Click or drag: paint · I/Ctrl+click: pick · Alt+move: edge width · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+                Mode::Shape => "Tab/P: paint · Drag corner: move · Drag edge: extend · Drag blank: new tri · C: cut edge · D: delete tri · Ctrl+drag: lasso · Shift+click: (de)select vertex · Ctrl+L: select shape · Drag/G: move selection · R: rotate · T: scale · Esc: deselect · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
+                Mode::Paint => "Tab/S: shape · F/E: faces/edges · Click or drag: paint · I/Ctrl+click: pick · Alt+move: edge width · C+move: lighter/darker · Middle-drag: pan · Wheel: zoom · Shift+wheel: rotate",
             })
             .size(12),
         ]
@@ -1504,7 +1515,8 @@ impl Tessera {
             container(wheel::view(hsv, INNER - 20.0).map(Message::WheelPicked)).center_x(Fill),
             row![
                 small("Light").width(44),
-                slider(0.0..=1.0, hsv.value, move |value| {
+                // Black, the colour itself (in the middle), white.
+                slider(0.0..=2.0, hsv.value, move |value| {
                     Message::WheelPicked(Hsv { value, ..hsv })
                 })
                 .step(0.01),
@@ -2568,6 +2580,30 @@ mod tests {
             repeat: false,
         }));
         assert!(!app.about);
+    }
+
+    #[test]
+    fn c_and_moving_tweaks_the_lightness() {
+        let mut app = Tessera::default();
+        let _ = app.update(Message::WheelPicked(Hsv {
+            hue: 0.6,
+            saturation: 0.8,
+            value: 0.52,
+        }));
+        let _ = app.update(Message::Editor(editor::Message::TweakLightness(50.0)));
+        assert!((app.hsv.value - 0.72).abs() < 1e-5);
+        // Through black and back, and through white and back: the same
+        // colour again.
+        let before = app.hex.clone();
+        let _ = app.update(Message::Editor(editor::Message::TweakLightness(-1000.0)));
+        assert_eq!(app.hex, "#000000");
+        let _ = app.update(Message::Editor(editor::Message::TweakLightness(180.0)));
+        assert_eq!(app.hex, before);
+        let _ = app.update(Message::Editor(editor::Message::TweakLightness(1000.0)));
+        assert_eq!(app.hex, "#ffffff");
+        let _ = app.update(Message::Editor(editor::Message::TweakLightness(-320.0)));
+        assert_eq!(app.hex, before);
+        assert_eq!(app.brush, Brush::Color(app.hsv.to_color()));
     }
 
     #[test]

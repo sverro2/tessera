@@ -7,6 +7,13 @@
 //! wheel zooms around the cursor, Shift+wheel rotates around it. C cuts the
 //! hovered edge at the cursor; D removes the triangle under it.
 //!
+//! Ctrl+drag draws a lasso, adding the vertices inside it to the
+//! selection; Shift+click adds or removes a vertex; Ctrl+L adds the whole
+//! shape under the cursor (or those the selection is in). The selection is then
+//! dragged, grabbed with G, or rotated (R) or scaled (T) around its
+//! centre (a click applies those); a click without dragging, or Esc,
+//! drops it.
+//!
 //! In the paint mode, clicking a face or dragging over faces paints them
 //! with the brush; the shape can't be changed.
 //!
@@ -34,7 +41,7 @@ use crate::camera::Camera;
 use crate::document::EdgeStyle;
 use crate::document::{Changes, Document, Edit, TriangleId, VertexId, opposite};
 use crate::fade;
-use crate::geometry::{area2, closest_on_line, closest_on_segment, min_height};
+use crate::geometry::{area2, closest_on_line, closest_on_segment, inside_polygon, min_height};
 use crate::icons;
 use crate::joints;
 use crate::layers::{Crossfade, NodeId};
@@ -115,6 +122,9 @@ pub enum Message {
     /// Holding Alt while painting edges, the mouse moved this far across
     /// (screen px): make the stroke wider (or, to the left, thinner).
     TweakWidth(f32),
+    /// Holding C while painting, the mouse moved this far across (screen
+    /// px): make the colour lighter (or, to the left, darker).
+    TweakLightness(f32),
     Pan(Vector),
     Zoom {
         anchor: Point,
@@ -172,6 +182,7 @@ struct LayerKey {
     look: Look,
     crossfade: Crossfade,
     show_edges: bool,
+    vertices: bool,
     camera: (Vector, f32, f32),
     size: Size,
 }
@@ -350,9 +361,32 @@ pub struct State {
     /// that's done once per frame, for the latest position, not for every
     /// mouse move (a mouse may report a thousand a second).
     aim: Option<Point>,
-    /// Holding Alt while painting edges: where the edge previewed meanwhile
-    /// is looked for, and where the mouse last was (screen).
-    tweaking: Option<(Point, Point)>,
+    /// Holding a key while painting to adjust the brush by moving the mouse.
+    tweaking: Option<Tweak>,
+    /// The vertices selected with the lasso (shape mode), to move, rotate or scale
+    /// together; as of document `selected_in`.
+    selection: Vec<VertexId>,
+    selected_in: u64,
+    /// The lasso being drawn (world).
+    lasso: Vec<Point>,
+}
+
+/// Adjusting the brush while painting, by holding a key and moving the
+/// mouse across: what, where the face or edge previewed meanwhile is looked
+/// for, and where the mouse last was (screen).
+#[derive(Debug, Clone, Copy)]
+struct Tweak {
+    what: Tweaking,
+    at: Point,
+    last: Point,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tweaking {
+    /// The stroke width (Alt, painting edges).
+    Width,
+    /// How light the colour is (C).
+    Lightness,
 }
 
 /// An in-progress drag. Positions are in world coordinates.
@@ -396,6 +430,44 @@ enum Interaction {
     MovingBackground {
         last: Point,
     },
+    /// Drawing a lasso (see [`State::lasso`]), to add what's in it to the
+    /// selection.
+    Lassoing,
+    /// Moving the selection by as much as the cursor moved `from` → `to`:
+    /// dragging it (`held`), or grabbed with G, until a click.
+    MovingSelection {
+        from: Point,
+        to: Point,
+        held: bool,
+    },
+    /// Rotating (R) or scaling (T) the selection around `center` by as much
+    /// as the cursor turned around it, or came closer or went further from
+    /// it, going `from` → `to`; until a click.
+    PivotingSelection {
+        pivot: Pivot,
+        center: Point,
+        from: Point,
+        to: Point,
+    },
+}
+
+/// How the selection changes around its centre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pivot {
+    Rotate,
+    Scale,
+}
+
+impl Interaction {
+    /// Grabbing, rotating or scaling the selection: applied on a click, not
+    /// a drag.
+    fn is_transforming(self) -> bool {
+        matches!(
+            self,
+            Interaction::MovingSelection { held: false, .. }
+                | Interaction::PivotingSelection { .. }
+        )
+    }
 }
 
 /// What the cursor is hovering over.
@@ -467,20 +539,157 @@ impl canvas::Program<Message> for Editor<'_> {
                 *shape = self.highlight(shape.start);
             }
         }
+        // The selection is only the shape mode's, and only of vertices still
+        // there (not welded away, say, or undone).
+        if self.tool != Tool::Shape || !self.shown {
+            state.selection.clear();
+            state.lasso.clear();
+            if matches!(
+                state.interaction,
+                Interaction::Lassoing
+                    | Interaction::MovingSelection { .. }
+                    | Interaction::PivotingSelection { .. }
+            ) {
+                state.interaction = Interaction::Idle;
+                state.pending = None;
+            }
+        } else if state.selected_in != revision {
+            let used = self.document.unique_vertices();
+            state.selection.retain(|v| used.binary_search(v).is_ok());
+            state.selected_in = revision;
+        }
 
         match event {
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
                 // Holding Alt over the canvas, painting edges, tweaks the
-                // stroke width; the brush stays where it is meanwhile.
-                state.tweaking = match (state.tweaking, inside) {
-                    _ if !(modifiers.alt() && self.paints_edges()) => None,
-                    (Some(tweaking), _) => Some(tweaking),
-                    (None, Some(pos)) => Some((pos, pos)),
-                    (None, None) => None,
+                // stroke width; the edge previewed stays meanwhile.
+                let alt = modifiers.alt() && self.paints_edges();
+                state.tweaking = match state.tweaking {
+                    Some(tweak) if tweak.what == Tweaking::Width => alt.then_some(tweak),
+                    None if alt => inside.map(|at| Tweak {
+                        what: Tweaking::Width,
+                        at,
+                        last: at,
+                    }),
+                    other => other,
                 };
                 // Holding Ctrl turns the brush into the pipette.
                 matches!(self.tool, Tool::Paint { .. }).then(canvas::Action::request_redraw)
+            }
+            // Holding C while painting (with a colour) tweaks how light it
+            // is; the face or edge previewed stays meanwhile.
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                repeat,
+                ..
+            }) if !modifiers.command()
+                && matches!(
+                    self.tool,
+                    Tool::Paint {
+                        brush: Brush::Color(_),
+                        ..
+                    }
+                )
+                && key.to_latin(*physical_key) == Some('c') =>
+            {
+                if !repeat && state.tweaking.is_none() {
+                    state.tweaking = Some(Tweak {
+                        what: Tweaking::Lightness,
+                        at: inside?,
+                        last: inside?,
+                    });
+                }
+                Some(canvas::Action::request_redraw().and_capture())
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                key, physical_key, ..
+            }) if key.to_latin(*physical_key) == Some('c')
+                && state
+                    .tweaking
+                    .is_some_and(|tweak| tweak.what == Tweaking::Lightness) =>
+            {
+                state.tweaking = None;
+                Some(canvas::Action::request_redraw().and_capture())
+            }
+            // Ctrl+L selects the whole shape under the cursor; off the
+            // drawing, the whole shapes the selection is in.
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) if modifiers.command()
+                && self.tool == Tool::Shape
+                && self.shown
+                && matches!(state.interaction, Interaction::Idle)
+                && key.to_latin(*physical_key) == Some('l') =>
+            {
+                let hovered = inside
+                    .and_then(|pos| self.hit_test(pos))
+                    .map(|hover| vec![self.hover_vertex(hover)]);
+                let from = hovered.unwrap_or_else(|| state.selection.clone());
+                let mut linked = Vec::new();
+                for v in from {
+                    if !linked.contains(&v) {
+                        linked.extend(self.document.connected(v).into_iter().flatten());
+                        linked.sort_unstable();
+                        linked.dedup();
+                    }
+                }
+                for v in linked {
+                    if !state.selection.contains(&v) {
+                        state.selection.push(v);
+                    }
+                }
+                state.selected_in = self.document.revision();
+                Some(canvas::Action::request_redraw().and_capture())
+            }
+            // With a selection: G grabs it, R rotates it, T scales it; Esc
+            // lets go of that, or else of the selection.
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) if !modifiers.command()
+                && !state.selection.is_empty()
+                && (*key == keyboard::Key::Named(keyboard::key::Named::Escape)
+                    || matches!(key.to_latin(*physical_key), Some('g' | 'r' | 't'))) =>
+            {
+                let latin = key.to_latin(*physical_key);
+                match (latin, state.interaction) {
+                    (None, Interaction::Idle) => state.selection.clear(),
+                    (None, _) => {
+                        state.interaction = Interaction::Idle;
+                        state.pending = None;
+                        state.aim = None;
+                    }
+                    (Some(key), Interaction::Idle) => {
+                        let at = self.camera.to_world(inside?);
+                        let center = self.centre(&state.selection);
+                        let pivot = |pivot| Interaction::PivotingSelection {
+                            pivot,
+                            center,
+                            from: at,
+                            to: at,
+                        };
+                        state.interaction = match key {
+                            'g' => Interaction::MovingSelection {
+                                from: at,
+                                to: at,
+                                held: false,
+                            },
+                            'r' => pivot(Pivot::Rotate),
+                            _ => pivot(Pivot::Scale),
+                        };
+                        state.pending = None;
+                    }
+                    _ => return None,
+                }
+                Some(canvas::Action::request_redraw().and_capture())
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
@@ -517,6 +726,43 @@ impl canvas::Program<Message> for Editor<'_> {
                 if *button == mouse::Button::Left && !self.editable() {
                     return None;
                 }
+                // Grabbed, rotating or scaling, the selection follows the cursor: a
+                // click applies that; a right click cancels it.
+                if state.interaction.is_transforming() {
+                    if let Some(world) = state.aim.take() {
+                        self.follow(state, world);
+                    }
+                    let pending = state.pending.take();
+                    state.interaction = Interaction::Idle;
+                    let action = match (button, pending) {
+                        (mouse::Button::Left, Some(pending)) => {
+                            canvas::Action::publish(Message::Edit {
+                                edits: pending.edits,
+                                revision: self.document.revision(),
+                            })
+                        }
+                        _ => canvas::Action::request_redraw(),
+                    };
+                    return Some(action.and_capture());
+                }
+                // Shift+click adds a vertex to the selection, or removes it.
+                if *button == mouse::Button::Left
+                    && self.tool == Tool::Shape
+                    && state.modifiers.shift()
+                    && !state.modifiers.command()
+                    && matches!(state.interaction, Interaction::Idle)
+                {
+                    if let Some(Hover::Vertex(v)) = self.hit_test(pos) {
+                        match state.selection.iter().position(|&s| s == v) {
+                            Some(i) => {
+                                state.selection.remove(i);
+                            }
+                            None => state.selection.push(v),
+                        }
+                        state.selected_in = self.document.revision();
+                    }
+                    return Some(canvas::Action::request_redraw().and_capture());
+                }
                 if *button == mouse::Button::Left && self.picking(state) {
                     return Some(
                         match self.pick(pos) {
@@ -532,11 +778,36 @@ impl canvas::Program<Message> for Editor<'_> {
                     mouse::Button::Left if matches!(self.tool, Tool::Background { .. }) => {
                         Interaction::MovingBackground { last: pos }
                     }
+                    // Adjusting the brush (holding Alt or C): a click applies it
+                    // to what's previewed, not what's under the mouse.
+                    mouse::Button::Left if state.tweaking.is_some() => {
+                        let at = state.tweaking.map_or(pos, |tweak| tweak.at);
+                        state.stroke.clear();
+                        state.edge_stroke.clear();
+                        self.paint_at(state, at);
+                        let faces = std::mem::take(&mut state.stroke);
+                        let edges = std::mem::take(&mut state.edge_stroke);
+                        return Some(self.paint(faces, edges).and_capture());
+                    }
                     mouse::Button::Left if matches!(self.tool, Tool::Paint { .. }) => {
                         state.stroke.clear();
                         state.edge_stroke.clear();
                         self.paint_at(state, pos);
                         Interaction::Painting { last: world }
+                    }
+                    // Ctrl: a lasso.
+                    mouse::Button::Left if state.modifiers.command() => {
+                        state.lasso = vec![world];
+                        Interaction::Lassoing
+                    }
+                    // With a selection, dragging moves it (and a click lets go
+                    // of it).
+                    mouse::Button::Left if !state.selection.is_empty() => {
+                        Interaction::MovingSelection {
+                            from: world,
+                            to: world,
+                            held: true,
+                        }
                     }
                     mouse::Button::Left => match self.hit_test(pos) {
                         Some(Hover::Vertex(id)) => Interaction::MovingVertex {
@@ -572,14 +843,14 @@ impl canvas::Program<Message> for Editor<'_> {
                 let pos = screen?;
                 let world = self.camera.to_world(pos);
 
-                if let (Some((_, last)), Interaction::Idle) =
-                    (&mut state.tweaking, state.interaction)
-                {
-                    let across = pos.x - last.x;
-                    *last = pos;
-                    return Some(
-                        canvas::Action::publish(Message::TweakWidth(across)).and_capture(),
-                    );
+                if let (Some(tweak), Interaction::Idle) = (&mut state.tweaking, state.interaction) {
+                    let across = pos.x - tweak.last.x;
+                    tweak.last = pos;
+                    let message = match tweak.what {
+                        Tweaking::Width => Message::TweakWidth(across),
+                        Tweaking::Lightness => Message::TweakLightness(across),
+                    };
+                    return Some(canvas::Action::publish(message).and_capture());
                 }
 
                 match &mut state.interaction {
@@ -621,6 +892,16 @@ impl canvas::Program<Message> for Editor<'_> {
                         *last = pos;
                         return Some(canvas::Action::publish(Message::Pan(delta)).and_capture());
                     }
+                    Interaction::Lassoing => {
+                        let far = state
+                            .lasso
+                            .last()
+                            .is_none_or(|&p| self.camera.to_screen(p).distance(pos) >= 3.0);
+                        if far {
+                            state.lasso.push(world);
+                        }
+                        return Some(canvas::Action::request_redraw().and_capture());
+                    }
                     _ => {}
                 }
 
@@ -631,6 +912,10 @@ impl canvas::Program<Message> for Editor<'_> {
             Event::Mouse(mouse::Event::ButtonReleased(
                 mouse::Button::Left | mouse::Button::Middle,
             )) => {
+                // Grabbed, rotating or scaling: only a click applies that.
+                if state.interaction.is_transforming() {
+                    return None;
+                }
                 // Where it was let go, if not worked out yet.
                 if let Some(world) = state.aim.take() {
                     self.follow(state, world);
@@ -638,48 +923,40 @@ impl canvas::Program<Message> for Editor<'_> {
                 let finished = std::mem::take(&mut state.interaction);
                 let pending = state.pending.take();
 
+                if let Interaction::Lassoing = finished {
+                    let lasso = std::mem::take(&mut state.lasso);
+                    if lasso.len() >= 3 {
+                        let caught = self
+                            .document
+                            .unique_vertices()
+                            .into_iter()
+                            .filter(|&v| inside_polygon(self.document.vertex(v), &lasso));
+                        for v in caught {
+                            if !state.selection.contains(&v) {
+                                state.selection.push(v);
+                            }
+                        }
+                    }
+                    state.selected_in = self.document.revision();
+                    return Some(canvas::Action::request_redraw().and_capture());
+                }
+                // A click (not a drag) on the selection lets go of it.
+                if let (Interaction::MovingSelection { from, .. }, None) = (finished, &pending) {
+                    let still = screen.is_some_and(|pos| {
+                        self.camera.to_screen(from).distance(pos) < VERTEX_HIT / 2.0
+                    });
+                    if still {
+                        state.selection.clear();
+                    }
+                }
+
                 if let Interaction::Idle = finished {
                     return None;
                 }
                 if let Interaction::Painting { .. } = finished {
                     let faces = std::mem::take(&mut state.stroke);
                     let edges = std::mem::take(&mut state.edge_stroke);
-                    // The tool changed mid-stroke: dropped.
-                    let Tool::Paint {
-                        target,
-                        brush,
-                        width,
-                        ..
-                    } = self.tool
-                    else {
-                        return Some(canvas::Action::request_redraw().and_capture());
-                    };
-                    // Only what changes.
-                    let edits: Vec<_> = match target {
-                        paint::Target::Faces => {
-                            let color = brush.color();
-                            faces
-                                .into_iter()
-                                .filter(|&t| self.document.color(t) != color)
-                                .map(|triangle| Edit::Paint { triangle, color })
-                                .collect()
-                        }
-                        paint::Target::Edges => {
-                            let style = brush.color().map(|color| EdgeStyle { color, width });
-                            edges
-                                .into_iter()
-                                .filter(|&(a, b)| self.document.edge_style(a, b) != style)
-                                .map(|(a, b)| Edit::PaintEdge { a, b, style })
-                                .collect()
-                        }
-                    };
-                    if edits.is_empty() {
-                        return Some(canvas::Action::request_redraw().and_capture());
-                    }
-                    let revision = self.document.revision();
-                    return Some(
-                        canvas::Action::publish(Message::Edit { edits, revision }).and_capture(),
-                    );
+                    return Some(self.paint(faces, edges).and_capture());
                 }
 
                 // Exactly what was shown.
@@ -973,7 +1250,23 @@ impl Editor<'_> {
             }
         }
 
+        self.draw_selection(&mut overlay, state, pending, cursor_pos);
+
         match (state.interaction, &pending) {
+            (
+                Interaction::Lassoing
+                | Interaction::MovingSelection { .. }
+                | Interaction::PivotingSelection { .. },
+                _,
+            ) => {}
+            // With a selection, clicking is about it: no hovering, but for
+            // the vertex Shift+click would add or remove.
+            (Interaction::Idle, _) if !state.selection.is_empty() => {
+                if let (true, Some(Hover::Vertex(id))) = (state.modifiers.shift(), hover) {
+                    let at = camera.to_screen(self.document.vertex(id));
+                    overlay.stroke(&Path::circle(at, 11.0), stroke(HOVER, 2.5));
+                }
+            }
             (Interaction::Idle, _) => match cursor_pos.map(|p| (p, hover)) {
                 Some((_, Some(Hover::Vertex(id)))) => {
                     // A ring as well, to stand out against the shape outline.
@@ -1048,6 +1341,100 @@ impl Editor<'_> {
         with_overlay(layers, overlay)
     }
 
+    /// The lasso being drawn, the selected vertices (where the pending move
+    /// puts them), the centre they rotate or scale around, and the cursor.
+    fn draw_selection(
+        &self,
+        frame: &mut Frame,
+        state: &State,
+        pending: Option<&Pending>,
+        cursor: Option<Point>,
+    ) {
+        let camera = self.camera;
+
+        if let (Interaction::Lassoing, Some((first, rest))) =
+            (state.interaction, state.lasso.split_first())
+        {
+            let lasso = Path::new(|p| {
+                p.move_to(camera.to_screen(*first));
+                for &point in rest {
+                    p.line_to(camera.to_screen(point));
+                }
+                p.close();
+            });
+            frame.fill(&lasso, Color { a: 0.08, ..HOVER });
+            let dashed = Stroke {
+                line_dash: LineDash {
+                    segments: &[6.0, 4.0],
+                    offset: 0,
+                },
+                ..stroke(HOVER, 1.5)
+            };
+            frame.stroke(&lasso, dashed);
+        }
+
+        let at = |v: VertexId| match pending {
+            Some(pending) => pending.result.vertex(pending.changes.kept(v)),
+            None => self.document.vertex(v),
+        };
+        for &v in &state.selection {
+            let p = camera.to_screen(at(v));
+            frame.fill(&Path::circle(p, 4.5), HOVER);
+            frame.stroke(&Path::circle(p, 4.5), stroke(BACKGROUND, 1.5));
+        }
+
+        if let Interaction::PivotingSelection { center, .. } = state.interaction {
+            let c = camera.to_screen(center);
+            let plus = Path::new(|p| {
+                p.move_to(c - Vector::new(6.0, 0.0));
+                p.line_to(c + Vector::new(6.0, 0.0));
+                p.move_to(c - Vector::new(0.0, 6.0));
+                p.line_to(c + Vector::new(0.0, 6.0));
+            });
+            frame.stroke(&plus, stroke(JOINED, 2.0));
+            if let Some(cursor) = cursor {
+                let dashed = Stroke {
+                    line_dash: LineDash {
+                        segments: &[4.0, 4.0],
+                        offset: 0,
+                    },
+                    ..stroke(Color { a: 0.6, ..JOINED }, 1.0)
+                };
+                frame.stroke(&Path::line(c, cursor), dashed);
+            }
+        }
+
+        // The cursor: a cross-hair for the lasso, arrows each way with a
+        // selection to move.
+        let Some(p) = cursor else {
+            return;
+        };
+        match state.interaction {
+            Interaction::Lassoing => {
+                frame.stroke(&Path::circle(p, 4.0), stroke(HOVER, 1.5));
+            }
+            Interaction::Idle
+            | Interaction::MovingSelection { .. }
+            | Interaction::PivotingSelection { .. }
+                if !state.selection.is_empty() =>
+            {
+                let arrows = Path::new(|path| {
+                    for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                        let tip = p + Vector::new(dx * 9.0, dy * 9.0);
+                        path.move_to(p);
+                        path.line_to(tip);
+                        path.move_to(tip + Vector::new(-dx * 3.0 - dy * 3.0, -dy * 3.0 - dx * 3.0));
+                        path.line_to(tip);
+                        path.line_to(tip + Vector::new(-dx * 3.0 + dy * 3.0, -dy * 3.0 + dx * 3.0));
+                    }
+                });
+                frame.stroke(&arrows, stroke(BACKGROUND, 3.5));
+                frame.stroke(&arrows, stroke(HOVER, 1.5));
+            }
+            _ => {}
+        }
+    }
+
     /// Where a drag to `world` gets to, and what releasing there does. If
     /// nothing works out (in time), it stays where it was.
     fn follow(&self, state: &mut State, world: Point) {
@@ -1098,10 +1485,51 @@ impl Editor<'_> {
                     }
                 }
             }
+            Interaction::MovingSelection { from, to, .. } => {
+                let by = world - *from;
+                if let Some(pending) = self.transform(&state.selection, world, |p| p + by) {
+                    *to = world;
+                    state.pending = Some(pending);
+                }
+            }
+            Interaction::PivotingSelection {
+                pivot,
+                center,
+                from,
+                to,
+            } => {
+                let center = *center;
+                // Turned by `turn`, scaled by `scale`, around the centre.
+                let (turn, scale) = match pivot {
+                    Pivot::Rotate => {
+                        let angle = |p: Point| (p.y - center.y).atan2(p.x - center.x);
+                        (angle(world) - angle(*from), 1.0)
+                    }
+                    Pivot::Scale => {
+                        // Started right on the centre: nothing to scale by.
+                        let start = from.distance(center);
+                        if start < 1e-3 {
+                            self.deadline.set(None);
+                            return;
+                        }
+                        (0.0, world.distance(center) / start)
+                    }
+                };
+                let (sin, cos) = turn.sin_cos();
+                let transform = |p: Point| {
+                    let d = (p - center) * scale;
+                    center + Vector::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos)
+                };
+                if let Some(pending) = self.transform(&state.selection, world, transform) {
+                    *to = world;
+                    state.pending = Some(pending);
+                }
+            }
             Interaction::Idle
             | Interaction::Panning { .. }
             | Interaction::MovingBackground { .. }
-            | Interaction::Painting { .. } => {}
+            | Interaction::Painting { .. }
+            | Interaction::Lassoing => {}
         }
         self.deadline.set(None);
     }
@@ -1186,7 +1614,10 @@ impl Editor<'_> {
             Interaction::Idle
             | Interaction::Panning { .. }
             | Interaction::MovingBackground { .. }
-            | Interaction::Painting { .. } => None,
+            | Interaction::Painting { .. }
+            | Interaction::Lassoing => None,
+            // Worked out as they move (see `follow`); not moved yet, nothing.
+            Interaction::MovingSelection { .. } | Interaction::PivotingSelection { .. } => None,
             Interaction::Creating { from, to } => self.check(
                 vec![Edit::AddTriangle {
                     corners: equilateral(from, to),
@@ -1294,6 +1725,32 @@ impl Editor<'_> {
             .find_map(|p| self.check(vec![Edit::MoveVertex { id, to: p }], p))
     }
 
+    /// Moving each of `selection` to where `f` takes it, all at once (the
+    /// cursor `at`). `None` if that doesn't work out: it folds something
+    /// over, say.
+    fn transform(
+        &self,
+        selection: &[VertexId],
+        at: Point,
+        f: impl Fn(Point) -> Point,
+    ) -> Option<Pending> {
+        let moves = selection
+            .iter()
+            .map(|&v| (v, f(self.document.vertex(v))))
+            .collect();
+        self.check(vec![Edit::MoveVertices { moves }], at)
+    }
+
+    /// The centre of `selection`: the average of its vertices.
+    fn centre(&self, selection: &[VertexId]) -> Point {
+        let sum = selection
+            .iter()
+            .map(|&v| self.document.vertex(v))
+            .fold(Vector::ZERO, |sum, p| sum + Vector::new(p.x, p.y));
+        let n = selection.len().max(1) as f32;
+        Point::new(sum.x / n, sum.y / n)
+    }
+
     /// Dragging from edge `a`–`b` (grabbed at `start`) to `apex`. On a side of
     /// the edge that has a triangle, split that triangle and then move the
     /// new vertex to `apex` like any dragged vertex, so it can go on to
@@ -1354,7 +1811,7 @@ impl Editor<'_> {
         let insert = Edit::InsertVertex { at };
 
         let mut document = self.document.clone();
-        document.apply(insert).then(|| {
+        document.apply(insert.clone()).then(|| {
             let id = document.last_vertex();
             (insert, document, id)
         })
@@ -1587,6 +2044,9 @@ impl Editor<'_> {
             // painted; other layers fainter.
             Look::Plain => {
                 self.draw_hinted(frame, document, 1.0, 1.5);
+                if self.shows_vertices(look) {
+                    self.draw_vertices(frame, document);
+                }
                 return;
             }
             Look::Faded => {
@@ -1667,6 +2127,22 @@ impl Editor<'_> {
         }
     }
 
+    /// Whether the vertices are drawn: in the shape mode, on the layer
+    /// being shaped (they're what the shape hangs on).
+    fn shows_vertices(&self, look: Look) -> bool {
+        self.tool == Tool::Shape && look == Look::Plain
+    }
+
+    /// A dot on each vertex.
+    fn draw_vertices(&self, frame: &mut Frame, document: &Document) {
+        let dots = Path::new(|p| {
+            for v in document.unique_vertices() {
+                p.circle(self.camera.to_screen(document.vertex(v)), 2.5);
+            }
+        });
+        frame.fill(&dots, EDGE);
+    }
+
     /// The plain look, `strength` strong (1: full), edges `width` wide, with
     /// a hint of the face colours and edge colours.
     fn draw_hinted(&self, frame: &mut Frame, document: &Document, strength: f32, width: f32) {
@@ -1714,6 +2190,7 @@ impl Editor<'_> {
             look,
             crossfade,
             show_edges,
+            vertices: self.shows_vertices(look),
             camera: (camera.pan, camera.zoom, camera.rotation),
             size,
         };
@@ -1734,6 +2211,49 @@ impl Editor<'_> {
     /// A painted edge's width on screen: never too thin to see.
     fn edge_width(&self, width: f32) -> f32 {
         (width * self.camera.zoom).max(1.0)
+    }
+
+    /// Paints `faces` or `edges` (whichever is painted) with the brush: the
+    /// edit for those that change, if any.
+    fn paint(
+        &self,
+        faces: Vec<TriangleId>,
+        edges: Vec<(VertexId, VertexId)>,
+    ) -> canvas::Action<Message> {
+        // The tool changed meanwhile: nothing.
+        let Tool::Paint {
+            target,
+            brush,
+            width,
+            ..
+        } = self.tool
+        else {
+            return canvas::Action::request_redraw();
+        };
+        // Only what changes.
+        let edits: Vec<_> = match target {
+            paint::Target::Faces => {
+                let color = brush.color();
+                faces
+                    .into_iter()
+                    .filter(|&t| self.document.color(t) != color)
+                    .map(|triangle| Edit::Paint { triangle, color })
+                    .collect()
+            }
+            paint::Target::Edges => {
+                let style = brush.color().map(|color| EdgeStyle { color, width });
+                edges
+                    .into_iter()
+                    .filter(|&(a, b)| self.document.edge_style(a, b) != style)
+                    .map(|(a, b)| Edit::PaintEdge { a, b, style })
+                    .collect()
+            }
+        };
+        if edits.is_empty() {
+            return canvas::Action::request_redraw();
+        }
+        let revision = self.document.revision();
+        canvas::Action::publish(Message::Edit { edits, revision })
     }
 
     /// Adds what's under `screen` to the stroke: the face or the edge,
@@ -1820,9 +2340,9 @@ impl Editor<'_> {
     /// The paint mode's overlay: the stroke so far, what's under the
     /// cursor, and the brush (or pipette) following the cursor.
     fn draw_painting(&self, frame: &mut Frame, state: &State, cursor: Option<Point>) {
-        // Tweaking the width: the edge previewed stays the one it was, while
-        // the brush follows the mouse.
-        let focus = state.tweaking.map(|(at, _)| at).or(cursor);
+        // Tweaking the brush: the face or edge previewed stays the one it
+        // was, while the brush follows the mouse.
+        let focus = state.tweaking.map(|tweak| tweak.at).or(cursor);
         let Tool::Paint {
             target,
             brush,
@@ -1856,7 +2376,10 @@ impl Editor<'_> {
                 if let Some(t) = hovered {
                     let face = faces(&[t]);
                     if let Some(color) = color.filter(|_| !picking) {
-                        frame.fill(&face, Color { a: 0.5, ..color });
+                        // Tweaking its lightness: as it will be.
+                        let tweaking = state.tweaking.is_some();
+                        let alpha = if tweaking { 1.0 } else { 0.5 };
+                        frame.fill(&face, Color { a: alpha, ..color });
                     }
                     frame.stroke(&face, stroke(HOVER, 2.5));
                 }
@@ -1890,12 +2413,20 @@ impl Editor<'_> {
                 Rectangle::new(p - hotspot, iced::Size::new(CURSOR_SIZE, CURSOR_SIZE)),
                 &iced::widget::svg::Handle::from_memory(icon.into_bytes()),
             );
-            // Tweaking: the width, by the brush.
-            if state.tweaking.is_some() {
+            // Tweaking: the width or lightness, by the brush.
+            if let Some(tweak) = state.tweaking {
+                let content = match (tweak.what, color) {
+                    (Tweaking::Width, _) => format!("{width:.1}"),
+                    (Tweaking::Lightness, Some(color)) => {
+                        let hsv = paint::Hsv::from_color(color, 0.0);
+                        format!("{:.0}%", hsv.value * 100.0)
+                    }
+                    (Tweaking::Lightness, None) => String::new(),
+                };
                 let label = Point::new(p.x + CURSOR_SIZE * 0.5, p.y - CURSOR_SIZE * 0.9);
                 for (offset, color) in [(1.0, BACKGROUND), (0.0, EDGE)] {
                     frame.fill_text(canvas::Text {
-                        content: format!("{width:.1}"),
+                        content: content.clone(),
                         position: label + Vector::new(offset, offset),
                         color,
                         size: 13.0.into(),
@@ -2396,6 +2927,252 @@ mod tests {
         position: Point::ORIGIN,
     };
 
+    /// Runs `event` at cursor (`x`, `y`), then a frame; the edits published.
+    fn run(editor: &Editor, state: &mut State, event: Event, x: f32, y: f32) -> Vec<Vec<Edit>> {
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+        let cursor = mouse::Cursor::Available(Point::new(x, y));
+        let frame = Event::Window(window::Event::RedrawRequested(Instant::now()));
+        [event, frame]
+            .into_iter()
+            .filter_map(|event| editor.update(state, &event, bounds, cursor))
+            .flat_map(|action| action.into_inner().0)
+            .filter_map(|m| match m {
+                Message::Edit { edits, .. } => Some(edits),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn key(c: char) -> Event {
+        let key = keyboard::Key::Character(c.to_string().into());
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        })
+    }
+
+    /// Lassos the right triangle of [`two_apart`] (vertices 3, 4, 5).
+    fn lasso_right(editor: &Editor, state: &mut State) {
+        let ctrl = |m| Event::Keyboard(keyboard::Event::ModifiersChanged(m));
+        run(editor, state, ctrl(keyboard::Modifiers::CTRL), 230.0, 180.0);
+        run(editor, state, Event::Mouse(PRESS), 230.0, 180.0);
+        for (x, y) in [(370.0, 180.0), (370.0, 320.0), (230.0, 320.0)] {
+            run(editor, state, Event::Mouse(MOVE), x, y);
+        }
+        run(editor, state, Event::Mouse(RELEASE), 230.0, 320.0);
+        run(
+            editor,
+            state,
+            ctrl(keyboard::Modifiers::empty()),
+            230.0,
+            320.0,
+        );
+        assert!([3, 4, 5].iter().all(|v| state.selection.contains(v)));
+    }
+
+    /// The vertices `edits` move, and where to, sorted.
+    fn moves(edits: &[Vec<Edit>]) -> Vec<(VertexId, Point)> {
+        let [edits] = edits else {
+            panic!("{edits:?}");
+        };
+        let [Edit::MoveVertices { moves }] = &edits[..] else {
+            panic!("{edits:?}");
+        };
+        let mut moves = moves.clone();
+        moves.sort_by_key(|&(v, _)| v);
+        moves
+    }
+
+    #[test]
+    fn a_lassoed_selection_is_dragged_together() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let mut state = State::default();
+        lasso_right(&editor, &mut state);
+
+        run(&editor, &mut state, Event::Mouse(PRESS), 300.0, 250.0);
+        run(&editor, &mut state, Event::Mouse(MOVE), 340.0, 200.0);
+        let edits = run(&editor, &mut state, Event::Mouse(RELEASE), 340.0, 200.0);
+        let by = Vector::new(40.0, -50.0);
+        assert_eq!(moves(&edits), [3, 4, 5].map(|v| (v, doc.vertex(v) + by)));
+        // Still selected, to move on.
+        assert_eq!(state.selection.len(), 3);
+
+        // A click lets go of it.
+        run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 500.0);
+        assert!(run(&editor, &mut state, Event::Mouse(RELEASE), 500.0, 500.0).is_empty());
+        assert!(state.selection.is_empty());
+    }
+
+    #[test]
+    fn g_grabs_the_selection_until_a_click() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let mut state = State::default();
+        lasso_right(&editor, &mut state);
+
+        run(&editor, &mut state, key('g'), 300.0, 250.0);
+        assert!(run(&editor, &mut state, Event::Mouse(MOVE), 310.0, 270.0).is_empty());
+        let edits = run(&editor, &mut state, Event::Mouse(PRESS), 310.0, 270.0);
+        let by = Vector::new(10.0, 20.0);
+        assert_eq!(moves(&edits), [3, 4, 5].map(|v| (v, doc.vertex(v) + by)));
+        assert!(run(&editor, &mut state, Event::Mouse(RELEASE), 310.0, 270.0).is_empty());
+        // Still selected, to go on with.
+        assert_eq!(state.selection.len(), 3);
+    }
+
+    #[test]
+    fn r_rotates_the_selection_around_its_centre() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let mut state = State::default();
+        lasso_right(&editor, &mut state);
+
+        // Its centre is (300, 266.67); a quarter turn round it.
+        let c = Point::new(300.0, 800.0 / 3.0);
+        run(&editor, &mut state, key('r'), c.x + 50.0, c.y);
+        run(&editor, &mut state, Event::Mouse(MOVE), c.x, c.y + 50.0);
+        let edits = run(&editor, &mut state, Event::Mouse(PRESS), c.x, c.y + 50.0);
+        for (v, to) in moves(&edits) {
+            let d = doc.vertex(v) - c;
+            let expected = c + Vector::new(-d.y, d.x);
+            assert!(to.distance(expected) < 1e-3, "{v}: {to:?} != {expected:?}");
+        }
+        assert_eq!(state.selection.len(), 3);
+    }
+
+    #[test]
+    fn t_scales_the_selection_around_its_centre() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let mut state = State::default();
+        lasso_right(&editor, &mut state);
+
+        // Twice as far from its centre (300, 266.67): twice the size.
+        let c = Point::new(300.0, 800.0 / 3.0);
+        run(&editor, &mut state, key('t'), c.x + 20.0, c.y);
+        run(&editor, &mut state, Event::Mouse(MOVE), c.x, c.y - 40.0);
+        let edits = run(&editor, &mut state, Event::Mouse(PRESS), c.x, c.y - 40.0);
+        for (v, to) in moves(&edits) {
+            let expected = c + (doc.vertex(v) - c) * 2.0;
+            assert!(to.distance(expected) < 1e-3, "{v}: {to:?} != {expected:?}");
+        }
+        assert_eq!(state.selection.len(), 3);
+    }
+
+    #[test]
+    fn ctrl_l_selects_the_whole_shape() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let mut state = State::default();
+        let ctrl_l = || {
+            let key = keyboard::Key::Character("l".into());
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyL),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::CTRL,
+                text: None,
+                repeat: false,
+            })
+        };
+        let selected = |state: &State| {
+            let mut selected = state.selection.clone();
+            selected.sort_unstable();
+            selected
+        };
+
+        // Over the left triangle: its vertices.
+        run(&editor, &mut state, ctrl_l(), 150.0, 280.0);
+        assert_eq!(selected(&state), [0, 1, 2]);
+
+        // Off the drawing, from one selected vertex: its shape.
+        state.selection = vec![4];
+        run(&editor, &mut state, ctrl_l(), 600.0, 500.0);
+        assert_eq!(selected(&state), [3, 4, 5]);
+    }
+
+    #[test]
+    fn shift_click_and_another_lasso_add_to_the_selection() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let mut state = State::default();
+        let shift = |m| Event::Keyboard(keyboard::Event::ModifiersChanged(m));
+        lasso_right(&editor, &mut state);
+
+        // Shift+click adds vertex 0, then removes vertex 3; missing a vertex
+        // leaves the selection be.
+        run(
+            &editor,
+            &mut state,
+            shift(keyboard::Modifiers::SHIFT),
+            0.0,
+            0.0,
+        );
+        for (x, y) in [(100.0, 300.0), (250.0, 300.0), (500.0, 500.0)] {
+            run(&editor, &mut state, Event::Mouse(PRESS), x, y);
+            run(&editor, &mut state, Event::Mouse(RELEASE), x, y);
+        }
+        run(
+            &editor,
+            &mut state,
+            shift(keyboard::Modifiers::empty()),
+            0.0,
+            0.0,
+        );
+        let mut selected = state.selection.clone();
+        selected.sort_unstable();
+        assert_eq!(selected, [0, 4, 5]);
+
+        // Lassoing the right triangle again adds 3 back.
+        lasso_right(&editor, &mut state);
+        assert_eq!(state.selection.len(), 4);
+    }
+
+    #[test]
+    fn escape_cancels_a_grab_and_then_the_selection() {
+        let doc = two_apart();
+        let cache = Caches::default();
+        let editor = editor(&doc, &cache);
+        let mut state = State::default();
+        lasso_right(&editor, &mut state);
+        let escape = || {
+            let key = keyboard::Key::Named(keyboard::key::Named::Escape);
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            })
+        };
+
+        run(&editor, &mut state, key('g'), 300.0, 250.0);
+        run(&editor, &mut state, Event::Mouse(MOVE), 310.0, 270.0);
+        run(&editor, &mut state, escape(), 310.0, 270.0);
+        assert!(matches!(state.interaction, Interaction::Idle));
+        assert!(state.pending.is_none());
+        assert_eq!(state.selection.len(), 3);
+        run(&editor, &mut state, escape(), 310.0, 270.0);
+        assert!(state.selection.is_empty());
+    }
+
     #[test]
     fn painting_paints_the_faces_dragged_over_and_nothing_else() {
         let doc = two_apart();
@@ -2579,7 +3356,7 @@ mod tests {
                     assert_eq!(across, 30.0);
                     // The edge previewed is still looked for where Alt was
                     // pressed.
-                    assert_eq!(state.tweaking.unwrap().0, Point::new(200.0, 300.0));
+                    assert_eq!(state.tweaking.unwrap().at, Point::new(200.0, 300.0));
                 }
                 _ => assert!(!tweaks, "{target:?}: {moved:?}"),
             }
@@ -2634,6 +3411,133 @@ mod tests {
         assert!(state.aim.is_none());
         let pending = state.pending.as_ref().expect("worked out");
         assert!(pending.at.distance(Point::new(200.0, 50.0)) < 1e-3);
+    }
+
+    #[test]
+    fn c_and_moving_tweaks_the_lightness() {
+        let doc = one();
+        let cache = Caches::default();
+        let mut editor = editor(&doc, &cache);
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+        let run = |editor: &Editor, state: &mut State, event: Event, x: f32| {
+            let cursor = mouse::Cursor::Available(Point::new(x, 250.0));
+            editor
+                .update(state, &event, bounds, cursor)
+                .and_then(|action| action.into_inner().0)
+        };
+        let c = keyboard::Key::Character("c".into());
+        let physical = keyboard::key::Physical::Code(keyboard::key::Code::KeyC);
+        let press = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: c.clone(),
+            modified_key: c.clone(),
+            physical_key: physical,
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let release = Event::Keyboard(keyboard::Event::KeyReleased {
+            key: c.clone(),
+            modified_key: c,
+            physical_key: physical,
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+        });
+
+        for (brush, tweaks) in [(Brush::default(), true), (Brush::Eraser, false)] {
+            editor.tool = Tool::Paint {
+                target: paint::Target::Faces,
+                brush,
+                width: 2.0,
+                picking: false,
+            };
+            let mut state = State::default();
+            run(&editor, &mut state, press.clone(), 200.0);
+            let moved = run(&editor, &mut state, Event::Mouse(MOVE), 180.0);
+            match moved {
+                Some(Message::TweakLightness(across)) => {
+                    assert!(tweaks);
+                    assert_eq!(across, -20.0);
+                    // The face previewed stays the one C was pressed over.
+                    assert_eq!(state.tweaking.unwrap().at, Point::new(200.0, 250.0));
+                }
+                _ => assert!(!tweaks, "{brush:?}: {moved:?}"),
+            }
+            run(&editor, &mut state, release.clone(), 180.0);
+            assert!(state.tweaking.is_none());
+        }
+    }
+
+    #[test]
+    fn a_click_while_adjusting_paints_what_is_previewed() {
+        let doc = one();
+        let cache = Caches::default();
+        let mut editor = editor(&doc, &cache);
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+        let run = |editor: &Editor, state: &mut State, event: Event, x: f32, y: f32| {
+            let cursor = mouse::Cursor::Available(Point::new(x, y));
+            editor
+                .update(state, &event, bounds, cursor)
+                .and_then(|action| action.into_inner().0)
+        };
+        let alt = |modifiers| Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers));
+        let c = keyboard::Key::Character("c".into());
+        let press_c = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: c.clone(),
+            modified_key: c,
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyC),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let brush = Brush::default();
+
+        // Alt over the bottom edge; the mouse wanders off; a click there
+        // paints the bottom edge, with the width set.
+        editor.tool = Tool::Paint {
+            target: paint::Target::Edges,
+            brush,
+            width: 5.0,
+            picking: false,
+        };
+        let mut state = State::default();
+        run(
+            &editor,
+            &mut state,
+            alt(keyboard::Modifiers::ALT),
+            200.0,
+            300.0,
+        );
+        run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 450.0);
+        let clicked = run(&editor, &mut state, Event::Mouse(PRESS), 200.0, 450.0);
+        let style = Some(EdgeStyle {
+            color: brush.color().unwrap(),
+            width: 5.0,
+        });
+        assert!(
+            matches!(&clicked, Some(Message::Edit { edits, .. })
+                if edits[..] == [Edit::PaintEdge { a: 0, b: 1, style }]),
+            "{clicked:?}"
+        );
+        assert!(run(&editor, &mut state, Event::Mouse(RELEASE), 200.0, 450.0).is_none());
+
+        // C over the face; off the drawing; a click paints the face.
+        editor.tool = Tool::Paint {
+            target: paint::Target::Faces,
+            brush,
+            width: 5.0,
+            picking: false,
+        };
+        let mut state = State::default();
+        run(&editor, &mut state, press_c, 200.0, 250.0);
+        run(&editor, &mut state, Event::Mouse(MOVE), 600.0, 500.0);
+        let clicked = run(&editor, &mut state, Event::Mouse(PRESS), 600.0, 500.0);
+        assert!(
+            matches!(&clicked, Some(Message::Edit { edits, .. })
+                if edits[..] == [Edit::Paint { triangle: 0, color: brush.color() }]),
+            "{clicked:?}"
+        );
     }
 
     #[test]

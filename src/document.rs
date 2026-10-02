@@ -75,7 +75,7 @@ pub struct EdgeStyle {
     pub width: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Edit {
     /// Add a triangle. Where it runs into existing geometry only the
     /// uncovered part is added, joined up with the mesh; corners on
@@ -93,6 +93,12 @@ pub enum Edit {
     /// instead; see [`Document::move_vertex`]. Moved onto another vertex it
     /// welds with it; onto an edge, it splits that edge.
     MoveVertex { id: VertexId, to: Point },
+    /// Move several vertices at once, each to where it's paired with (e.g.
+    /// a selection moved or rotated together). Unlike moving them one by
+    /// one, triangles between them don't fold over on the way; but nothing
+    /// is rearranged either: a move that folds a triangle over is rejected.
+    /// Landing on other vertices or edges joins them up as usual.
+    MoveVertices { moves: Vec<(VertexId, Point)> },
     /// Paint a face this colour; `None` clears it.
     Paint {
         triangle: TriangleId,
@@ -401,14 +407,15 @@ impl Document {
         let mut changes = Changes::default();
         let mut document = self.clone();
 
-        for &edit in edits {
+        for edit in edits {
             let mut next = document.clone();
-            let moved = match edit {
-                Edit::MoveVertex { id, .. } => Some(id),
-                _ => None,
+            let moved: Vec<VertexId> = match edit {
+                Edit::MoveVertex { id, .. } => vec![*id],
+                Edit::MoveVertices { moves } => moves.iter().map(|&(id, _)| id).collect(),
+                _ => Vec::new(),
             };
-            let valid = next.apply_unchecked(edit, &mut changes, deadline)
-                && next.normalize(moved, &mut changes, &document)
+            let valid = next.apply_unchecked(edit.clone(), &mut changes, deadline)
+                && next.normalize(&moved, &mut changes, &document)
                 && next.is_valid_after(&document);
             if !valid {
                 return None;
@@ -439,6 +446,17 @@ impl Document {
                 }
             }
             Edit::MoveVertex { id, to } => self.move_vertex(id, to),
+            Edit::MoveVertices { moves } => {
+                let used = self.unique_vertices();
+                moves.iter().all(|(id, to)| {
+                    used.binary_search(id).is_ok() && to.x.is_finite() && to.y.is_finite()
+                }) && {
+                    for &(id, to) in &moves {
+                        self.vertices[id] = to;
+                    }
+                    true
+                }
+            }
             Edit::Paint { triangle, color } => {
                 let Some(&t) = self.triangles.get(triangle) else {
                     return false;
@@ -664,7 +682,7 @@ impl Document {
     }
 
     /// Makes the connectivity follow the geometry: welds vertices at the
-    /// same spot (keeping the one that wasn't `moved`), drops triangles that
+    /// same spot (keeping one that wasn't `moved`), drops triangles that
     /// are flat, and splits edges that have a vertex lying on them (see
     /// [`Self::split_t_junctions`]). Records what it did in `changes`.
     ///
@@ -672,12 +690,7 @@ impl Document {
     ///
     /// `before` is the (normalized) document the edit was made to: only what
     /// changed since needs checking against the rest.
-    fn normalize(
-        &mut self,
-        moved: Option<VertexId>,
-        changes: &mut Changes,
-        before: &Document,
-    ) -> bool {
+    fn normalize(&mut self, moved: &[VertexId], changes: &mut Changes, before: &Document) -> bool {
         let used = self.unique_vertices();
         let changed = Changed::since(self, before);
 
@@ -686,9 +699,13 @@ impl Document {
                 if u == v || self.vertices[u].distance(self.vertices[v]) > tolerance(0.0) {
                     continue;
                 }
-                // The later one goes, unless the earlier one is the one moved.
+                // The later one goes, unless only the earlier one was moved.
                 let (u, v) = (u.min(v), u.max(v));
-                let (gone, kept) = if Some(u) == moved { (u, v) } else { (v, u) };
+                let (gone, kept) = if moved.contains(&u) && !moved.contains(&v) {
+                    (u, v)
+                } else {
+                    (v, u)
+                };
                 if changes.welded.iter().any(|&(g, _)| g == gone || g == kept) {
                     continue; // Already welded away.
                 }
@@ -901,6 +918,28 @@ mod tests {
             snap: 0.0
         }));
         doc
+    }
+
+    #[test]
+    fn vertices_move_together_without_folding_on_the_way() {
+        let mut doc = Document::default();
+        assert!(doc.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(0.0, 10.0)
+            ],
+            snap: 0.0
+        }));
+        // The whole triangle, far past where any corner alone would fold it.
+        let by = iced::Vector::new(100.0, 50.0);
+        let moves: Vec<_> = (0..3).map(|v| (v, doc.vertex(v) + by)).collect();
+        assert!(doc.apply(Edit::MoveVertices { moves }));
+        assert_eq!(doc.vertex(0), Point::new(100.0, 50.0));
+        assert_eq!(doc.triangle_ids().len(), 1);
+        // Folding it over is rejected.
+        let flipped = vec![(1, Point::new(90.0, 50.0))];
+        assert!(!doc.apply(Edit::MoveVertices { moves: flipped }));
     }
 
     #[test]
@@ -1592,9 +1631,9 @@ mod fuzz {
 
                 let started = std::time::Instant::now();
                 let mut unchecked = doc.clone();
-                if !unchecked.apply_unchecked(edit, &mut Changes::default(), None) {
+                if !unchecked.apply_unchecked(edit.clone(), &mut Changes::default(), None) {
                     empty += 1;
-                } else if doc.apply(edit) {
+                } else if doc.apply(edit.clone()) {
                     ok += 1;
                     assert!(!super::tests::has_t_junction(&doc), "{edit:?}");
                 } else {

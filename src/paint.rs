@@ -71,8 +71,10 @@ pub fn from_hex(text: &str) -> Option<Color> {
     Some(Color::from_rgb8(r, g, b))
 }
 
-/// Hue (0 to 1, from red round through green and blue), saturation and
-/// value (both 0 to 1).
+/// A colour as hue (0 to 1, from red round through green and blue),
+/// saturation (0 to 1) and lightness `value`: 0 is black, 1 the colour
+/// itself (as bright as it goes), 2 white (its saturation all faded out).
+/// Past 1 the colour pales, keeping its hue and saturation to come back to.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Hsv {
     pub hue: f32,
@@ -84,9 +86,15 @@ impl Hsv {
     pub fn to_color(self) -> Color {
         let Hsv {
             hue,
-            saturation: s,
-            value: v,
+            saturation,
+            value,
         } = self;
+        // Past full brightness: paler, towards white.
+        let (s, v) = if value > 1.0 {
+            (saturation * (2.0 - value).max(0.0), 1.0)
+        } else {
+            (saturation, value.max(0.0))
+        };
         let h = hue.rem_euclid(1.0) * 6.0;
         let f = h.fract();
         let (p, q, t) = (v * (1.0 - s), v * (1.0 - s * f), v * (1.0 - s * (1.0 - f)));
@@ -144,6 +152,21 @@ mod tests {
         assert_eq!(from_hex("f00"), Some(Color::from_rgb8(255, 0, 0)));
         assert_eq!(from_hex("#12345"), None);
         assert_eq!(from_hex("#gggggg"), None);
+    }
+
+    #[test]
+    fn lightness_goes_from_black_through_the_colour_to_white() {
+        let colour = Hsv {
+            hue: 0.0,
+            saturation: 1.0,
+            value: 1.0,
+        };
+        let at = |value| to_hex(Hsv { value, ..colour }.to_color());
+        assert_eq!(at(0.0), "#000000");
+        assert_eq!(at(0.5), "#800000");
+        assert_eq!(at(1.0), "#ff0000");
+        assert_eq!(at(1.5), "#ff8080");
+        assert_eq!(at(2.0), "#ffffff");
     }
 
     #[test]

@@ -60,3 +60,16 @@ pub fn closest_on_line(p: Point, a: Point, b: Point) -> (Point, f32) {
     let closest = a + ab * t;
     (closest, closest.distance(p))
 }
+
+/// Whether `p` lies inside the polygon through `points` (closed back to
+/// the first; crossing itself, by the even-odd rule).
+pub fn inside_polygon(p: Point, points: &[Point]) -> bool {
+    let mut inside = false;
+    for (i, &a) in points.iter().enumerate() {
+        let b = points[(i + 1) % points.len()];
+        if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x) {
+            inside = !inside;
+        }
+    }
+    inside
+}
