@@ -167,6 +167,9 @@ pub enum Message {
     /// Holding C while painting, the mouse moved this far across (screen
     /// px): make the colour lighter (or, to the left, darker).
     TweakLightness(f32),
+    /// Holding the opacity key (Shift+C) and moving: the brush's colour
+    /// more opaque (right) or less (left), by how far (screen px).
+    TweakOpacity(f32),
     /// Copied (Ctrl+C): the selected faces.
     Copy(Piece),
     /// Cut (Ctrl+X): the selected faces copied, and these edits removing
@@ -549,6 +552,8 @@ enum Tweaking {
     Width,
     /// How light the colour is (C).
     Lightness,
+    /// How opaque the colour is (Shift+C).
+    Opacity,
     /// How far proportional editing reaches (Shift+O, in the shape mode).
     Reach,
 }

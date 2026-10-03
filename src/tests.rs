@@ -639,6 +639,7 @@ fn c_and_moving_tweaks_the_lightness() {
         hue: 0.6,
         saturation: 0.8,
         value: 0.52,
+        ..Hsv::default()
     })));
     let _ = app.update(Message::Editor(editor::Message::TweakLightness(50.0)));
     assert!((app.paint.hsv.value - 0.72).abs() < 1e-5);
@@ -654,6 +655,24 @@ fn c_and_moving_tweaks_the_lightness() {
     let _ = app.update(Message::Editor(editor::Message::TweakLightness(-320.0)));
     assert_eq!(app.paint.hex, before);
     assert_eq!(app.paint.brush, Brush::Color(app.paint.hsv.to_color()));
+}
+
+#[test]
+fn shift_c_and_moving_tweaks_the_opacity() {
+    let mut app = Tessera::default();
+    let opaque = app.paint.brush.color().unwrap();
+    // Left: less opaque, as far as see-through; right: back, as far as
+    // opaque. The colour itself stays.
+    let _ = app.update(Message::Editor(editor::Message::TweakOpacity(-250.0)));
+    assert!((app.paint.hsv.alpha - 0.5).abs() < 1e-5);
+    let half = app.paint.brush.color().unwrap();
+    assert!((half.a - 0.5).abs() < 1e-5);
+    assert_eq!(paint::to_opaque_hex(half), paint::to_opaque_hex(opaque));
+    assert_eq!(app.paint.hex, paint::to_hex(half));
+    let _ = app.update(Message::Editor(editor::Message::TweakOpacity(-1000.0)));
+    assert_eq!(app.paint.hsv.alpha, 0.0);
+    let _ = app.update(Message::Editor(editor::Message::TweakOpacity(1000.0)));
+    assert_eq!(app.paint.hex, paint::to_hex(opaque));
 }
 
 #[test]

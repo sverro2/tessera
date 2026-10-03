@@ -78,11 +78,12 @@ pub enum Action {
     PaintEdges,
     Pipette,
     Lightness,
+    Opacity,
     Width,
 }
 
 impl Action {
-    pub const ALL: [Action; 31] = [
+    pub const ALL: [Action; 32] = [
         Action::ToggleMode,
         Action::New,
         Action::Open,
@@ -113,6 +114,7 @@ impl Action {
         Action::PaintEdges,
         Action::Pipette,
         Action::Lightness,
+        Action::Opacity,
         Action::Width,
     ];
 
@@ -125,7 +127,7 @@ impl Action {
             | SelectShape | SelectAll | Copy | CutFaces | Paste | Proportional | Reach => {
                 Context::Shape
             }
-            PaintFaces | PaintEdges | Pipette | Lightness | Width => Context::Paint,
+            PaintFaces | PaintEdges | Pipette | Lightness | Opacity | Width => Context::Paint,
         }
     }
 
@@ -167,6 +169,7 @@ impl Action {
             PaintEdges => "Paint edges",
             Pipette => "Pipette on/off",
             Lightness => "Hold and move: lighter or darker",
+            Opacity => "Hold and move: more or less opaque",
             Width => "Hold and move: edge width",
         }
     }
@@ -205,6 +208,7 @@ impl Action {
             PaintEdges => &["E"],
             Pipette => &["I"],
             Lightness => &["C"],
+            Opacity => &["Shift+C"],
             Width => &["W"],
         }
     }
@@ -570,6 +574,10 @@ mod tests {
         assert_eq!(
             keys.action(&chord("C"), Context::Paint),
             Some(Action::Lightness)
+        );
+        assert_eq!(
+            keys.action(&chord("Shift+C"), Context::Paint),
+            Some(Action::Opacity)
         );
         // Everywhere.
         assert_eq!(

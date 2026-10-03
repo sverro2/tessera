@@ -47,7 +47,7 @@ impl canvas::Program<Hsv> for Wheel {
             Hsv {
                 hue: (d.y.atan2(d.x) / TAU).rem_euclid(1.0),
                 saturation: (d.x.hypot(d.y) / radius(bounds)).min(1.0),
-                value: self.color.value,
+                ..self.color
             }
         };
         match event {
@@ -109,6 +109,7 @@ impl canvas::Program<Hsv> for Wheel {
                         hue: (step as f32 + 0.5) / HUES as f32,
                         saturation: (ring as f32 + 0.5) / RINGS as f32,
                         value,
+                        alpha: 1.0,
                     };
                     frame.fill(&cell, color.to_color());
                 }

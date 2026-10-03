@@ -286,6 +286,53 @@ fn c_and_moving_tweaks_the_lightness() {
 }
 
 #[test]
+fn shift_c_and_moving_tweaks_the_opacity() {
+    let doc = one();
+    let cache = Caches::default();
+    let mut editor = editor(&doc, &cache);
+    let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+    let run = |editor: &Editor, state: &mut State, event: Event, x: f32| {
+        let cursor = mouse::Cursor::Available(Point::new(x, 250.0));
+        editor
+            .update(state, &event, bounds, cursor)
+            .and_then(|action| action.into_inner().0)
+    };
+    let c = letter('c');
+    let physical = keyboard::key::Physical::Code(keyboard::key::Code::KeyC);
+    let press = press(c.clone(), keyboard::Modifiers::SHIFT);
+    let release = Event::Keyboard(keyboard::Event::KeyReleased {
+        key: c.clone(),
+        modified_key: c,
+        physical_key: physical,
+        location: keyboard::Location::Standard,
+        modifiers: keyboard::Modifiers::empty(),
+    });
+
+    for (brush, tweaks) in [(Brush::default(), true), (Brush::Eraser, false)] {
+        editor.tool = Tool::Paint {
+            target: paint::Target::Faces,
+            brush,
+            width: 2.0,
+            picking: false,
+        };
+        let mut state = State::default();
+        run(&editor, &mut state, press.clone(), 200.0);
+        let moved = run(&editor, &mut state, Event::Mouse(MOVE), 180.0);
+        match moved {
+            Some(Message::TweakOpacity(across)) => {
+                assert!(tweaks);
+                assert_eq!(across, -20.0);
+                // The face previewed stays the one Shift+C was pressed over.
+                assert_eq!(state.tweaking.unwrap().at, Point::new(200.0, 250.0));
+            }
+            _ => assert!(!tweaks, "{brush:?}: {moved:?}"),
+        }
+        run(&editor, &mut state, release.clone(), 180.0);
+        assert!(state.tweaking.is_none());
+    }
+}
+
+#[test]
 fn a_click_while_adjusting_paints_what_is_previewed() {
     let doc = one();
     let cache = Caches::default();

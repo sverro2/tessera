@@ -199,6 +199,7 @@ impl Editor<'_> {
         let tweak = state.tweaking?;
         let action = match tweak.what {
             Tweaking::Lightness => Action::Lightness,
+            Tweaking::Opacity => Action::Opacity,
             Tweaking::Width => Action::Width,
             Tweaking::Reach => Action::Reach,
         };
@@ -247,7 +248,7 @@ impl Editor<'_> {
         screen: Option<Point>,
     ) -> Option<canvas::Action<Message>> {
         match action {
-            Action::Reach | Action::Lightness | Action::Width => {
+            Action::Reach | Action::Lightness | Action::Opacity | Action::Width => {
                 self.tweak(state, action, repeat, inside, screen)
             }
             Action::Copy | Action::CutFaces | Action::Paste if self.shaping(state) => {
@@ -325,6 +326,17 @@ impl Editor<'_> {
                 ) =>
             {
                 (Tweaking::Lightness, inside)
+            }
+            Action::Opacity
+                if matches!(
+                    self.tool,
+                    Tool::Paint {
+                        brush: Brush::Color(_),
+                        ..
+                    }
+                ) =>
+            {
+                (Tweaking::Opacity, inside)
             }
             Action::Width if self.paints_edges() => (Tweaking::Width, inside),
             _ => return None,
@@ -749,6 +761,7 @@ impl Editor<'_> {
             let message = match tweak.what {
                 Tweaking::Width => Message::TweakWidth(across),
                 Tweaking::Lightness => Message::TweakLightness(across),
+                Tweaking::Opacity => Message::TweakOpacity(across),
                 Tweaking::Reach => Message::TweakReach(across),
             };
             return canvas::Action::publish(message).and_capture();

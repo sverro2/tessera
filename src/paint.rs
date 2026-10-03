@@ -1,5 +1,5 @@
-//! Face colours: writing them as `#rrggbb`, the preset palette, and the
-//! colours used recently.
+//! Face colours: writing them as `#rrggbb` (`#rrggbbaa` if they're
+//! translucent), the preset palette, and the colours used recently.
 
 use iced::Color;
 
@@ -53,33 +53,57 @@ impl Default for Brush {
 /// How many recently used colours are kept.
 const RECENT: usize = 10;
 
-/// `#rrggbb`.
+/// `#rrggbb`; translucent, `#rrggbbaa` (its opacity last).
 pub fn to_hex(color: Color) -> String {
-    let [r, g, b, _] = color.into_rgba8();
-    format!("#{r:02x}{g:02x}{b:02x}")
+    let [r, g, b, a] = color.into_rgba8();
+    if a == 255 {
+        format!("#{r:02x}{g:02x}{b:02x}")
+    } else {
+        format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
+    }
 }
 
-/// Reads `#rrggbb` (the `#` optional; also `#rgb`).
+/// `#rrggbb` of `color`, leaving its opacity out (SVG gives that apart).
+pub fn to_opaque_hex(color: Color) -> String {
+    to_hex(Color { a: 1.0, ..color })
+}
+
+/// Reads `#rrggbb`, or `#rrggbbaa` with its opacity (the `#` optional;
+/// also `#rgb`). Without an opacity, fully opaque.
 pub fn from_hex(text: &str) -> Option<Color> {
     let hex = text.trim().trim_start_matches('#');
     let digit = |i: usize, n: usize| u8::from_str_radix(hex.get(i..i + n)?, 16).ok();
-    let (r, g, b) = match hex.len() {
-        6 => (digit(0, 2)?, digit(2, 2)?, digit(4, 2)?),
-        3 => (digit(0, 1)? * 17, digit(1, 1)? * 17, digit(2, 1)? * 17),
+    let (r, g, b, a) = match hex.len() {
+        8 => (digit(0, 2)?, digit(2, 2)?, digit(4, 2)?, digit(6, 2)?),
+        6 => (digit(0, 2)?, digit(2, 2)?, digit(4, 2)?, 255),
+        3 => (digit(0, 1)? * 17, digit(1, 1)? * 17, digit(2, 1)? * 17, 255),
         _ => return None,
     };
-    Some(Color::from_rgb8(r, g, b))
+    Some(Color::from_rgba8(r, g, b, f32::from(a) / 255.0))
 }
 
 /// A colour as hue (0 to 1, from red round through green and blue),
 /// saturation (0 to 1) and lightness `value`: 0 is black, 1 the colour
 /// itself (as bright as it goes), 2 white (its saturation all faded out).
 /// Past 1 the colour pales, keeping its hue and saturation to come back to.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// And its opacity (`alpha`, 0 to 1: fully opaque).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Hsv {
     pub hue: f32,
     pub saturation: f32,
     pub value: f32,
+    pub alpha: f32,
+}
+
+impl Default for Hsv {
+    fn default() -> Self {
+        Hsv {
+            hue: 0.0,
+            saturation: 0.0,
+            value: 0.0,
+            alpha: 1.0,
+        }
+    }
 }
 
 impl Hsv {
@@ -88,6 +112,7 @@ impl Hsv {
             hue,
             saturation,
             value,
+            alpha,
         } = self;
         // Past full brightness: paler, towards white.
         let (s, v) = if value > 1.0 {
@@ -106,13 +131,13 @@ impl Hsv {
             4 => (t, p, v),
             _ => (v, p, q),
         };
-        Color::from_rgb(r, g, b)
+        Color::from_rgba(r, g, b, alpha)
     }
 
     /// `color` as hue, saturation and value; for greys (which have no hue)
     /// keeping `hue`.
     pub fn from_color(color: Color, hue: f32) -> Hsv {
-        let Color { r, g, b, .. } = color;
+        let Color { r, g, b, a } = color;
         let max = r.max(g).max(b);
         let min = r.min(g).min(b);
         let d = max - min;
@@ -129,6 +154,7 @@ impl Hsv {
             hue,
             saturation: if max <= 1e-6 { 0.0 } else { d / max },
             value: max,
+            alpha: a,
         }
     }
 }
@@ -150,6 +176,12 @@ mod tests {
             assert_eq!(from_hex(&to_hex(color)), Some(color));
         }
         assert_eq!(from_hex("f00"), Some(Color::from_rgb8(255, 0, 0)));
+        // Translucent: its opacity too; else opaque, written as before.
+        let half = Color::from_rgba8(0x12, 0x34, 0x56, 128.0 / 255.0);
+        assert_eq!(to_hex(half), "#12345680");
+        assert_eq!(from_hex("#12345680"), Some(half));
+        assert_eq!(to_opaque_hex(half), "#123456");
+        assert_eq!(from_hex("#123456").map(|c| c.a), Some(1.0));
         assert_eq!(from_hex("#12345"), None);
         assert_eq!(from_hex("#gggggg"), None);
     }
@@ -160,6 +192,7 @@ mod tests {
             hue: 0.0,
             saturation: 1.0,
             value: 1.0,
+            alpha: 1.0,
         };
         let at = |value| to_hex(Hsv { value, ..colour }.to_color());
         assert_eq!(at(0.0), "#000000");

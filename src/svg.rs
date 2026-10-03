@@ -139,10 +139,10 @@ fn write_drawing(svg: &mut String, layer: &Layer, prefix: &str, depth: usize, se
         .zip(document.colors())
         .filter_map(|(t, color)| Some((t, color?)));
     for (i, ([a, b, c], color)) in painted.enumerate() {
-        let fill = paint::to_hex(color);
+        let fill = paint_attributes("fill", "fill-opacity", color);
         let _ = writeln!(
             svg,
-            r#"{indent}<path id="{prefix}face{i}" d="M {},{} L {},{} L {},{} Z" fill="{fill}"/>"#,
+            r#"{indent}<path id="{prefix}face{i}" d="M {},{} L {},{} L {},{} Z" {fill}/>"#,
             a.x, a.y, b.x, b.y, c.x, c.y
         );
     }
@@ -156,7 +156,7 @@ fn write_drawing(svg: &mut String, layer: &Layer, prefix: &str, depth: usize, se
     // each other.
     let edges: Vec<_> = document
         .edge_styles()
-        .map(|(a, b, style)| (a, b, style.width, paint::to_hex(style.color)))
+        .map(|(a, b, style)| (a, b, style.width, style.color))
         .collect();
     let outlines = joints::outlines(
         &edges
@@ -189,17 +189,17 @@ fn write_drawing(svg: &mut String, layer: &Layer, prefix: &str, depth: usize, se
             for &(at, color) in stops {
                 let _ = write!(
                     gradient,
-                    r#"<stop offset="{}" stop-color="{}"/>"#,
+                    r#"<stop offset="{}" {}/>"#,
                     at / length,
-                    paint::to_hex(color)
+                    paint_attributes("stop-color", "stop-opacity", color),
                 );
             }
             let _ = writeln!(svg, "{indent}{gradient}</linearGradient>");
-            format!("url(#{id}-fade)")
+            format!(r#"fill="url(#{id}-fade)""#)
         } else {
-            color.clone()
+            paint_attributes("fill", "fill-opacity", *color)
         };
-        let _ = writeln!(svg, r#"{indent}<path id="{id}" d="{d}" fill="{fill}"/>"#);
+        let _ = writeln!(svg, r#"{indent}<path id="{id}" d="{d}" {fill}/>"#);
     }
 }
 
@@ -234,6 +234,10 @@ fn write_seals(
         let &[(one, c), (other, d)] = &sides[..] else {
             continue; // On the outline: nothing to seal.
         };
+        // Translucent, it would show through, a line darker than the faces.
+        if one.a < 1.0 || other.a < 1.0 {
+            continue;
+        }
         if show_edges && document.edge_style(a, b).is_some() {
             continue;
         }
@@ -289,6 +293,18 @@ fn write_seals(
         );
     }
     let _ = writeln!(svg, "{indent}</g>");
+}
+
+/// `color` as the attributes `name` (`fill`, say) and, translucent, its
+/// opacity apart as `opacity` (`fill-opacity`): what SVG readers all
+/// understand.
+fn paint_attributes(name: &str, opacity: &str, color: Color) -> String {
+    let hex = paint::to_opaque_hex(color);
+    if color.a >= 1.0 {
+        format!(r#"{name}="{hex}""#)
+    } else {
+        format!(r#"{name}="{hex}" {opacity}="{}""#, color.a)
+    }
 }
 
 /// `text` as XML attribute content.
@@ -434,6 +450,37 @@ mod tests {
             "{svg}"
         );
         assert_eq!(svg.matches("url(#l1-edge").count(), 2, "{svg}");
+    }
+
+    #[test]
+    fn translucent_faces_have_their_opacity_and_no_seals() {
+        let mut document = Document::default();
+        document.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(0.0, 0.0),
+                Point::new(10.0, 0.0),
+                Point::new(5.0, 10.0),
+            ],
+            snap: 0.0,
+        });
+        document.apply(Edit::InsertVertex {
+            at: Point::new(5.0, 4.0),
+        });
+        let see_through = Color::from_rgba8(255, 0, 0, 0.5);
+        document.apply(Edit::PaintAll {
+            color: Some(see_through),
+        });
+        document.apply(Edit::PaintAllEdges { style: None });
+        let mut layers = Layers::default();
+        let first = layers.first_layer();
+        layers.layer_mut(first).unwrap().document = std::sync::Arc::new(document);
+        let svg = export(&layers, None);
+        assert!(
+            svg.contains(r##"fill="#ff0000" fill-opacity="0.5""##),
+            "{svg}"
+        );
+        // A seal would show through, a line darker than the faces.
+        assert!(!svg.contains("Seals"), "{svg}");
     }
 
     #[test]

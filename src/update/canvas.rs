@@ -74,6 +74,17 @@ impl Tessera {
                 }
                 Task::none()
             }
+            editor::Message::TweakOpacity(across) => {
+                // From see-through to opaque in some 500 px.
+                if let Brush::Color(_) = self.paint.brush {
+                    let alpha = (self.paint.hsv.alpha + across * 0.002).clamp(0.0, 1.0);
+                    self.paint.hsv.alpha = alpha;
+                    let color = self.paint.hsv.to_color();
+                    self.paint.brush = Brush::Color(color);
+                    self.paint.hex = paint::to_hex(color);
+                }
+                Task::none()
+            }
             editor::Message::Pick(picked) => {
                 // Brushes that paint just like what was picked.
                 let color = match picked {

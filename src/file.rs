@@ -681,6 +681,7 @@ fn place(mut background: Background, saved: &SavedBackground) -> Background {
 mod tests {
     use super::*;
     use crate::document::Edit;
+    use iced::Color;
 
     fn drawing() -> Document {
         let mut document = Document::default();
@@ -811,6 +812,26 @@ mod tests {
         assert_eq!(opened.camera.rotation, camera.rotation);
         // The layer worked on.
         assert_eq!(opened.current, Some(opened.layers.layers()[1].id));
+    }
+
+    #[test]
+    fn opacity_is_kept_and_left_out_when_opaque() {
+        let mut document = drawing();
+        let see_through = Color::from_rgba8(0x12, 0x34, 0x56, 0.25);
+        assert!(document.apply(Edit::Paint {
+            triangle: 0,
+            color: Some(see_through),
+        }));
+        let mut layers = Layers::default();
+        let first = layers.first_layer();
+        layers.layer_mut(first).unwrap().document = Arc::new(document);
+        let saved = save(&layers, Camera::default(), &HashMap::new(), first);
+        let opened = open(&saved).unwrap();
+        let colour = opened.layers.layers()[0].document.color(0).unwrap();
+        assert_eq!(paint::to_hex(colour), paint::to_hex(see_through));
+        // Opaque ones stay so (written without an opacity: see `to_hex`).
+        let opaque = opened.layers.layers()[0].document.color(1);
+        assert_eq!(opaque, Some(paint::PALETTE[3]));
     }
 
     #[test]

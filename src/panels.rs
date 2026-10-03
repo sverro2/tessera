@@ -299,6 +299,16 @@ impl Tessera {
             ]
             .spacing(8)
             .align_y(Center),
+            row![
+                small("Opacity").width(44),
+                // See-through to opaque.
+                slider(0.0..=1.0, hsv.alpha, move |alpha| {
+                    Message::Paint(PaintMessage::WheelPicked(Hsv { alpha, ..hsv }))
+                })
+                .step(0.01),
+            ]
+            .spacing(8)
+            .align_y(Center),
         ]
         .spacing(8);
         if self.paint.target == Target::Edges {

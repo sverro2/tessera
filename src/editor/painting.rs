@@ -276,7 +276,7 @@ impl Editor<'_> {
                 Rectangle::new(p - hotspot, iced::Size::new(CURSOR_SIZE, CURSOR_SIZE)),
                 &iced::widget::svg::Handle::from_memory(icon.into_bytes()),
             );
-            // Tweaking: the width or lightness, by the brush.
+            // Tweaking: the width, lightness or opacity, by the brush.
             if let Some(tweak) = state.tweaking {
                 let content = match (tweak.what, color) {
                     (Tweaking::Width, _) => format!("{width:.1}"),
@@ -284,7 +284,10 @@ impl Editor<'_> {
                         let hsv = paint::Hsv::from_color(color, 0.0);
                         format!("{:.0}%", hsv.value * 100.0)
                     }
-                    (Tweaking::Lightness, None) | (Tweaking::Reach, _) => String::new(),
+                    (Tweaking::Opacity, Some(color)) => format!("{:.0}%", color.a * 100.0),
+                    (Tweaking::Lightness | Tweaking::Opacity, None) | (Tweaking::Reach, _) => {
+                        String::new()
+                    }
                 };
                 let label = Point::new(p.x + CURSOR_SIZE * 0.5, p.y - CURSOR_SIZE * 0.9);
                 for (offset, color) in [(1.0, BACKGROUND), (0.0, EDGE)] {
