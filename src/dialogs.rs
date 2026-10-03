@@ -16,7 +16,7 @@ impl Tessera {
         let small = |label: String| text(label).size(13);
         let close = Message::Export(ExportMessage::ShowExport(None));
         let (_, area) = svg::area(&self.layers, self.export_page());
-        let (width, height) = raster::pixels(area.width, area.height, self.png_scale);
+        let (width, height) = raster::pixels(area.width, area.height, self.export.png_scale);
         let fits =
             format == Format::Svg || (width <= raster::MAX_SIDE && height <= raster::MAX_SIDE);
 
@@ -33,12 +33,12 @@ impl Tessera {
             let areas = vec![
                 (
                     "Document",
-                    self.export_to_page,
+                    self.export.to_page,
                     Message::Export(ExportMessage::ToPage(true)),
                 ),
                 (
                     "Everything",
-                    !self.export_to_page,
+                    !self.export.to_page,
                     Message::Export(ExportMessage::ToPage(false)),
                 ),
             ];
@@ -59,7 +59,7 @@ impl Tessera {
                             4.0 => "4×",
                             _ => "8×",
                         },
-                        self.png_scale == scale,
+                        self.export.png_scale == scale,
                         Message::Export(ExportMessage::PngScale(scale)),
                     )
                 })
@@ -69,7 +69,7 @@ impl Tessera {
                 .map(|backdrop| {
                     (
                         backdrop.label(),
-                        self.png_backdrop == backdrop,
+                        self.export.png_backdrop == backdrop,
                         Message::Export(ExportMessage::PngBackdrop(backdrop)),
                     )
                 })

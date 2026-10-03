@@ -28,7 +28,7 @@ pub enum ExportMessage {
 impl Tessera {
     /// What's exported: the document, if its size is set and that's chosen.
     pub(crate) fn export_page(&self) -> Option<page::Page> {
-        self.layers.page().filter(|_| self.export_to_page)
+        self.layers.page().filter(|_| self.export.to_page)
     }
 
     pub(crate) fn update_export(&mut self, message: ExportMessage) -> Task<Message> {
@@ -39,15 +39,15 @@ impl Tessera {
                 Task::none()
             }
             ExportMessage::ToPage(to_page) => {
-                self.export_to_page = to_page;
+                self.export.to_page = to_page;
                 Task::none()
             }
             ExportMessage::PngScale(scale) => {
-                self.png_scale = scale;
+                self.export.png_scale = scale;
                 Task::none()
             }
             ExportMessage::PngBackdrop(backdrop) => {
-                self.png_backdrop = backdrop;
+                self.export.png_backdrop = backdrop;
                 Task::none()
             }
             ExportMessage::ExportSvg => {
@@ -60,11 +60,11 @@ impl Tessera {
             }
             ExportMessage::ExportPng => {
                 self.dialogs.export_open = None;
-                let scale = self.png_scale.max(0.1);
+                let scale = self.export.png_scale.max(0.1);
                 // Seals as wide in the image whatever its scale.
                 let seal = svg::SEAL_PIXELS / scale;
                 let svg = svg::export_sealed(&self.layers, self.export_page(), seal);
-                Task::perform(save_png(svg, scale, self.png_backdrop), |value| {
+                Task::perform(save_png(svg, scale, self.export.png_backdrop), |value| {
                     Message::Export(ExportMessage::Exported(value))
                 })
             }
@@ -79,6 +79,25 @@ impl Tessera {
                 }
                 Task::none()
             }
+        }
+    }
+}
+
+/// How to export, as last chosen in the export dialog.
+pub struct ExportSettings {
+    /// Just the document (its size set), else all of the drawing.
+    pub to_page: bool,
+    /// How large a PNG is (times the drawing's size), and on what.
+    pub png_scale: f32,
+    pub png_backdrop: raster::Backdrop,
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        ExportSettings {
+            to_page: true,
+            png_scale: 2.0,
+            png_backdrop: raster::Backdrop::default(),
         }
     }
 }

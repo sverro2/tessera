@@ -55,8 +55,8 @@ use layers::{Layers, NodeId, Place, Signature};
 use paint::{Brush, Hsv, Target};
 use panels::{joined, tip};
 use update::{
-    BackgroundMessage, ExportMessage, FileMessage, Format, KeysMessage, LayerAction, MenuMessage,
-    PageDialog, PageMessage, PaintMessage, ShapeMessage, SnapMessage,
+    BackgroundMessage, ExportMessage, ExportSettings, FileMessage, Format, KeysMessage,
+    LayerAction, MenuMessage, PageDialog, PageMessage, PaintMessage, ShapeMessage, SnapMessage,
 };
 
 pub fn main() -> iced::Result {
@@ -182,9 +182,6 @@ struct Tessera {
     clipboard: Option<document::Piece>,
     /// Which keys do what (kept in the config folder).
     keys: Keymap,
-    export_to_page: bool,
-    png_scale: f32,
-    png_backdrop: raster::Backdrop,
     /// How dragged points snap (kept in the config folder).
     snap: snap::Snap,
     /// The modifier keys held (Shift turns painting a layer into painting
@@ -197,6 +194,8 @@ struct Tessera {
     history: History,
     /// What's open over the canvas: a menu, or a dialog.
     dialogs: Dialogs,
+    /// How to export, as last chosen in the export dialog.
+    export: ExportSettings,
 }
 
 /// The background panel's number fields, as typed (so half-typed numbers
@@ -490,8 +489,6 @@ impl Tessera {
             edge_width: 2.0,
             reach: 100.0,
             keys: Keymap::load(),
-            png_scale: 2.0,
-            export_to_page: true,
             snap: snap::Snap::load(),
             brush,
             recent_files: recent::Recent::load(),

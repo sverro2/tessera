@@ -14,7 +14,7 @@ mod shape;
 mod snap;
 
 pub use background::BackgroundMessage;
-pub use export::{ExportMessage, Format};
+pub use export::{ExportMessage, ExportSettings, Format};
 pub use file::Dropped;
 pub use file::FileMessage;
 pub use keys::KeysMessage;
