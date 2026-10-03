@@ -18,6 +18,11 @@ pub(super) const GUIDE_NEAR: f32 = 20.0;
 
 pub(super) const GUIDES_SHOWN: usize = 3;
 
+/// How many of the shapes' outline edges, and of the vertices, nearest
+/// where a point's placed offer guides (angles, lengths, lining up): with
+/// all of them, crowded drawings would offer too many.
+pub(super) const NEAREST: usize = 10;
+
 /// A line (or circle) a point dragged with Shift can line up with, from
 /// the edges around it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,6 +54,9 @@ pub(super) enum Guide {
     /// From a point that's no vertex yet (where a new triangle starts), at
     /// the same angle as edge `u`–`v`.
     ParallelFrom { at: Point, u: VertexId, v: VertexId },
+    /// From a point that's no vertex yet (where an extrusion started),
+    /// square to edge `a`–`b`: extruding it straight out.
+    Normal { at: Point, a: VertexId, b: VertexId },
     /// The far side of a new triangle started at `at` (from its dragged
     /// corner to its third) running along `side`: level or upright in the
     /// view, or parallel to `edge`. For that, the dragged corner is on the
@@ -71,6 +79,10 @@ impl Guide {
             Guide::Along { u, v } => Shape::Line(at(u), at(v) - at(u)),
             Guide::ParallelFrom { at: from, u, v } => Shape::Line(from, at(v) - at(u)),
             Guide::Across { at, line, .. } => Shape::Line(at, line),
+            Guide::Normal { at: from, a, b } => {
+                let d = at(b) - at(a);
+                Shape::Line(from, Vector::new(-d.y, d.x))
+            }
             Guide::Axis { at, upright } => level(at, upright, camera),
             Guide::Straight { m, n } => Shape::Line(at(n), at(n) - at(m)),
             Guide::Square { m, n } => {
@@ -99,6 +111,7 @@ impl Guide {
             | Guide::Along { u, v }
             | Guide::ParallelFrom { u, v, .. } => Some((u, v)),
             Guide::Across { edge, .. } => edge,
+            Guide::Normal { a, b, .. } => Some((a, b)),
             Guide::Between { .. }
             | Guide::Corner { .. }
             | Guide::Level { .. }
@@ -120,14 +133,17 @@ impl Guide {
             | Guide::Axis { .. }
             | Guide::Along { .. }
             | Guide::ParallelFrom { .. }
-            | Guide::Across { .. } => None,
+            | Guide::Across { .. }
+            | Guide::Normal { .. } => None,
         }
     }
 
     /// Where the new edge it lines up starts (world), for those from one.
     pub(super) fn start(self, document: &Document) -> Option<Point> {
         match self {
-            Guide::Axis { at, .. } | Guide::ParallelFrom { at, .. } => Some(at),
+            Guide::Axis { at, .. } | Guide::ParallelFrom { at, .. } | Guide::Normal { at, .. } => {
+                Some(at)
+            }
             _ => self.from().map(|n| document.vertex(n)),
         }
     }
@@ -244,7 +260,7 @@ impl Editor<'_> {
             }
             Dragged::Apex { a, b, .. } => vec![a, b],
         };
-        let guides = self.guides(moving, &ends);
+        let guides = self.guides(moving, &ends, world);
         let (near, all_near, candidates) = self.line_up(&guides, world);
 
         // Moving it to `at`: what that does, if it works out, lands there
@@ -282,12 +298,13 @@ impl Editor<'_> {
     /// the outlines; and its far side likewise. As [`Self::guided`].
     pub(super) fn guided_creation(&self, from: Point, world: Point) -> Guided {
         let camera = self.camera;
-        let outlines = self.outlines(|_| false);
+        let outlines = self.nearest_outlines(self.outlines(|_| false), &[from, world]);
+        let vertices = self.nearest_vertices(&[from, world]);
         // For either corner.
         let mut corner = Vec::new();
         for upright in [false, true] {
             corner.push(Guide::Axis { at: from, upright });
-            for n in self.document.unique_vertices() {
+            for &n in &vertices {
                 corner.push(Guide::Level { n, upright });
             }
         }
@@ -355,13 +372,129 @@ impl Editor<'_> {
         (fine, all_near, found)
     }
 
+    /// Lining up an extrusion of `selection` started at `from` (the cursor
+    /// at `world`): the way it goes square to an edge extruded (as far as
+    /// that's long, say), level or upright in the view, or at the angle of
+    /// the outlines (straight on from those at its ends, say); else one of
+    /// its far ends level or upright with the vertices there are, or in
+    /// line with the outlines. As [`Self::guided`], the cursor lining up.
+    pub(super) fn guided_extrusion(
+        &self,
+        selection: &[VertexId],
+        from: Point,
+        world: Point,
+    ) -> Guided {
+        let camera = self.camera;
+        let outlines = self.nearest_outlines(self.outlines(|_| false), &[from, world]);
+        let vertices = self.nearest_vertices(&[from, world]);
+        let mut way = Vec::new();
+        for (a, b, _) in self.outer_edges(selection) {
+            way.push(Guide::Normal { at: from, a, b });
+        }
+        for upright in [false, true] {
+            way.push(Guide::Axis { at: from, upright });
+        }
+        for &(u, v) in &outlines {
+            way.push(Guide::ParallelFrom { at: from, u, v });
+        }
+        let mut lands = Vec::new();
+        for upright in [false, true] {
+            for &n in &vertices {
+                lands.push(Guide::Level { n, upright });
+            }
+        }
+        for &(u, v) in &outlines {
+            lands.push(Guide::Along { u, v });
+        }
+
+        // The way first; then the far ends nearest the cursor, a few.
+        let by = world - from;
+        let (near, mut all_near, lined) = self.line_up(&way, world);
+        let mut candidates: Vec<Vector> = lined
+            .into_iter()
+            .take(2 * MAX_SNAPS)
+            .map(|p| p - from)
+            .collect();
+        let mut near: Vec<(Guide, Vector)> =
+            near.into_iter().map(|(g, at)| (g, at - from)).collect();
+        let cursor = camera.to_screen(world);
+        let mut ends: Vec<Point> = self
+            .extruded_ends(selection)
+            .into_iter()
+            .map(|v| self.document.vertex(v))
+            .collect();
+        ends.sort_by(|p, q| {
+            let off = |e: &Point| camera.to_screen(*e + by).distance(cursor);
+            off(p).total_cmp(&off(q))
+        });
+        for end in ends.into_iter().take(3) {
+            let (near_end, all_end, lined_end) = self.line_up(&lands, end + by);
+            all_near.extend(all_end);
+            candidates.extend(lined_end.into_iter().take(MAX_SNAPS).map(|p| p - end));
+            near.extend(near_end.into_iter().map(|(g, at)| (g, at - end)));
+        }
+
+        let attempt = |by: Vector| self.extrude(selection, by, from + by);
+        let found = candidates
+            .into_iter()
+            .find_map(|by| Some((from + by, attempt(by)?)));
+        let fine = near
+            .into_iter()
+            .filter(|&(_, by)| attempt(by).is_some())
+            .map(|(guide, _)| guide)
+            .collect();
+        (fine, all_near, found)
+    }
+
+    /// Where a new triangle pressed at `pressed` starts: there; with `grid`
+    /// on the nearest grid point; with `shift` lined up level or upright with
+    /// the vertices there are, or in line with the outlines (with both, a
+    /// grid point on such a guide first). And the guides that would do, and
+    /// all those near.
+    pub(super) fn creation_start(
+        &self,
+        pressed: Point,
+        grid: bool,
+        shift: bool,
+    ) -> (Point, Vec<Guide>, Vec<Guide>) {
+        if !grid && !shift {
+            return (pressed, Vec::new(), Vec::new());
+        }
+        let mut guides = Vec::new();
+        if shift {
+            for upright in [false, true] {
+                for n in self.nearest_vertices(&[pressed]) {
+                    guides.push(Guide::Level { n, upright });
+                }
+            }
+            for (u, v) in self.nearest_outlines(self.outlines(|_| false), &[pressed]) {
+                guides.push(Guide::Along { u, v });
+            }
+        }
+        let (near, all_near, lined) = self.line_up(&guides, pressed);
+        let fine = near.into_iter().map(|(guide, _)| guide).collect();
+        let start = if grid {
+            self.grid_points(pressed, &|p| self.on_guide(&all_near, &[p]))
+                .first()
+                .copied()
+        } else {
+            lined.first().copied()
+        };
+        (start.unwrap_or(pressed), fine, all_near)
+    }
+
     /// The guides a point dragged (`moving`, if it's a vertex already),
     /// with edges to `ends`, can line up with: straight on from the edges
     /// at its ends, or square to them; at the angle of the edges at its
     /// other ends; level or upright in the view from its ends; between two
     /// ends, as far from both, or square at the point itself; at the angle
     /// of, or in line with, the outlines of other shapes. Each once.
-    pub(super) fn guides(&self, moving: Option<VertexId>, ends: &[VertexId]) -> Vec<Guide> {
+    pub(super) fn guides(
+        &self,
+        moving: Option<VertexId>,
+        ends: &[VertexId],
+        near: Point,
+    ) -> Vec<Guide> {
         let document = self.document;
         let edges = document.unique_edges();
         let mut around: HashMap<VertexId, Vec<VertexId>> = HashMap::new();
@@ -407,13 +540,14 @@ impl Editor<'_> {
             }
         }
 
-        // From the other shapes there are (their outlines): at the same
-        // angle (keeping them parallel), and in line with them.
+        // From the other shapes there are (their outlines, those nearest):
+        // at the same angle (keeping them parallel), and in line with them.
         let seed = moving.or(ends.first().copied());
         let own: std::collections::HashSet<VertexId> = seed
             .map(|v| document.connected(v).into_iter().flatten().collect())
             .unwrap_or_default();
-        for (u, v) in self.outlines(|v| own.contains(&v)) {
+        let others = self.outlines(|v| own.contains(&v));
+        for (u, v) in self.nearest_outlines(others, &[near]) {
             for &n in ends {
                 guides.push(Guide::Parallel { n, u, v });
             }
@@ -423,6 +557,42 @@ impl Editor<'_> {
         // Each kept, even where they run alike: each edge followed has a
         // length of its own to line up with (see `line_up`).
         guides
+    }
+
+    /// Of `outlines`, the [`NEAREST`] nearest any of `near` (world): with
+    /// guides from all of them, crowded drawings would offer too many.
+    pub(super) fn nearest_outlines(
+        &self,
+        mut outlines: Vec<(VertexId, VertexId)>,
+        near: &[Point],
+    ) -> Vec<(VertexId, VertexId)> {
+        let at = |v| self.document.vertex(v);
+        let off = |&(u, v): &(VertexId, VertexId)| {
+            near.iter()
+                .map(|&p| closest_on_segment(p, at(u), at(v)).1)
+                .fold(f32::INFINITY, f32::min)
+        };
+        if outlines.len() > NEAREST {
+            outlines.select_nth_unstable_by(NEAREST, |x, y| off(x).total_cmp(&off(y)));
+            outlines.truncate(NEAREST);
+        }
+        outlines
+    }
+
+    /// The [`NEAREST`] vertices nearest any of `near` (world).
+    pub(super) fn nearest_vertices(&self, near: &[Point]) -> Vec<VertexId> {
+        let off = |&v: &VertexId| {
+            let p = self.document.vertex(v);
+            near.iter()
+                .map(|&q| q.distance(p))
+                .fold(f32::INFINITY, f32::min)
+        };
+        let mut vertices = self.document.unique_vertices();
+        if vertices.len() > NEAREST {
+            vertices.select_nth_unstable_by(NEAREST, |x, y| off(x).total_cmp(&off(y)));
+            vertices.truncate(NEAREST);
+        }
+        vertices
     }
 
     /// The edges on the outlines of the shapes there are, but for those
@@ -535,9 +705,10 @@ impl Editor<'_> {
             // square or parallel, either way.
             let ways: &[f32] = match guide {
                 Guide::Straight { .. } => &[1.0],
-                Guide::Square { .. } | Guide::Parallel { .. } | Guide::ParallelFrom { .. } => {
-                    &[1.0, -1.0]
-                }
+                Guide::Square { .. }
+                | Guide::Parallel { .. }
+                | Guide::ParallelFrom { .. }
+                | Guide::Normal { .. } => &[1.0, -1.0],
                 Guide::Between { .. }
                 | Guide::Corner { .. }
                 | Guide::Level { .. }
@@ -592,23 +763,85 @@ impl Editor<'_> {
         if !self.keeps_shape(pending) {
             return Vec::new();
         }
-        let third = self.creating_third(state);
+        let also = self.also_lined(state);
         state
             .near_guides
             .iter()
             .copied()
             .filter(|&guide| {
                 self.runs_through(guide, pending.at)
-                    || third.is_some_and(|third| self.runs_through(guide, third))
+                    || also.iter().any(|&p| self.lines_up(guide, p))
             })
             .collect()
     }
 
-    /// Creating a triangle: its third corner (world), which lines up too.
-    fn creating_third(&self, state: &State) -> Option<Point> {
+    /// Whether `guide` lines `p` up: runs through it, not just from it (as
+    /// those from a new triangle's start do).
+    fn lines_up(&self, guide: Guide, p: Point) -> bool {
+        let from_it = matches!(
+            guide.shape(self.document, self.camera),
+            Shape::Line(o, _) if o.distance(p) < 1e-3
+        );
+        !from_it && self.runs_through(guide, p)
+    }
+
+    /// The points (world) that line up besides the one dragged: a new
+    /// triangle's third corner; an extrusion's far ends.
+    fn also_lined(&self, state: &State) -> Vec<Point> {
         match state.interaction {
-            Interaction::Creating { from, to } => Some(self.third_corner(from, to)),
-            _ => None,
+            // Its start too, lined up from where it was pressed.
+            Interaction::Creating { from, to, .. } => vec![self.third_corner(from, to), from],
+            Interaction::Extruding { from, to } => self
+                .extruded_ends(&state.selection)
+                .into_iter()
+                .map(|v| self.document.vertex(v) + (to - from))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// How `guide` shows, the point dragged at `at` (world): where it runs,
+    /// and the new edge it lines up (lit), from where (if it says) to where.
+    fn guide_view(&self, state: &State, guide: Guide, at: Point) -> (Shape, Option<Point>, Point) {
+        let document = self.document;
+        let shape = guide.shape(document, self.camera);
+        let also = self.also_lined(state);
+        let through = || {
+            if self.runs_through(guide, at) {
+                at
+            } else {
+                also.iter()
+                    .copied()
+                    .find(|&p| self.lines_up(guide, p))
+                    .unwrap_or(at)
+            }
+        };
+        match state.interaction {
+            // The far side runs through the far side, from the corner
+            // dragged to the third.
+            Interaction::Creating { to, .. } => match guide {
+                Guide::Across { side, .. } => (Shape::Line(to, side), Some(to), also[0]),
+                _ => (shape, guide.start(document), through()),
+            },
+            // The way an extrusion goes, shown from an end it extrudes: an
+            // edge it's square to, else the nearest.
+            Interaction::Extruding { from, to } if guide.start(document) == Some(from) => {
+                let by = to - from;
+                let end = match guide {
+                    Guide::Normal { a, .. } => document.vertex(a),
+                    _ => also
+                        .iter()
+                        .map(|&p| p - by)
+                        .min_by(|p, q| p.distance(at).total_cmp(&q.distance(at)))
+                        .unwrap_or(from),
+                };
+                let shape = match shape {
+                    Shape::Line(_, d) => Shape::Line(end, d),
+                    circle => circle,
+                };
+                (shape, Some(end), end + by)
+            }
+            _ => (shape, guide.start(document), through()),
         }
     }
 
@@ -647,14 +880,6 @@ impl Editor<'_> {
         let others = state.guides.iter().filter(|guide| !lit.contains(guide));
         shown.extend(others.take(GUIDES_SHOWN.saturating_sub(lit.len())));
 
-        // Creating a triangle: its corners dragged and third, which line up
-        // too.
-        let creating = match state.interaction {
-            Interaction::Creating { to, .. } => {
-                Some((to, self.creating_third(state).unwrap_or(to)))
-            }
-            _ => None,
-        };
         let reach = bounds.width + bounds.height;
         for guide in &shown {
             let on = lit.contains(guide);
@@ -671,11 +896,7 @@ impl Editor<'_> {
                     if on { 1.5 } else { 1.0 },
                 )
             };
-            // The far side's runs through the far side.
-            let shape = match (*guide, creating) {
-                (Guide::Across { side, .. }, Some((to, _))) => Shape::Line(to, side),
-                _ => guide.shape(document, camera),
-            };
+            let (shape, ..) = self.guide_view(state, *guide, at.unwrap_or(Point::ORIGIN));
             match shape {
                 Shape::Line(o, d) => {
                     let (a, b) = (camera.to_screen(o), camera.to_screen(o + d));
@@ -736,16 +957,10 @@ impl Editor<'_> {
             frame.stroke(&path, stroke(GUIDE, 2.0));
         };
         for guide in &lit {
-            // Where the new edge lining up ends: the point dragged, or (as
-            // it lines up) a new triangle's third corner.
-            let p = match creating {
-                Some((_, third))
-                    if matches!(guide, Guide::Across { .. }) || !self.runs_through(*guide, at) =>
-                {
-                    camera.to_screen(third)
-                }
-                _ => p,
-            };
+            // The new edge lining up: from where it starts to the point that
+            // lines up.
+            let (_, start, end) = self.guide_view(state, *guide, at);
+            let p = camera.to_screen(end);
             match *guide {
                 Guide::Corner { a, b } => {
                     frame.stroke(&Path::line(screen(a), p), stroke(GUIDE, 2.0));
@@ -764,11 +979,6 @@ impl Editor<'_> {
                 Guide::Between { .. } => continue,
                 _ => {}
             }
-            let start = match (*guide, creating) {
-                // The far side: from the corner dragged to the third.
-                (Guide::Across { .. }, Some((to, _))) => Some(to),
-                _ => guide.start(document),
-            };
             let Some(start) = start.map(|at| camera.to_screen(at)) else {
                 continue;
             };
@@ -795,6 +1005,9 @@ impl Editor<'_> {
                 let (a, b) = if same_way { (a, b) } else { (b, a) };
                 mark(frame, a, b, true, -aside);
                 mark(frame, start, p, true, -aside);
+            }
+            if let Guide::Normal { a, b, .. } = *guide {
+                square(frame, screen(a), screen(b), p);
             }
             if let Guide::Square { m, n } = *guide {
                 square(frame, screen(n), screen(m), p);

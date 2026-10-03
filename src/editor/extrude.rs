@@ -15,7 +15,10 @@ use crate::geometry::overlap;
 impl Editor<'_> {
     /// The outer edges with both ends in `selection`, each wound as its
     /// face winds it (`a` → `b`, the face to the left), with that face.
-    fn outer_edges(&self, selection: &[VertexId]) -> Vec<(VertexId, VertexId, TriangleId)> {
+    pub(super) fn outer_edges(
+        &self,
+        selection: &[VertexId],
+    ) -> Vec<(VertexId, VertexId, TriangleId)> {
         let selected: HashSet<VertexId> = selection.iter().copied().collect();
         let triangles = self.document.triangle_ids();
         let wound: HashSet<(VertexId, VertexId)> = triangles

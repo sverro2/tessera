@@ -64,6 +64,8 @@ pub enum Action {
     Rotate,
     Scale,
     Extrude,
+    Lasso,
+    LassoRemove,
     SelectShape,
     SelectAll,
     Copy,
@@ -80,7 +82,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 29] = [
+    pub const ALL: [Action; 31] = [
         Action::ToggleMode,
         Action::New,
         Action::Open,
@@ -98,6 +100,8 @@ impl Action {
         Action::Rotate,
         Action::Scale,
         Action::Extrude,
+        Action::Lasso,
+        Action::LassoRemove,
         Action::SelectShape,
         Action::SelectAll,
         Action::Copy,
@@ -117,8 +121,10 @@ impl Action {
         match self {
             ToggleMode | New | Open | Save | SaveAs | Undo | Redo | Mirror | DuplicateLayer
             | FrameShape | ShowKeys => Context::Global,
-            CutEdge | Delete | Grab | Rotate | Scale | Extrude | SelectShape | SelectAll | Copy
-            | CutFaces | Paste | Proportional | Reach => Context::Shape,
+            CutEdge | Delete | Grab | Rotate | Scale | Extrude | Lasso | LassoRemove
+            | SelectShape | SelectAll | Copy | CutFaces | Paste | Proportional | Reach => {
+                Context::Shape
+            }
             PaintFaces | PaintEdges | Pipette | Lightness | Width => Context::Paint,
         }
     }
@@ -146,6 +152,8 @@ impl Action {
             Extrude => {
                 "Extrude the selection's outer edges, or the hovered one (click to put down)"
             }
+            Lasso => "Lasso: then drag around vertices to add them to the selection",
+            LassoRemove => "Lasso: then drag around vertices to take them out of the selection",
             SelectShape => "Select the whole shape",
             SelectAll => "Select every vertex of the layer",
             Copy => "Copy the selected faces",
@@ -182,6 +190,8 @@ impl Action {
             Rotate => &["R"],
             Scale => &["T"],
             Extrude => &["E"],
+            Lasso => &["Q"],
+            LassoRemove => &["Shift+Q"],
             SelectShape => &["Ctrl+L"],
             SelectAll => &["Ctrl+A"],
             Copy => &["Ctrl+C"],
@@ -216,7 +226,6 @@ pub const GESTURES: [(Context, &str, &str); 10] = [
     (Context::Global, "Middle-drag", "Pan"),
     (Context::Global, "Wheel", "Zoom"),
     (Context::Global, "Shift+wheel", "Rotate the view"),
-    (Context::Shape, "Ctrl+drag", "Lasso: add to the selection"),
     (
         Context::Shape,
         "Shift+click",
@@ -226,6 +235,11 @@ pub const GESTURES: [(Context, &str, &str); 10] = [
         Context::Shape,
         "Shift while dragging",
         "Line up with guides",
+    ),
+    (
+        Context::Shape,
+        "Ctrl while dragging",
+        "Snap to the grid, from where it starts (View > Snap settings)",
     ),
     (
         Context::Shape,

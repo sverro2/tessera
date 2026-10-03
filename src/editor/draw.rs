@@ -63,11 +63,15 @@ pub(super) fn interior(document: &Document) -> Vec<(VertexId, VertexId)> {
     edges_used(document, 2)
 }
 
-pub(super) fn draw_grid(frame: &mut Frame, camera: Camera) {
-    let spacing = GRID * camera.zoom;
-    if spacing < 8.0 {
+/// The dot grid: a dot every [`MAJOR`] steps of the snapping grid, from
+/// the world's origin (so dots are where it snaps to); none zoomed out so far
+/// they'd crowd.
+pub(super) fn draw_grid(frame: &mut Frame, camera: Camera, grid: Grid) {
+    let spacing = grid.step * MAJOR as f32;
+    if spacing * camera.zoom < 8.0 {
         return;
     }
+    let o = Point::ORIGIN;
 
     // The world-space bounds of the (possibly rotated) visible area.
     let size = frame.size();
@@ -83,17 +87,21 @@ pub(super) fn draw_grid(frame: &mut Frame, camera: Camera) {
     let visible = Rectangle::new(Point::ORIGIN, size);
 
     let dots = Path::new(|p| {
-        let mut y = (min(|p| p.y) / GRID).floor() * GRID;
-        while y <= max(|p| p.y) {
-            let mut x = (min(|p| p.x) / GRID).floor() * GRID;
-            while x <= max(|p| p.x) {
-                let dot = camera.to_screen(Point::new(x, y));
+        // Counted off from the origin, so they don't drift far from it.
+        let first = |min: f32, o: f32| ((min - o) / spacing).floor() as i64;
+        let (i0, j0) = (first(min(|p| p.x), o.x), first(min(|p| p.y), o.y));
+        let mut j = j0;
+        while o.y + j as f32 * spacing <= max(|p| p.y) {
+            let mut i = i0;
+            while o.x + i as f32 * spacing <= max(|p| p.x) {
+                let world = Point::new(o.x + i as f32 * spacing, o.y + j as f32 * spacing);
+                let dot = camera.to_screen(world);
                 if visible.contains(dot) {
                     p.circle(dot, 1.2);
                 }
-                x += GRID;
+                i += 1;
             }
-            y += GRID;
+            j += 1;
         }
     });
 
@@ -401,6 +409,43 @@ impl Editor<'_> {
             }
         }
 
+        // Holding Ctrl while dragging: the grid, around what lands on it.
+        let gridded = matches!(
+            state.interaction,
+            Interaction::Creating { .. }
+                | Interaction::MovingVertex { .. }
+                | Interaction::Extending { .. }
+                | Interaction::LeavingFace { .. }
+                | Interaction::Extruding { .. }
+                | Interaction::MovingSelection { .. }
+                | Interaction::Pasting { .. }
+        );
+        if state.modifiers.command() && gridded {
+            let points = match pending {
+                Some(pending) => self.placed(state, pending),
+                None => cursor_pos.map(|p| camera.to_world(p)).into_iter().collect(),
+            };
+            self.draw_snap_grid(&mut overlay, &points);
+        }
+        // Holding Ctrl before pressing: the grid around the cursor, and on
+        // blank canvas, the grid point a new triangle would start at.
+        if state.modifiers.command()
+            && matches!(state.interaction, Interaction::Idle)
+            && self.tool == Tool::Shape
+            && self.shown
+            && !state.lasso_armed
+            && let Some(cursor) = cursor_pos
+        {
+            let world = camera.to_world(cursor);
+            self.draw_snap_grid(&mut overlay, &[world]);
+            if state.selection.is_empty() && hover.is_none() {
+                let (start, ..) = self.creation_start(world, true, state.modifiers.shift());
+                overlay.stroke(
+                    &Path::circle(camera.to_screen(start), 5.0),
+                    stroke(ADDED, 1.5),
+                );
+            }
+        }
         if !state.near_guides.is_empty()
             && matches!(
                 state.interaction,
@@ -408,6 +453,7 @@ impl Editor<'_> {
                     | Interaction::MovingVertex { .. }
                     | Interaction::Extending { .. }
                     | Interaction::LeavingFace { .. }
+                    | Interaction::Extruding { .. }
             )
         {
             self.draw_guides(&mut overlay, state, pending, bounds);

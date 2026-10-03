@@ -77,6 +77,7 @@ impl Editor<'_> {
             clipboard: self.clipboard,
             keys: self.keys,
             lit: self.lit.clone(),
+            grid: self.grid,
             deadline: self.deadline.clone(),
         })
     }

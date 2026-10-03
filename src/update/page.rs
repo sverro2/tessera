@@ -104,6 +104,16 @@ impl Tessera {
                     Some(page) if !dialog.centre => page.center,
                     _ => self.middle(),
                 };
+                // Its corner on the grid (which stays put), so it lines up
+                // with it.
+                let step = self.snap.grid;
+                let on_grid = |middle: f32, side: f32| {
+                    ((middle - side / 2.0) / step).round() * step + side / 2.0
+                };
+                let center = iced::Point::new(
+                    on_grid(center.x, size.width),
+                    on_grid(center.y, size.height),
+                );
                 let page = Page { center, size };
                 self.set_page(Some(page));
                 // All of it in view, clear of the panels over the canvas.

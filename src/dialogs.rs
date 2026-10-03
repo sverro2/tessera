@@ -205,6 +205,51 @@ impl Tessera {
         )
     }
 
+    /// How dragged points snap: the grid (held Ctrl).
+    pub(super) fn snap_dialog<'a>(&'a self, step: &'a str) -> Element<'a, Message> {
+        let close = Message::Snap(SnapMessage::Show(false));
+        let fits = step
+            .trim()
+            .parse::<f32>()
+            .is_ok_and(|step| (snap::MIN_GRID..=snap::MAX_GRID).contains(&step));
+        modal(
+            column![
+                text("Snap settings").size(20),
+                text("Grid snap").size(16),
+                row![
+                    text("Step").size(13).width(80),
+                    text_input("", step)
+                        .on_input(|text| Message::Snap(SnapMessage::Grid(text)))
+                        .on_submit(Message::Snap(SnapMessage::Apply))
+                        .size(13)
+                        .width(90),
+                    text("pixels").size(13),
+                ]
+                .spacing(8)
+                .align_y(Center),
+                text(
+                    "Hold Ctrl while dragging to land on the grid (with Shift too, on a \
+                     guide where the grid allows). A document is placed with its corner \
+                     on the grid."
+                )
+                .size(12)
+                .style(text::secondary),
+                row![
+                    space::horizontal(),
+                    button("Cancel")
+                        .style(button::secondary)
+                        .on_press(close.clone()),
+                    button("Apply")
+                        .on_press_maybe(fits.then_some(Message::Snap(SnapMessage::Apply))),
+                ]
+                .spacing(8),
+            ]
+            .spacing(14)
+            .width(420),
+            close,
+        )
+    }
+
     /// The keyboard shortcuts, by where they work, to look up and to set:
     /// click a key, then press the new one; add one; take one away; back
     /// to the defaults. What the mouse does with keys held is listed too,

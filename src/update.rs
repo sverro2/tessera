@@ -11,6 +11,7 @@ mod menu;
 mod page;
 mod paint;
 mod shape;
+mod snap;
 
 pub use background::BackgroundMessage;
 pub use export::{ExportMessage, Format};
@@ -22,3 +23,4 @@ pub use menu::MenuMessage;
 pub use page::{PageDialog, PageMessage};
 pub use paint::PaintMessage;
 pub use shape::ShapeMessage;
+pub use snap::SnapMessage;

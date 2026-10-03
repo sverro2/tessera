@@ -41,6 +41,7 @@ pub(super) fn editor<'a>(doc: &'a Document, caches: &'a Caches) -> Editor<'a> {
         clipboard: None,
         keys: Some(crate::keys::defaults()),
         lit: Vec::new(),
+        grid: Grid::default(),
         deadline: Cell::new(None),
     }
 }
@@ -136,19 +137,12 @@ fn hold(modifiers: keyboard::Modifiers) -> Event {
 
 /// Lassos the right triangle of [`two_apart`] (vertices 3, 4, 5).
 fn lasso_right(editor: &Editor, state: &mut State) {
-    run(editor, state, hold(keyboard::Modifiers::CTRL), 230.0, 180.0);
+    run(editor, state, key('q'), 230.0, 180.0);
     run(editor, state, Event::Mouse(PRESS), 230.0, 180.0);
     for (x, y) in [(370.0, 180.0), (370.0, 320.0), (230.0, 320.0)] {
         run(editor, state, Event::Mouse(MOVE), x, y);
     }
     run(editor, state, Event::Mouse(RELEASE), 230.0, 320.0);
-    run(
-        editor,
-        state,
-        hold(keyboard::Modifiers::empty()),
-        230.0,
-        320.0,
-    );
     assert!([3, 4, 5].iter().all(|v| state.selection.contains(v)));
 }
 
@@ -2165,13 +2159,7 @@ fn a_right_click_cancels_a_drag() {
     }
 
     let mut state = State::default();
-    run(
-        &editor,
-        &mut state,
-        hold(keyboard::Modifiers::CTRL),
-        50.0,
-        50.0,
-    );
+    run(&editor, &mut state, key('q'), 50.0, 50.0);
     run(&editor, &mut state, Event::Mouse(PRESS), 50.0, 50.0);
     for (x, y) in [(400.0, 50.0), (400.0, 400.0), (50.0, 400.0)] {
         run(&editor, &mut state, Event::Mouse(MOVE), x, y);
@@ -2219,7 +2207,7 @@ fn with_shift_a_new_triangle_lines_up_by_its_third_corner_and_far_side() {
             400.0,
         );
         run(&editor, &mut state, Event::Mouse(MOVE), to.0, to.1);
-        let Interaction::Creating { from, to } = state.interaction else {
+        let Interaction::Creating { from, to, .. } = state.interaction else {
             panic!("{:?}", state.interaction);
         };
         let lit = editor.lit(&state, state.pending.as_ref().expect("lined up"));
@@ -2266,4 +2254,291 @@ fn e_over_an_outer_edge_extrudes_it() {
     let mut state = State::default();
     run(&editor, &mut state, key('e'), 200.0, 250.0);
     assert!(matches!(state.interaction, Interaction::Idle));
+}
+
+/// The corners of what an extrusion adds.
+fn extruded_corners(edits: &[Vec<Edit>]) -> Vec<Point> {
+    match &edits[..] {
+        [edits] => match &edits[..] {
+            [Edit::Paste { piece }] => piece.vertices.clone(),
+            _ => panic!("not an extrusion: {edits:?}"),
+        },
+        _ => panic!("expected one edit: {edits:?}"),
+    }
+}
+
+#[test]
+fn with_shift_an_extrusion_lines_up() {
+    let extrude = |doc: &Document, at: (f32, f32), to: (f32, f32)| {
+        let cache = Caches::default();
+        let editor = editor(doc, &cache);
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(MOVE), at.0, at.1);
+        run(&editor, &mut state, key('e'), at.0, at.1);
+        run(
+            &editor,
+            &mut state,
+            hold(keyboard::Modifiers::SHIFT),
+            at.0,
+            at.1,
+        );
+        run(&editor, &mut state, Event::Mouse(MOVE), to.0, to.1);
+        let lit = editor.lit(&state, state.pending.as_ref().expect("lined up"));
+        let edits = run(&editor, &mut state, Event::Mouse(PRESS), to.0, to.1);
+        (extruded_corners(&edits), lit)
+    };
+    let has = |corners: &[Point], x: f32, y: f32| {
+        corners.iter().any(|p| p.distance(Point::new(x, y)) < 1e-3)
+    };
+
+    // The bottom edge (100–300, 300) pulled down a little askew: straight
+    // out, square to it.
+    let doc = one();
+    let (corners, lit) = extrude(&doc, (200.0, 300.0), (206.0, 380.0));
+    assert!(
+        has(&corners, 100.0, 380.0) && has(&corners, 300.0, 380.0),
+        "{corners:?}"
+    );
+    assert!(
+        lit.iter().any(|g| matches!(g, Guide::Normal { .. })),
+        "{lit:?}"
+    );
+
+    // Near as far as it's long: a square.
+    let (corners, _) = extrude(&doc, (200.0, 300.0), (203.0, 496.0));
+    assert!(
+        has(&corners, 100.0, 500.0) && has(&corners, 300.0, 500.0),
+        "{corners:?}"
+    );
+
+    // The left one's right edge (1 2) pulled right and up: a far end level
+    // with the top of the other one, 5 (300, 200).
+    let doc = two_apart();
+    let (corners, lit) = extrude(&doc, (175.0, 250.0), (205.0, 153.0));
+    assert!(
+        corners.iter().any(|p| (p.y - 200.0).abs() < 1e-3),
+        "{corners:?}"
+    );
+    assert!(
+        lit.iter()
+            .any(|g| matches!(g, Guide::Level { upright: false, .. })),
+        "{lit:?}"
+    );
+}
+
+#[test]
+fn with_ctrl_a_dragged_point_lands_on_the_grid() {
+    let ctrl = keyboard::Modifiers::CTRL;
+    let drag_to = |editor: &Editor, at: (f32, f32), to: (f32, f32), held| {
+        let mut state = State::default();
+        run(editor, &mut state, Event::Mouse(MOVE), at.0, at.1);
+        run(editor, &mut state, Event::Mouse(PRESS), at.0, at.1);
+        run(editor, &mut state, hold(held), at.0, at.1);
+        run(editor, &mut state, Event::Mouse(MOVE), to.0, to.1);
+        state.interaction
+    };
+
+    let doc = one();
+    let cache = Caches::default();
+    let mut editor = editor(&doc, &cache);
+    // A new triangle's corner.
+    let Interaction::Creating { to, .. } = drag_to(&editor, (500.0, 400.0), (533.0, 417.0), ctrl)
+    else {
+        panic!()
+    };
+    assert_eq!(to, Point::new(530.0, 420.0));
+    // A corner moved.
+    let Interaction::MovingVertex { to, .. } =
+        drag_to(&editor, (200.0, 100.0), (213.0, 86.0), ctrl)
+    else {
+        panic!()
+    };
+    assert_eq!(to, Point::new(210.0, 90.0));
+    // With Shift too: a grid point on a guide (upright from where it
+    // started) rather than the nearest.
+    let both = ctrl | keyboard::Modifiers::SHIFT;
+    let Interaction::Creating { to, .. } = drag_to(&editor, (500.0, 400.0), (506.0, 470.0), both)
+    else {
+        panic!()
+    };
+    assert_eq!(to, Point::new(500.0, 470.0));
+}
+
+#[test]
+fn with_ctrl_a_grabbed_selection_puts_its_nearest_vertex_on_the_grid() {
+    let doc = two_apart();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    lasso_right(&editor, &mut state);
+
+    // Corner 5 (300, 200), nearest the cursor, moved to (313, 204): onto
+    // (310, 200).
+    run(&editor, &mut state, key('g'), 300.0, 250.0);
+    run(
+        &editor,
+        &mut state,
+        hold(keyboard::Modifiers::CTRL),
+        300.0,
+        250.0,
+    );
+    run(&editor, &mut state, Event::Mouse(MOVE), 313.0, 254.0);
+    // The grid's shown around the vertices as they land, not the cursor.
+    let by = Vector::new(10.0, 0.0);
+    let placed = editor.placed(&state, state.pending.as_ref().unwrap());
+    assert_eq!(placed, [3, 4, 5].map(|v| doc.vertex(v) + by));
+    let edits = run(&editor, &mut state, Event::Mouse(PRESS), 313.0, 254.0);
+    assert_eq!(moves(&edits), [3, 4, 5].map(|v| (v, doc.vertex(v) + by)));
+}
+
+#[test]
+fn zoomed_far_out_ctrl_lands_on_the_points_shown() {
+    let doc = one();
+    let cache = Caches::default();
+    let mut editor = editor(&doc, &cache);
+    // At a quarter, points 10 apart would be 2.5 px apart: every tenth.
+    editor.camera.zoom = 0.25;
+    let at = |x: f32, y: f32| editor.camera.to_screen(Point::new(x, y));
+    let mut state = State::default();
+    let (from, to) = (at(1000.0, 1000.0), at(1130.0, 1040.0));
+    run(&editor, &mut state, Event::Mouse(MOVE), from.x, from.y);
+    run(&editor, &mut state, Event::Mouse(PRESS), from.x, from.y);
+    run(
+        &editor,
+        &mut state,
+        hold(keyboard::Modifiers::CTRL),
+        from.x,
+        from.y,
+    );
+    run(&editor, &mut state, Event::Mouse(MOVE), to.x, to.y);
+    let Interaction::Creating { to, .. } = state.interaction else {
+        panic!()
+    };
+    assert!(to.distance(Point::new(1100.0, 1000.0)) < 1e-2, "{to:?}");
+}
+
+#[test]
+fn a_new_triangle_starts_lined_up_too() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    // Held from before pressing.
+    let start = |held: keyboard::Modifiers, at: (f32, f32), to: (f32, f32)| {
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(MOVE), at.0, at.1);
+        run(&editor, &mut state, hold(held), at.0, at.1);
+        run(&editor, &mut state, Event::Mouse(PRESS), at.0, at.1);
+        run(&editor, &mut state, Event::Mouse(MOVE), to.0, to.1);
+        let Interaction::Creating { from, to } = state.interaction else {
+            panic!("{:?}", state.interaction)
+        };
+        (from, to, state)
+    };
+
+    // Ctrl: it starts on the grid, as well as ending on it (not a lasso).
+    let (from, to, mut state) = start(keyboard::Modifiers::CTRL, (503.0, 397.0), (533.0, 417.0));
+    assert_eq!(
+        (from, to),
+        (Point::new(500.0, 400.0), Point::new(530.0, 420.0))
+    );
+    // Let go: it stays where it started.
+    run(
+        &editor,
+        &mut state,
+        hold(keyboard::Modifiers::empty()),
+        533.0,
+        417.0,
+    );
+    run(&editor, &mut state, Event::Mouse(MOVE), 534.0, 417.0);
+    let Interaction::Creating { from, .. } = state.interaction else {
+        panic!()
+    };
+    assert_eq!(from, Point::new(500.0, 400.0));
+
+    // Shift: pressed a little below the level of the bottom corners
+    // (y 300), it starts level with them.
+    let (from, ..) = start(keyboard::Modifiers::SHIFT, (503.0, 304.0), (600.0, 350.0));
+    assert_eq!(from, Point::new(503.0, 300.0));
+}
+
+#[test]
+fn q_then_a_drag_draws_a_lasso_and_esc_lets_go_of_it() {
+    let doc = two_apart();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    lasso_right(&editor, &mut state);
+    assert!(!state.lasso_armed);
+
+    // Made ready, then let go of: a drag creates again.
+    let mut state = State::default();
+    run(&editor, &mut state, key('q'), 500.0, 400.0);
+    assert!(state.lasso_armed);
+    run(&editor, &mut state, escape(), 500.0, 400.0);
+    assert!(!state.lasso_armed);
+    run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
+    assert!(matches!(state.interaction, Interaction::Creating { .. }));
+}
+
+#[test]
+fn shift_q_lassos_vertices_out_of_the_selection() {
+    let doc = two_apart();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    lasso_right(&editor, &mut state);
+
+    // Around the top of the right one, 5 (300, 200).
+    run(
+        &editor,
+        &mut state,
+        press(letter('Q'), keyboard::Modifiers::SHIFT),
+        280.0,
+        180.0,
+    );
+    assert!(state.lasso_armed && state.lasso_removes);
+    run(
+        &editor,
+        &mut state,
+        hold(keyboard::Modifiers::empty()),
+        280.0,
+        180.0,
+    );
+    run(&editor, &mut state, Event::Mouse(PRESS), 280.0, 180.0);
+    for (x, y) in [(320.0, 180.0), (320.0, 220.0), (280.0, 220.0)] {
+        run(&editor, &mut state, Event::Mouse(MOVE), x, y);
+    }
+    run(&editor, &mut state, Event::Mouse(RELEASE), 280.0, 220.0);
+    let mut selected = state.selection.clone();
+    selected.sort_unstable();
+    assert_eq!(selected, [3, 4]);
+
+    // Q again adds.
+    run(&editor, &mut state, key('q'), 280.0, 180.0);
+    assert!(state.lasso_armed && !state.lasso_removes);
+}
+
+#[test]
+fn guides_come_from_the_geometry_nearest_only() {
+    // Fifteen triangles in a row, 100 apart: 45 outline edges.
+    let mut doc = Document::default();
+    for i in 0..15 {
+        let x = i as f32 * 100.0;
+        triangle(&mut doc, [(x, 300.0), (x + 50.0, 300.0), (x + 25.0, 250.0)]);
+    }
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let near = [Point::new(-50.0, 300.0)];
+
+    let outlines = editor.nearest_outlines(editor.outlines(|_| false), &near);
+    assert_eq!(outlines.len(), NEAREST);
+    // Those of the first four triangles (x < 400), not further along.
+    assert!(
+        outlines
+            .iter()
+            .all(|&(u, v)| { doc.vertex(u).x < 400.0 && doc.vertex(v).x < 400.0 })
+    );
+    let vertices = editor.nearest_vertices(&near);
+    assert_eq!(vertices.len(), NEAREST);
+    assert!(vertices.iter().all(|&v| doc.vertex(v).x < 400.0));
 }

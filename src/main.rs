@@ -18,6 +18,7 @@ mod panels;
 mod places;
 mod raster;
 mod recent;
+mod snap;
 mod svg;
 mod update;
 mod wheel;
@@ -47,7 +48,7 @@ use paint::{Brush, Hsv, Target};
 use panels::{joined, tip};
 use update::{
     BackgroundMessage, ExportMessage, FileMessage, Format, KeysMessage, LayerAction, MenuMessage,
-    PageDialog, PageMessage, PaintMessage, ShapeMessage,
+    PageDialog, PageMessage, PaintMessage, ShapeMessage, SnapMessage,
 };
 
 pub fn main() -> iced::Result {
@@ -193,6 +194,10 @@ struct Tessera {
     keys_open: bool,
     /// The document size dialog, as filled in so far, while it's open.
     page_dialog: Option<PageDialog>,
+    /// How dragged points snap (kept in the config folder); and its
+    /// dialog's grid step, as typed, while it's open.
+    snap: snap::Snap,
+    snap_dialog: Option<String>,
     rebinding: Option<(Action, Option<usize>)>,
     /// The modifier keys held (Shift turns painting a layer into painting
     /// all layers).
@@ -299,6 +304,7 @@ enum Message {
     Background(BackgroundMessage),
     Menu(MenuMessage),
     Page(PageMessage),
+    Snap(SnapMessage),
 }
 
 /// What was saved: the layers and background version.
@@ -498,6 +504,7 @@ impl Tessera {
             keys: Keymap::load(),
             png_scale: 2.0,
             export_to_page: true,
+            snap: snap::Snap::load(),
             brush,
             recent_files: recent::Recent::load(),
             places: places::Places::load(),
@@ -528,6 +535,7 @@ impl Tessera {
             Message::Background(message) => self.update_background(message),
             Message::Menu(message) => self.update_menu(message),
             Message::Page(message) => self.update_page(message),
+            Message::Snap(message) => self.update_snap(message),
             Message::Undo => {
                 self.menu = None;
                 let Some(before) = self.undo.pop() else {
@@ -643,6 +651,7 @@ impl Tessera {
             self.keys_open = false;
             self.export_open = None;
             self.page_dialog = None;
+            self.snap_dialog = None;
             self.editing_background = false;
             self.picking = false;
             self.placing_mirror = false;
@@ -653,6 +662,7 @@ impl Tessera {
             || self.keys_open
             || self.export_open.is_some()
             || self.page_dialog.is_some()
+            || self.snap_dialog.is_some()
         {
             return Task::none();
         }
@@ -851,6 +861,9 @@ impl Tessera {
                             .filter(|&id| self.layers.shown(id))
                             .collect(),
                         page: self.layers.page(),
+                        grid: editor::Grid {
+                            step: self.snap.grid,
+                        },
                     },
                 )
             }
@@ -895,6 +908,9 @@ impl Tessera {
         }
         if let Some(dialog) = &self.page_dialog {
             screen = screen.push(self.page_dialog(dialog));
+        }
+        if let Some(step) = &self.snap_dialog {
+            screen = screen.push(self.snap_dialog(step));
         }
         if let Some(path) = &self.dropping {
             screen = screen.push(dropping_hint(path));
@@ -953,6 +969,30 @@ mod tests {
             edits: vec![Edit::AddTriangle { corners, snap: 0.0 }],
             revision,
         }));
+    }
+
+    #[test]
+    fn a_document_is_placed_with_its_corner_on_the_grid() {
+        let mut app = Tessera::default();
+        edit(&mut app, 0.0);
+        let page = |app: &mut Tessera, message| {
+            let _ = app.update(Message::Page(message));
+        };
+        // Odd sizes, around the triangle and then where it was: its corner
+        // lands on the (10 px) grid either way.
+        for (width, height) in [("1005", "703"), ("333", "777")] {
+            page(&mut app, PageMessage::Show(true));
+            page(&mut app, PageMessage::Width(width.into()));
+            page(&mut app, PageMessage::Height(height.into()));
+            page(&mut app, PageMessage::Apply);
+            let corner = app.layers.page().unwrap().min();
+            for side in [corner.x, corner.y] {
+                assert!(
+                    (side / 10.0 - (side / 10.0).round()).abs() < 1e-4,
+                    "{corner:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -43,6 +43,68 @@ pub(super) fn rebase(interaction: &mut Interaction, cursor: Point) {
     }
 }
 
+/// The lasso's cursor at `p` (screen): a loop of rope above and to the
+/// right, crossing itself, its end trailing down to a dot where the cursor
+/// is; taking out of the selection (`removes`), with a minus by it.
+fn draw_lasso_cursor(frame: &mut Frame, p: Point, removes: bool) {
+    let at = |x: f32, y: f32| p + Vector::new(x, y);
+    // Where the rope crosses itself.
+    let (cx, cy) = (5.0, -6.0);
+    let rope = Path::new(|path| {
+        path.move_to(at(cx - 3.0, cy + 3.0));
+        path.line_to(at(cx, cy));
+        path.bezier_curve_to(
+            at(cx + 2.0, cy - 3.0),
+            at(cx - 4.0, cy - 14.0),
+            at(cx + 6.0, cy - 17.0),
+        );
+        path.bezier_curve_to(
+            at(cx + 16.0, cy - 20.0),
+            at(cx + 22.0, cy - 10.0),
+            at(cx + 14.0, cy - 4.0),
+        );
+        path.bezier_curve_to(
+            at(cx + 9.0, cy - 1.0),
+            at(cx + 3.0, cy - 1.0),
+            at(cx - 2.0, cy - 2.0),
+        );
+        // The end, down to the cursor.
+        path.move_to(at(cx - 3.0, cy + 3.0));
+        path.bezier_curve_to(at(cx - 6.0, cy + 6.0), at(2.0, -1.0), p);
+    });
+    let outline = Stroke {
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..stroke(BACKGROUND, 3.5)
+    };
+    let line = Stroke {
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..stroke(HOVER, 1.5)
+    };
+    frame.stroke(&rope, outline);
+    frame.stroke(&rope, line);
+    frame.fill(&Path::circle(p, 2.5), BACKGROUND);
+    frame.fill(&Path::circle(p, 1.5), HOVER);
+    if removes {
+        let minus = Path::line(at(-9.0, -16.0), at(-3.0, -16.0));
+        frame.stroke(
+            &minus,
+            Stroke {
+                line_cap: LineCap::Round,
+                ..stroke(BACKGROUND, 4.0)
+            },
+        );
+        frame.stroke(
+            &minus,
+            Stroke {
+                line_cap: LineCap::Round,
+                ..stroke(REMOVED, 2.0)
+            },
+        );
+    }
+}
+
 impl Editor<'_> {
     /// The lasso being drawn, the selected vertices (where the pending move
     /// puts them), the centre they rotate or scale around, and the cursor.
@@ -65,13 +127,15 @@ impl Editor<'_> {
                 }
                 p.close();
             });
-            frame.fill(&lasso, Color { a: 0.08, ..HOVER });
+            // Taking out of the selection: in red.
+            let color = if state.lasso_removes { REMOVED } else { HOVER };
+            frame.fill(&lasso, Color { a: 0.08, ..color });
             let dashed = Stroke {
                 line_dash: LineDash {
                     segments: &[6.0, 4.0],
                     offset: 0,
                 },
-                ..stroke(HOVER, 1.5)
+                ..stroke(color, 1.5)
             };
             frame.stroke(&lasso, dashed);
         }
@@ -214,14 +278,16 @@ impl Editor<'_> {
             }
         }
 
-        // The cursor: a cross-hair for the lasso, arrows each way with a
+        // The cursor: a lasso for the lasso, arrows each way with a
         // selection to move.
         let Some(p) = cursor else {
             return;
         };
         match state.interaction {
-            Interaction::Lassoing => {
-                frame.stroke(&Path::circle(p, 4.0), stroke(HOVER, 1.5));
+            // Drawing a lasso, or about to (after Q).
+            Interaction::Lassoing => draw_lasso_cursor(frame, p, state.lasso_removes),
+            Interaction::Idle if state.lasso_armed => {
+                draw_lasso_cursor(frame, p, state.lasso_removes);
             }
             Interaction::Idle
             | Interaction::MovingSelection { .. }

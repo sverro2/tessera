@@ -7,7 +7,7 @@
 //! cursor, Shift+wheel rotates around it. Keys (as the user has them; see
 //! [`crate::keys`]) cut the hovered edge, delete, and so on.
 //!
-//! Ctrl+drag draws a lasso, adding the vertices inside it to the
+//! Q, then a drag, draws a lasso, adding the vertices inside it to the
 //! selection; Shift+click adds or removes a vertex. The selection is then
 //! dragged, grabbed, rotated or scaled, copied and pasted (see
 //! [`selection`]).
@@ -58,6 +58,7 @@ use crate::paint::{self, Brush};
 
 mod draw;
 mod extrude;
+mod grid;
 mod guides;
 mod mirror;
 mod painting;
@@ -69,6 +70,8 @@ mod bench;
 mod tests;
 
 use draw::*;
+pub use grid::Grid;
+use grid::MAJOR;
 use guides::*;
 use mirror::*;
 use selection::*;
@@ -92,8 +95,6 @@ const BUDGET: Duration = Duration::from_millis(10);
 const MAX_SNAPS: usize = 4;
 /// How long the shape highlight takes to move over to another shape.
 const SHAPE_FADE: Duration = Duration::from_millis(200);
-/// World-space spacing of the background dot grid.
-const GRID: f32 = 50.0;
 /// Rotation per wheel notch with Shift held.
 const ROTATE_STEP: f32 = 5.0 * std::f32::consts::PI / 180.0;
 
@@ -276,6 +277,8 @@ pub struct Settings<'a> {
     pub lit: Vec<NodeId>,
     /// The document size, if one's set: shown as a sheet behind it all.
     pub page: Option<Page>,
+    /// The grid points snap to, holding Ctrl.
+    pub grid: Grid,
 }
 
 /// The canvas for editing the current layer of `scene`, over the backdrop
@@ -300,12 +303,14 @@ pub fn view<'a>(
         keys,
         lit,
         page,
+        grid,
     } = settings;
     let backdrop = Canvas::new(Backdrop {
         cache: &caches.grid,
         background,
         camera,
         page,
+        grid,
     });
     let editor = Canvas::new(Editor {
         document: current.document,
@@ -324,6 +329,7 @@ pub fn view<'a>(
         clipboard,
         keys,
         lit,
+        grid,
         deadline: Cell::new(None),
     });
     // Apart, as images (the background) are drawn after shapes within a
@@ -342,6 +348,8 @@ struct Backdrop<'a> {
     background: Option<&'a Background>,
     camera: Camera,
     page: Option<Page>,
+    /// The snapping grid, the dot grid shows sparser.
+    grid: Grid,
 }
 
 impl canvas::Program<Message> for Backdrop<'_> {
@@ -373,7 +381,7 @@ impl canvas::Program<Message> for Backdrop<'_> {
             if let Some(background) = self.background {
                 background.draw(frame, self.camera);
             }
-            draw_grid(frame, self.camera);
+            draw_grid(frame, self.camera, self.grid);
             if let (Some(sheet), Some(page)) = (&sheet, self.page) {
                 frame.stroke(sheet, stroke(PAGE_EDGE, 1.0));
                 // Its size, above its top left corner (as seen).
@@ -406,6 +414,7 @@ struct Worker<'a> {
     proportional: Option<f32>,
     clipboard: Option<&'a Piece>,
     keys: Option<&'a Keymap>,
+    grid: Grid,
     deadline: Option<std::time::Instant>,
 }
 
@@ -430,6 +439,7 @@ impl<'a> Worker<'a> {
             clipboard: self.clipboard,
             keys: self.keys,
             lit: Vec::new(),
+            grid: self.grid,
             deadline: Cell::new(self.deadline),
         }
     }
@@ -470,6 +480,8 @@ struct Editor<'a> {
     lit: Vec<NodeId>,
     /// When working out what a drag does should give up, so a heavy case
     /// (e.g. a fill through crowded geometry) can't make it crawl.
+    /// The grid points snap to, holding Ctrl.
+    grid: Grid,
     deadline: Cell<Option<std::time::Instant>>,
 }
 
@@ -507,8 +519,16 @@ pub struct State {
     /// with is told from where it lands: see [`Editor::lit`]).
     guides: Vec<Guide>,
     near_guides: Vec<Guide>,
-    /// The lasso being drawn (world).
+    /// The lasso being drawn (world); and whether the next drag draws one
+    /// (Q pressed).
     lasso: Vec<Point>,
+    lasso_armed: bool,
+    /// Whether the lasso (made ready, or being drawn) takes what it catches
+    /// out of the selection (Shift+Q), rather than adding it (Q).
+    lasso_removes: bool,
+    /// Creating a triangle: the guides its start lined up with when it was
+    /// pressed (with Shift), those that would do and all those near.
+    start_guides: (Vec<Guide>, Vec<Guide>),
     /// Working on the current layer through one of its mirror images (the
     /// cursor went over there), seen through this map: see
     /// [`Editor::flipped`].
@@ -551,6 +571,8 @@ enum Interaction {
     Panning {
         last: Point,
     },
+    /// Creating a triangle started at `from` (where it was pressed, or with
+    /// Ctrl or Shift held, lined up from there), dragged to `to`.
     Creating {
         from: Point,
         to: Point,
@@ -852,6 +874,7 @@ impl Editor<'_> {
         if self.tool != Tool::Shape || !self.shown {
             state.selection.clear();
             state.lasso.clear();
+            state.lasso_armed = false;
             if matches!(
                 state.interaction,
                 Interaction::Lassoing
@@ -897,14 +920,19 @@ impl Editor<'_> {
             keyboard::Event::ModifiersChanged(modifiers) => {
                 state.modifiers = *modifiers;
                 if self.tool == Tool::Shape {
-                    // Shift down or up mid-drag: guides on or off.
+                    // Shift or Ctrl down or up mid-drag: guides or the grid on
+                    // or off.
                     if matches!(
                         state.interaction,
                         Interaction::Creating { .. }
                             | Interaction::MovingVertex { .. }
                             | Interaction::Extending { .. }
                             | Interaction::LeavingFace { .. }
-                    ) && let Some(pos) = screen
+                            | Interaction::Extruding { .. }
+                            | Interaction::MovingSelection { .. }
+                            | Interaction::Pasting { .. }
+                    ) && state.tweaking.is_none()
+                        && let Some(pos) = screen
                     {
                         state.aim = Some(self.camera.to_world(pos));
                     }
@@ -1066,6 +1094,19 @@ impl Editor<'_> {
                 (!points.is_empty())
                     .then(|| canvas::Action::publish(Message::Frame(points)).and_capture())
             }
+            // Lasso (Q, or Shift+Q to take out of the selection): the next
+            // drag draws one (the same again: not).
+            keyboard::Event::KeyPressed { repeat: false, .. }
+                if matches!(pressed, Some(Action::Lasso | Action::LassoRemove))
+                    && self.tool == Tool::Shape
+                    && self.shown
+                    && matches!(state.interaction, Interaction::Idle) =>
+            {
+                let removes = pressed == Some(Action::LassoRemove);
+                state.lasso_armed = !(state.lasso_armed && state.lasso_removes == removes);
+                state.lasso_removes = removes;
+                Some(canvas::Action::request_redraw().and_capture())
+            }
             // Select all (Ctrl+A): every vertex of the layer.
             keyboard::Event::KeyPressed { .. }
                 if pressed == Some(Action::SelectAll)
@@ -1133,6 +1174,7 @@ impl Editor<'_> {
             keyboard::Event::KeyPressed { key, .. }
                 if (*key == keyboard::Key::Named(keyboard::key::Named::Escape)
                     && (!state.selection.is_empty()
+                        || state.lasso_armed
                         || matches!(state.interaction, Interaction::Pasting { .. })))
                     || (!state.selection.is_empty()
                         && self.tool == Tool::Shape
@@ -1165,6 +1207,8 @@ impl Editor<'_> {
                         state.pending = None;
                     }
                     (false, _) => return None,
+                    // The lasso made ready first, then the selection.
+                    (true, Interaction::Idle) if state.lasso_armed => state.lasso_armed = false,
                     (true, Interaction::Idle) => state.selection.clear(),
                     (true, _) => {
                         state.interaction = Interaction::Idle;
@@ -1302,14 +1346,23 @@ impl Editor<'_> {
             };
             return Some(action.and_capture());
         }
-        // Shift+click adds a vertex to the selection, or removes it.
+        // The lasso Q made ready: a right click lets go of it.
+        if button == mouse::Button::Right && state.lasso_armed {
+            state.lasso_armed = false;
+            return Some(canvas::Action::request_redraw().and_capture());
+        }
+        // Shift+click adds a vertex to the selection, or removes it; with a
+        // selection, it does nothing else. (Elsewhere, Shift+drag creates a
+        // triangle that starts lined up.)
         if button == mouse::Button::Left
             && self.tool == Tool::Shape
             && state.modifiers.shift()
             && !state.modifiers.command()
+            && !state.lasso_armed
             && matches!(state.interaction, Interaction::Idle)
         {
-            if let Some(Hover::Vertex(v)) = self.hit_test(pos) {
+            let hovered = self.hit_test(pos);
+            if let Some(Hover::Vertex(v)) = hovered {
                 match state.selection.iter().position(|&s| s == v) {
                     Some(i) => {
                         state.selection.remove(i);
@@ -1318,7 +1371,9 @@ impl Editor<'_> {
                 }
                 state.selected_in = self.document.revision();
             }
-            return Some(canvas::Action::request_redraw().and_capture());
+            if matches!(hovered, Some(Hover::Vertex(_))) || !state.selection.is_empty() {
+                return Some(canvas::Action::request_redraw().and_capture());
+            }
         }
         if button == mouse::Button::Left && self.picking(state) {
             return Some(
@@ -1366,8 +1421,9 @@ impl Editor<'_> {
                 self.paint_at(state, pos);
                 Interaction::Painting { last: world }
             }
-            // Ctrl: a lasso.
-            mouse::Button::Left if state.modifiers.command() => {
+            // After Q: a lasso.
+            mouse::Button::Left if state.lasso_armed => {
+                state.lasso_armed = false;
                 state.lasso = vec![world];
                 Interaction::Lassoing
             }
@@ -1395,10 +1451,16 @@ impl Editor<'_> {
                     edge: None,
                     apex: world,
                 },
-                None => Interaction::Creating {
-                    from: world,
-                    to: world,
-                },
+                // With Ctrl, it starts on the grid; with Shift, lined up.
+                None => {
+                    let (from, fine, near) = self.creation_start(
+                        world,
+                        state.modifiers.command(),
+                        state.modifiers.shift(),
+                    );
+                    state.start_guides = (fine, near);
+                    Interaction::Creating { from, to: from }
+                }
             },
             _ => return None,
         };
@@ -1526,9 +1588,14 @@ impl Editor<'_> {
                     .unique_vertices()
                     .into_iter()
                     .filter(|&v| inside_polygon(self.document.vertex(v), &lasso));
-                for v in caught {
-                    if !state.selection.contains(&v) {
-                        state.selection.push(v);
+                if state.lasso_removes {
+                    let caught: Vec<VertexId> = caught.collect();
+                    state.selection.retain(|v| !caught.contains(v));
+                } else {
+                    for v in caught {
+                        if !state.selection.contains(&v) {
+                            state.selection.push(v);
+                        }
                     }
                 }
             }
@@ -1622,8 +1689,14 @@ impl Editor<'_> {
     /// nothing works out (in time), it stays where it was.
     fn follow(&self, state: &mut State, world: Point) {
         self.deadline.set(Some(std::time::Instant::now() + BUDGET));
-        // With Shift, a dragged point lines up with what's around it.
+        // With Shift, a dragged point lines up with what's around it; with
+        // Ctrl, it lands on the grid (that first, with both).
         let shift = state.modifiers.shift();
+        let grid = state.modifiers.command();
+        let gridded = |state: &mut State, (found, fine, near): grid::Gridded| {
+            (state.guides, state.near_guides) = (fine, near);
+            found
+        };
         state.guides.clear();
         state.near_guides.clear();
         let guided = |dragged: Dragged, guides: &mut Vec<Guide>, near: &mut Vec<Guide>| {
@@ -1635,29 +1708,36 @@ impl Editor<'_> {
             found
         };
         match &mut state.interaction {
-            Interaction::Creating { from, to } => {
+            Interaction::Creating { from, .. } => {
                 let from = *from;
-                // With Shift, the corner dragged lines up level or upright
-                // with where it started, or with the vertices there are.
-                if shift {
+                // The corner dragged: with Ctrl on the grid; with Shift level
+                // or upright with where it starts, or with the vertices there
+                // are, and so on; else snapped.
+                let (found, mut fine, mut near) = if grid {
+                    self.grid_create(from, world, shift)
+                } else if shift {
                     let (fine, near, found) = self.guided_creation(from, world);
-                    (state.guides, state.near_guides) = (fine, near);
-                    if let Some((at, pending)) = found {
-                        *to = at;
-                        state.pending = Some(pending);
-                        self.deadline.set(None);
-                        return;
-                    }
-                }
-                match self.create_snapped(from, world) {
-                    Some((at, pending)) => {
-                        *to = at;
-                        state.pending = Some(pending);
-                    }
-                    None => {
-                        *to = world;
-                        state.pending = None;
-                    }
+                    (
+                        found.or_else(|| self.create_snapped(from, world)),
+                        fine,
+                        near,
+                    )
+                } else {
+                    (self.create_snapped(from, world), Vec::new(), Vec::new())
+                };
+                // And those its start lined up with.
+                fine.extend(state.start_guides.0.iter().copied());
+                near.extend(state.start_guides.1.iter().copied());
+                (state.guides, state.near_guides) = (fine, near);
+                let to = found.as_ref().map_or(world, |(at, _)| *at);
+                state.pending = found.map(|(_, pending)| pending);
+                state.interaction = Interaction::Creating { from, to };
+            }
+            Interaction::MovingVertex { id, .. } if grid => {
+                let id = *id;
+                if let Some((at, pending)) = gridded(state, self.grid_move(id, world, shift)) {
+                    state.interaction = Interaction::MovingVertex { id, to: at };
+                    state.pending = Some(pending);
                 }
             }
             Interaction::MovingVertex { id, to } => {
@@ -1679,6 +1759,13 @@ impl Editor<'_> {
                     *to = p;
                     state.pending = Some(pending);
                 }
+            }
+            Interaction::Extending { a, b, start, .. } if grid => {
+                let (a, b, start) = (*a, *b, *start);
+                let found = gridded(state, self.grid_extend(a, b, start, world, shift));
+                let apex = found.as_ref().map_or(world, |(at, _)| *at);
+                state.pending = found.map(|(_, pending)| pending);
+                state.interaction = Interaction::Extending { a, b, start, apex };
             }
             Interaction::Extending { a, b, start, apex } => {
                 let dragged = Dragged::Apex {
@@ -1716,6 +1803,12 @@ impl Editor<'_> {
                     *edge = None;
                 }
                 match *edge {
+                    Some((a, b, start)) if grid => {
+                        let (found, fine, near) = self.grid_extend(a, b, start, world, shift);
+                        (state.guides, state.near_guides) = (fine, near);
+                        *apex = found.as_ref().map_or(world, |(at, _)| *at);
+                        state.pending = found.map(|(_, pending)| pending);
+                    }
                     Some((a, b, start)) => {
                         let dragged = Dragged::Apex { a, b, start };
                         if let Some((at, pending)) =
@@ -1734,6 +1827,13 @@ impl Editor<'_> {
                     }
                 }
             }
+            Interaction::Pasting { base, from, to } if grid => {
+                *to = world;
+                let by = *base + (world - *from);
+                state.pending = self
+                    .clipboard
+                    .and_then(|piece| self.grid_paste(piece, by, world));
+            }
             Interaction::Pasting { base, from, to } => {
                 *to = world;
                 state.pending = self.clipboard.and_then(|piece| {
@@ -1748,6 +1848,13 @@ impl Editor<'_> {
                             self.check(vec![Edit::Paste { piece }], world)
                         })
                 });
+            }
+            Interaction::MovingSelection { from, to, .. } if grid => {
+                let by = world - *from;
+                if let Some(pending) = self.grid_move_selection(&state.selection, by, world) {
+                    *to = world;
+                    state.pending = Some(pending);
+                }
             }
             Interaction::MovingSelection { from, to, .. } => {
                 let by = world - *from;
@@ -1776,7 +1883,24 @@ impl Editor<'_> {
                     state.pending = Some(pending);
                 }
             }
+            Interaction::Extruding { from, to } if grid => {
+                let (found, fine, near) = self.grid_extrude(&state.selection, *from, world, shift);
+                (state.guides, state.near_guides) = (fine, near);
+                *to = found.as_ref().map_or(world, |(at, _)| *at);
+                state.pending = found.map(|(_, pending)| pending);
+            }
             Interaction::Extruding { from, to } => {
+                // With Shift, it lines up with what's around it.
+                if shift {
+                    let (fine, near, found) = self.guided_extrusion(&state.selection, *from, world);
+                    (state.guides, state.near_guides) = (fine, near);
+                    if let Some((at, pending)) = found {
+                        *to = at;
+                        state.pending = Some(pending);
+                        self.deadline.set(None);
+                        return;
+                    }
+                }
                 let by = world - *from;
                 // Snapped, so its far edges join up where they land; not
                 // onto what it's extruded from.
@@ -1996,7 +2120,7 @@ impl Editor<'_> {
             | Interaction::PivotingSelection { .. }
             | Interaction::Extruding { .. }
             | Interaction::Pasting { .. } => None,
-            Interaction::Creating { from, to } => self.create(from, to, to),
+            Interaction::Creating { from, to, .. } => self.create(from, to, to),
             Interaction::MovingVertex { id, to } => self.move_to(id, to),
             Interaction::LeavingFace { edge, apex, .. } => {
                 let (a, b, start) = edge?;
@@ -2216,6 +2340,29 @@ impl Editor<'_> {
             })
     }
 
+    /// Dragging from edge `a`–`b` (grabbed at `start`) to exactly `apex` (on
+    /// the grid, say): as [`Self::extend`], but snapping onto nothing.
+    fn extend_exact(&self, a: VertexId, b: VertexId, start: Point, apex: Point) -> Option<Pending> {
+        if let Some(triangle) = self.triangle_beside(a, b, apex) {
+            let Some((insert, document, id)) = self.split_from_edge(a, b, start, triangle) else {
+                return self.check(vec![Edit::InsertVertex { at: apex }], apex);
+            };
+            let moved = self
+                .with_document(&document)
+                .check(vec![Edit::MoveVertex { id, to: apex }], apex)?;
+            let edits = [insert].into_iter().chain(moved.edits).collect();
+            return self.check(edits, apex);
+        }
+        let (pa, pb) = (self.document.vertex(a), self.document.vertex(b));
+        self.check(
+            vec![Edit::AddTriangle {
+                corners: [pa, pb, apex],
+                snap: self.snap_distance(),
+            }],
+            apex,
+        )
+    }
+
     /// Splits `triangle` (on edge `a`–`b`) at a point just inside it from
     /// `start` on the edge: where a drag into it begins. Returns the edit,
     /// the resulting document and the new vertex.
@@ -2261,6 +2408,7 @@ impl Editor<'_> {
             clipboard: self.clipboard,
             keys: self.keys,
             lit: self.lit.clone(),
+            grid: self.grid,
             deadline: self.deadline.clone(),
         }
     }
@@ -2439,6 +2587,7 @@ impl Editor<'_> {
             proportional: self.proportional,
             clipboard: self.clipboard,
             keys: self.keys,
+            grid: self.grid,
             deadline: self.deadline.get(),
         }
     }

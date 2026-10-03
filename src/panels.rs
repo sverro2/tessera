@@ -845,7 +845,15 @@ impl Tessera {
             ),
             Menu::View => (
                 2.0 * (MENU_WIDTH + 10.0),
-                column![item("Reset view", String::new(), Some(Message::ResetView))],
+                column![
+                    item("Reset view", String::new(), Some(Message::ResetView)),
+                    iced::widget::rule::horizontal(1),
+                    item(
+                        "Snap settings…",
+                        String::new(),
+                        Some(Message::Snap(SnapMessage::Show(true)))
+                    ),
+                ],
             ),
             Menu::Help => (
                 3.0 * (MENU_WIDTH + 10.0),
