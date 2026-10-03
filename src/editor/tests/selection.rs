@@ -254,6 +254,25 @@ fn copied_faces_are_pasted_where_they_fit() {
 }
 
 #[test]
+fn faces_too_thin_to_draw_are_pasted_as_thin_as_copied() {
+    // Zoomed so far out the triangles are some 2 px high: thinner than
+    // anything may be made, but no thinner than they were.
+    let doc = two_apart();
+    let cache = Caches::default();
+    let mut editor = editor(&doc, &cache);
+    editor.camera.zoom = 0.02;
+    let piece = doc.piece(&[3, 4, 5]);
+    let below = Point::new(300.0, 650.0);
+    let pasted = editor.check(
+        vec![Edit::Paste {
+            piece: piece.moved(Vector::new(0.0, 400.0)),
+        }],
+        below,
+    );
+    assert!(pasted.is_some());
+}
+
+#[test]
 fn a_paste_snaps_to_join_up_and_a_cut_takes_the_faces_away() {
     let doc = two_apart();
     let cache = Caches::default();

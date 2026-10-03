@@ -551,6 +551,7 @@ impl Document {
     }
 
     /// Finds a triangle with these corners, in any order.
+    #[cfg(test)]
     pub fn find_triangle(&self, mut ids: [VertexId; 3]) -> Option<TriangleId> {
         ids.sort_unstable();
 

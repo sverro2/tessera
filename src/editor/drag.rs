@@ -2,6 +2,8 @@
 //! transforming), snapped and kept valid, worked out on other threads
 //! where that's slow.
 
+use std::collections::HashSet;
+
 use super::*;
 
 /// An editor's view of the drawing, without what can't go to another
@@ -491,21 +493,51 @@ impl Editor<'_> {
 
         // Slivers would be invisible and impossible to grab. Triangles that
         // were already that thin (e.g. when zoomed far out) may stay so, as
-        // long as they don't get any thinner.
+        // long as they don't get any thinner: the drawing's, and those
+        // pasted as they were copied.
         let height = |document: &Document, t: [VertexId; 3]| {
             min_height(t.map(|v| self.camera.to_screen(document.vertex(v))))
         };
-        let has_sliver = result.triangle_ids().iter().any(|&t| {
-            let after = height(&result, t);
-            after < MIN_THICKNESS
-                && match self.document.find_triangle(t) {
-                    Some(_) => after < height(self.document, t) - 1e-3,
-                    None => true,
+        let thin: Vec<[VertexId; 3]> = result
+            .triangle_ids()
+            .iter()
+            .copied()
+            .filter(|&t| height(&result, t) < MIN_THICKNESS)
+            .collect();
+        if !thin.is_empty() {
+            let sorted = |mut t: [VertexId; 3]| {
+                t.sort_unstable();
+                t
+            };
+            let before: HashSet<[VertexId; 3]> = self
+                .document
+                .triangle_ids()
+                .iter()
+                .map(|&t| sorted(t))
+                .collect();
+            let pasted: HashSet<[(u32, u32); 3]> = edits
+                .iter()
+                .filter_map(|edit| match edit {
+                    Edit::Paste { piece } => Some(piece),
+                    _ => None,
+                })
+                .flat_map(|piece| {
+                    piece
+                        .triangles
+                        .iter()
+                        .map(|t| corners_key(t.map(|v| piece.vertices[v])))
+                })
+                .collect();
+            let sliver = thin.iter().any(|&t| {
+                if before.contains(&sorted(t)) {
+                    height(&result, t) < height(self.document, t) - 1e-3
+                } else {
+                    !pasted.contains(&corners_key(t.map(|v| result.vertex(v))))
                 }
-        });
-
-        if has_sliver {
-            return None;
+            });
+            if sliver {
+                return None;
+            }
         }
         // Over a mirror line: it would overlap a mirror image.
         if !self.mirrors.is_empty() {
@@ -1026,4 +1058,11 @@ pub(super) fn equilateral(from: Point, to: Point) -> [Point; 3] {
     let mid = Point::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
     let h = 3f32.sqrt() / 2.0;
     [from, to, mid + Vector::new(d.y * h, -d.x * h)]
+}
+
+/// A triangle's corners, in a fixed order, to tell it by where it is.
+fn corners_key(corners: [Point; 3]) -> [(u32, u32); 3] {
+    let mut key = corners.map(|p| (p.x.to_bits(), p.y.to_bits()));
+    key.sort_unstable();
+    key
 }
