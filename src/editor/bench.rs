@@ -889,3 +889,121 @@ fn bench_face_meshes() {
         meshes
     });
 }
+
+/// Whole frames of the drawing in `TESSERA_BENCH`, through the GPU (drawn,
+/// uploaded, rendered and read back), panning a little each frame: with
+/// all on the canvas (paths) and with meshes. Run with
+/// `TESSERA_BENCH=file.tessera cargo test --release bench_frames --
+/// --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark: needs a drawing and a GPU"]
+fn bench_frames() {
+    use iced::advanced::graphics::geometry::Renderer as _;
+    use iced::advanced::graphics::mesh::Renderer as _;
+    use iced::advanced::renderer::{Headless, Renderer as _};
+    let Ok(path) = std::env::var("TESSERA_BENCH") else {
+        return;
+    };
+    let Some(mut renderer) = iced::futures::executor::block_on(<Renderer as Headless>::new(
+        iced_renderer::core::renderer::Settings::default(),
+        Some("wgpu"),
+    )) else {
+        println!("BENCH frames: no GPU");
+        return;
+    };
+    let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
+    let layers = &contents.layers;
+    let current = layers.first_layer();
+    fn scene_layer(layer: &crate::layers::Layer) -> SceneLayer<'_> {
+        SceneLayer {
+            id: layer.id,
+            document: &layer.document,
+            crossfade: layer.crossfade,
+            show_edges: layer.show_edges,
+            mirrors: layer.mirror.as_slice(),
+        }
+    }
+    let (below, above) = layers.around(current);
+    let size = iced::Size::new(1600.0, 1000.0);
+    let bounds = Rectangle::new(Point::ORIGIN, size);
+    let points: Vec<Point> = layers
+        .layers()
+        .iter()
+        .filter_map(|layer| layer.document.bounds())
+        .flat_map(|(min, max)| [min, max])
+        .collect();
+    let whole = Camera::default().framing(&points, size, 40.0);
+    let middle = Point::new(
+        (whole.to_world(Point::ORIGIN).x + whole.to_world(Point::new(size.width, 0.0)).x) / 2.0,
+        (whole.to_world(Point::ORIGIN).y + whole.to_world(Point::new(0.0, size.height)).y) / 2.0,
+    );
+    let on = |zoom: f32| Camera {
+        pan: Vector::new(
+            size.width / 2.0 - middle.x * zoom,
+            size.height / 2.0 - middle.y * zoom,
+        ),
+        zoom,
+        ..Camera::default()
+    };
+    let current_layer = layers.layer(current).unwrap();
+    for (tool_name, tool) in [
+        ("shape", Tool::Shape),
+        (
+            "paint",
+            Tool::Paint {
+                target: paint::Target::Faces,
+                brush: Brush::default(),
+                width: 2.0,
+                picking: false,
+            },
+        ),
+    ] {
+        for (view_name, camera) in [("whole", whole), ("×1", on(1.0)), ("×8", on(8.0))] {
+            for meshes in [false, true] {
+                let cache = Caches::default();
+                let mut editor = super::tests::editor(&current_layer.document, &cache);
+                editor.current = current;
+                editor.below = below.iter().map(|&l| scene_layer(l)).collect();
+                editor.above = above.iter().map(|&l| scene_layer(l)).collect();
+                editor.tool = tool;
+                let state = State::default();
+                let mut times = Vec::new();
+                for frame in 0..10 {
+                    editor.camera = Camera {
+                        pan: camera.pan + Vector::new(frame as f32 * 3.0, 0.0),
+                        ..camera
+                    };
+                    let start = std::time::Instant::now();
+                    // A new frame, as the app starts each.
+                    renderer.reset(bounds);
+                    renderer.with_translation(Vector::ZERO, |renderer| {
+                        let parts =
+                            editor.draw_parts(&state, renderer, bounds, mouse::Cursor::Unavailable, meshes);
+                        for part in parts {
+                            match part {
+                                meshes::Drawn::Geometry(geometry) => renderer.draw_geometry(geometry),
+                                meshes::Drawn::Meshes(cache) => renderer.draw_mesh_cache(cache),
+                            }
+                        }
+                    });
+                    let pixels = renderer.screenshot(
+                        iced::Size::new(size.width as u32, size.height as u32),
+                        1.0,
+                        BACKGROUND,
+                    );
+                    std::hint::black_box(pixels);
+                    times.push(start.elapsed());
+                }
+                // The first frames warm up.
+                let mut times = times.split_off(2);
+                times.sort();
+                let how = if meshes { "meshes" } else { "paths" };
+                println!(
+                    "BENCH frames {tool_name:>5} {view_name:<5} {how:<6}: median {:?}, max {:?}",
+                    times[times.len() / 2],
+                    times.last().unwrap()
+                );
+            }
+        }
+    }
+}
