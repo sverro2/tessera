@@ -804,16 +804,25 @@ impl Tessera {
                             .unwrap_or_default()
                             .to_string_lossy();
                         items = items.push(
+                            // Long names and folders cut short, so neither
+                            // pushes the other out of the menu.
                             button(
                                 row![
-                                    text(name).size(14).wrapping(text::Wrapping::None),
-                                    space::horizontal(),
+                                    text(name)
+                                        .size(14)
+                                        .wrapping(text::Wrapping::None)
+                                        .ellipsis(text::Ellipsis::End)
+                                        .width(iced::Length::FillPortion(3)),
                                     text(folder)
                                         .size(12)
                                         .style(text::secondary)
-                                        .wrapping(text::Wrapping::None),
+                                        .wrapping(text::Wrapping::None)
+                                        .ellipsis(text::Ellipsis::End)
+                                        .align_x(iced::Right)
+                                        .width(iced::Length::FillPortion(2)),
                                 ]
-                                .spacing(12),
+                                .spacing(12)
+                                .align_y(Center),
                             )
                             .width(Fill)
                             .padding([6, 12])
