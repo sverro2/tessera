@@ -1,3 +1,5 @@
+//! The document's tests: edits applied, and what they leave.
+
 use super::*;
 
 fn doc_with_triangle() -> Document {

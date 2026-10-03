@@ -1,3 +1,11 @@
+//! Tessera: drawing low-poly pictures out of triangles that share their
+//! corners, then painting their faces and edges, layer by layer.
+//!
+//! An iced application in the Elm style: [`Tessera`] holds the state,
+//! [`Message`] says what happened, `update` (by area, in [`update`]) changes
+//! the state, and `view` (with [`panels`] and [`dialogs`]) shows it. The
+//! canvas is [`editor`], a widget of its own that sends its own messages.
+
 mod background;
 mod camera;
 mod compass;

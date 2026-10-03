@@ -1,3 +1,6 @@
+//! The editor's tests: events (keys, the mouse) run through the canvas
+//! program, and what it publishes or how its state changes looked at.
+
 use super::*;
 use canvas::Program;
 

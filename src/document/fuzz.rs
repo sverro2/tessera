@@ -1,3 +1,5 @@
+//! Random edits, checking the document stays valid through them all.
+
 use super::*;
 use crate::geometry::closest_on_segment;
 

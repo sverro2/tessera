@@ -1,3 +1,7 @@
+//! Benchmarks (ignored tests, run with `--release -- --ignored
+//! --nocapture`): most time a drawing given in `TESSERA_BENCH` (see
+//! [`Drawing`]); `shoot_canvas` writes pictures of the canvas to compare.
+
 use super::*;
 use std::time::Instant as T;
 

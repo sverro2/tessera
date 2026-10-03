@@ -1,3 +1,5 @@
+//! The app's tests: messages in, state out, as the user would go about it.
+
 use super::*;
 use document::Edit;
 use iced::Point;
