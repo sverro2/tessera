@@ -797,9 +797,9 @@ impl Editor<'_> {
             // Both with a hint of the colours, to still tell what's
             // painted; other layers fainter.
             Look::Plain => {
-                self.draw_hinted(frame, document, 1.0, 1.5, meshes);
+                self.draw_hinted(frame, document, 1.0, 1.5, meshes.as_deref_mut());
                 if self.shows_vertices(look) {
-                    self.draw_vertices(frame, document);
+                    self.draw_vertices(frame, document, meshes);
                 }
                 return;
             }
@@ -944,17 +944,35 @@ impl Editor<'_> {
         self.tool == Tool::Shape && look == Look::Plain
     }
 
-    /// A dot on each vertex.
-    pub(super) fn draw_vertices(&self, frame: &mut Frame, document: &Document) {
+    /// A dot on each vertex (over everything else, with meshes).
+    pub(super) fn draw_vertices(
+        &self,
+        frame: &mut Frame,
+        document: &Document,
+        meshes: Option<&mut LayerMeshes>,
+    ) {
         let seen = self.view(frame, 4.0);
-        let dots = Path::new(|p| {
-            for v in document.unique_vertices() {
-                if seen.shows(&[document.vertex(v)]) {
-                    p.circle(self.camera.to_screen(document.vertex(v)), 2.5);
+        let dots = document
+            .unique_vertices()
+            .into_iter()
+            .map(|v| document.vertex(v))
+            .filter(|&p| seen.shows(&[p]))
+            .map(|p| self.camera.to_screen(p));
+        match meshes {
+            Some(meshes) => {
+                for dot in dots {
+                    meshes.over.dot(dot, 2.5, EDGE);
                 }
             }
-        });
-        frame.fill(&dots, EDGE);
+            None => {
+                let path = Path::new(|p| {
+                    for dot in dots {
+                        p.circle(dot, 2.5);
+                    }
+                });
+                frame.fill(&path, EDGE);
+            }
+        }
     }
 
     /// The plain look, `strength` strong (1: full), edges `width` wide, with
@@ -965,7 +983,7 @@ impl Editor<'_> {
         document: &Document,
         strength: f32,
         width: f32,
-        meshes: Option<&mut LayerMeshes>,
+        mut meshes: Option<&mut LayerMeshes>,
     ) {
         let faint = |color: Color, alpha: f32| Color {
             a: color.a * alpha * strength,
@@ -973,7 +991,7 @@ impl Editor<'_> {
         };
         // Only what may show.
         let seen = self.view(frame, width + 2.0);
-        match meshes {
+        match meshes.as_deref_mut() {
             Some(meshes) => {
                 let visible: Vec<[Point; 3]> = document
                     .triangles()
@@ -1015,13 +1033,24 @@ impl Editor<'_> {
             }
         }
         for (color, edges) in by_color.0 {
-            let path = Path::new(|p| {
-                for (a, b) in edges {
-                    p.move_to(screen(a));
-                    p.line_to(screen(b));
+            let color = faint(color, 0.5);
+            match meshes.as_deref_mut() {
+                // Over the outlines.
+                Some(meshes) => {
+                    for (a, b) in edges {
+                        meshes.under.line(screen(a), screen(b), width, color);
+                    }
                 }
-            });
-            frame.stroke(&path, stroke(faint(color, 0.5), width));
+                None => {
+                    let path = Path::new(|p| {
+                        for (a, b) in edges {
+                            p.move_to(screen(a));
+                            p.line_to(screen(b));
+                        }
+                    });
+                    frame.stroke(&path, stroke(color, width));
+                }
+            }
         }
     }
 

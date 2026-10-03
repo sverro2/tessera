@@ -107,6 +107,22 @@ impl Builder {
         self.indices.extend([middle, last, first]);
     }
 
+    /// A dot round `centre`, `radius` across, `color`: a polygon close
+    /// enough to a circle at the sizes dots are.
+    pub(super) fn dot(&mut self, centre: Point, radius: f32, color: Color) {
+        const SIDES: usize = 10;
+        let packed = color::pack(color);
+        let middle = self.vertex(centre, packed);
+        let first = middle + 1;
+        for i in 0..SIDES {
+            let angle = i as f32 * std::f32::consts::TAU / SIDES as f32;
+            let corner = centre + Vector::new(angle.cos(), angle.sin()) * radius;
+            let _ = self.vertex(corner, packed);
+            let next = first + ((i + 1) % SIDES) as u32;
+            self.indices.extend([middle, first + i as u32, next]);
+        }
+    }
+
     fn mesh(self, size: Size) -> Option<Mesh> {
         (!self.indices.is_empty()).then(|| Mesh::Solid {
             buffers: mesh::Indexed {
