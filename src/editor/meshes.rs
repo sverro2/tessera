@@ -10,13 +10,13 @@
 
 use std::sync::Arc;
 
+use iced::advanced::Shell;
 use iced::advanced::graphics::color;
 use iced::advanced::graphics::geometry::Renderer as _;
 use iced::advanced::graphics::mesh::{self, Mesh, Renderer as _, SolidVertex2D};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self as advanced_renderer, Renderer as _};
 use iced::advanced::widget::{self, Tree, Widget};
-use iced::advanced::Shell;
 use iced::{Event, Length, Transformation};
 
 use super::*;
@@ -85,7 +85,8 @@ impl Builder {
         let across = Vector::new(-along.y, along.x);
         let (a, b) = (a - along, b + along);
         let packed = color::pack(color);
-        let [p, q, r, s] = [a + across, b + across, b - across, a - across].map(|p| self.vertex(p, packed));
+        let [p, q, r, s] =
+            [a + across, b + across, b - across, a - across].map(|p| self.vertex(p, packed));
         self.indices.extend([p, q, r, p, r, s]);
     }
 
@@ -204,7 +205,10 @@ impl Widget<Message, Theme, Renderer> for EditorView<'_> {
             let interaction = self.mouse_interaction(tree, layout, cursor, viewport, renderer);
             if redrawing {
                 self.last_interaction = Some(interaction);
-            } else if self.last_interaction.is_some_and(|last| last != interaction) {
+            } else if self
+                .last_interaction
+                .is_some_and(|last| last != interaction)
+            {
                 shell.request_redraw();
             }
         }
@@ -220,7 +224,8 @@ impl Widget<Message, Theme, Renderer> for EditorView<'_> {
     ) -> mouse::Interaction {
         use canvas::Program;
         let state = tree.state.downcast_ref::<State>();
-        self.editor.mouse_interaction(state, layout.bounds(), cursor)
+        self.editor
+            .mouse_interaction(state, layout.bounds(), cursor)
     }
 
     fn draw(
@@ -240,7 +245,10 @@ impl Widget<Message, Theme, Renderer> for EditorView<'_> {
         let state = tree.state.downcast_ref::<State>();
         let meshes = draws_meshes(renderer);
         renderer.with_translation(Vector::new(bounds.x, bounds.y), |renderer| {
-            for part in self.editor.draw_parts(state, renderer, bounds, cursor, meshes) {
+            for part in self
+                .editor
+                .draw_parts(state, renderer, bounds, cursor, meshes)
+            {
                 match part {
                     Drawn::Geometry(geometry) => renderer.draw_geometry(geometry),
                     Drawn::Meshes(meshes) if !meshes.is_empty() => {

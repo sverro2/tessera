@@ -271,7 +271,10 @@ fn slash_frames_the_shape_pointed_at_else_the_layer() {
             .update(&mut state, &slash(), bounds, cursor)
             .and_then(|action| action.into_inner().0);
         match published {
-            Some(Message::Frame { points, layer: None }) => {
+            Some(Message::Frame {
+                points,
+                layer: None,
+            }) => {
                 let mut points: Vec<_> = points.iter().map(|p| (p.x, p.y)).collect();
                 points.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 points.dedup();

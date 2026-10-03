@@ -181,7 +181,10 @@ fn sides_of(document: &Document) -> Vec<[Side; 3]> {
     all.sort_unstable_by_key(|&(edge, ..)| edge);
     for run in all.chunk_by(|x, y| x.0 == y.0) {
         let (u, v) = run[0].0;
-        let near = run.iter().map(|&(_, near, _)| near).fold(f32::INFINITY, f32::min);
+        let near = run
+            .iter()
+            .map(|&(_, near, _)| near)
+            .fold(f32::INFINITY, f32::min);
         let owner = run.iter().map(|&(.., at)| at).min().expect("a side");
         let painted = document.edge_style(u, v).is_some();
         for &(_, _, at) in run {
@@ -319,8 +322,9 @@ impl Editor<'_> {
         mirrors: &[Mirror],
         meshes: Option<&mut LayerMeshes>,
     ) {
-        self.painter()
-            .draw_layer(frame, document, look, crossfade, show_edges, mirrors, meshes);
+        self.painter().draw_layer(
+            frame, document, look, crossfade, show_edges, mirrors, meshes,
+        );
     }
 
     pub(super) fn edge_width(&self, width: f32) -> f32 {
@@ -361,11 +365,7 @@ impl Painter<'_> {
     /// [`joints`]), their widths as drawn at this zoom. Remembered per
     /// drawing and zoom, so panning needn't work them out again; those not
     /// yet are, with the edges they meet, so they join up as they should.
-    fn edge_outlines(
-        &self,
-        document: &Document,
-        ends: &[(VertexId, VertexId)],
-    ) -> Vec<Vec<Point>> {
+    fn edge_outlines(&self, document: &Document, ends: &[(VertexId, VertexId)]) -> Vec<Vec<Point>> {
         let zoom = self.camera.zoom;
         let width = |a, b| {
             let style = document.edge_style(a, b).unwrap_or(doc::DEFAULT_EDGE);
@@ -417,7 +417,9 @@ impl Painter<'_> {
                 known.outlines.insert(edge, outline);
             }
         }
-        ends.iter().map(|edge| known.outlines[edge].clone()).collect()
+        ends.iter()
+            .map(|edge| known.outlines[edge].clone())
+            .collect()
     }
 
     /// How far (screen px) `document`'s painted edges may reach past what
@@ -452,13 +454,7 @@ impl Painter<'_> {
                 for image in doc::images(mirrors) {
                     if !image.near(seen) {
                         let ghost = document.transformed(image.then(unseen));
-                        self.draw_hinted(
-                            frame,
-                            &ghost,
-                            strength * 0.4,
-                            1.0,
-                            meshes.as_deref_mut(),
-                        );
+                        self.draw_hinted(frame, &ghost, strength * 0.4, 1.0, meshes.as_deref_mut());
                     }
                 }
                 self.draw_layer(frame, document, look, crossfade, show_edges, &[], meshes);
@@ -485,7 +481,8 @@ impl Painter<'_> {
         // Only what may show: past the sides as far as a painted edge may
         // reach.
         let seen = self.view(frame, self.edge_reach(document));
-        let shows = |a: VertexId, b: VertexId| seen.shows(&[document.vertex(a), document.vertex(b)]);
+        let shows =
+            |a: VertexId, b: VertexId| seen.shows(&[document.vertex(a), document.vertex(b)]);
 
         // Unpainted faces hatched, as they're not exported: plainly not
         // painted (and not some colour). Then the painted ones by colour.
@@ -503,11 +500,15 @@ impl Painter<'_> {
         match meshes.as_deref_mut() {
             Some(meshes) => {
                 for &t in &unpainted {
-                    meshes.under.triangle(t.map(|p| self.camera.to_screen(p)), unpainted_tint);
+                    meshes
+                        .under
+                        .triangle(t.map(|p| self.camera.to_screen(p)), unpainted_tint);
                 }
                 for &t in &visible {
                     if let Some(color) = colors[t] {
-                        meshes.under.triangle(corners(t).map(|p| self.camera.to_screen(p)), color);
+                        meshes
+                            .under
+                            .triangle(corners(t).map(|p| self.camera.to_screen(p)), color);
                     }
                 }
             }
@@ -548,7 +549,10 @@ impl Painter<'_> {
             // Over the faces, under the painted edges.
             Some(meshes) => {
                 for (a, b, shown) in unpainted {
-                    let color = Color { a: dashed.a * shown, ..dashed };
+                    let color = Color {
+                        a: dashed.a * shown,
+                        ..dashed
+                    };
                     for (from, to) in dashes(a, b, 4.0, 4.0) {
                         meshes.under.line(from, to, 1.0, color);
                     }
@@ -581,7 +585,12 @@ impl Painter<'_> {
         let outlines: Vec<Vec<Point>> = self
             .edge_outlines(document, &ends)
             .into_iter()
-            .map(|outline| outline.into_iter().map(|p| self.camera.to_screen(p)).collect())
+            .map(|outline| {
+                outline
+                    .into_iter()
+                    .map(|p| self.camera.to_screen(p))
+                    .collect()
+            })
             .collect();
         let path = |outlines: &[&Vec<Point>]| {
             Path::new(|p| {
@@ -656,7 +665,9 @@ impl Painter<'_> {
             .into_iter()
             .flat_map(|t| {
                 let corners = document.triangle_ids()[t];
-                (0..3).filter(move |&k| sides[t][k].owns_start).map(move |k| corners[k])
+                (0..3)
+                    .filter(move |&k| sides[t][k].owns_start)
+                    .map(move |k| corners[k])
             })
             .filter(|&v| seen.shows(&[document.vertex(v)]))
             .map(|v| (screen(v), detail(shortest[v] * zoom / 2.0)))
@@ -888,7 +899,11 @@ mod tests {
         for i in 0..300 {
             let x = i as f32 * 20.0;
             let at = points.len();
-            points.extend([Point::new(x, 0.0), Point::new(x + 10.0, 0.0), Point::new(x + 5.0, 10.0)]);
+            points.extend([
+                Point::new(x, 0.0),
+                Point::new(x + 10.0, 0.0),
+                Point::new(x + 5.0, 10.0),
+            ]);
             triangles.push([at, at + 1, at + 2]);
         }
         let document = Document::from_parts(points, triangles).unwrap();

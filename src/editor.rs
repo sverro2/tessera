@@ -31,13 +31,13 @@ use std::collections::HashMap;
 
 use rayon::prelude::*;
 
+use iced::advanced::graphics::cache::{Cached, Group};
 use iced::keyboard;
 use iced::mouse;
 use iced::time::{Duration, Instant};
 use iced::widget::canvas::{
     self, Canvas, Event, Frame, Geometry, LineCap, LineDash, LineJoin, Path, Stroke,
 };
-use iced::advanced::graphics::cache::{Cached, Group};
 use iced::widget::stack;
 use iced::window;
 use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Size, Theme, Vector};
@@ -76,10 +76,10 @@ mod tests;
 
 use drag::*;
 use draw::*;
-use meshes::{Drawn, EditorView, LayerMeshes};
 pub use grid::Grid;
 use grid::MAJOR;
 use guides::*;
+use meshes::{Drawn, EditorView, LayerMeshes};
 use mirror::*;
 use painter::*;
 use selection::*;

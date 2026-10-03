@@ -840,7 +840,9 @@ impl Tessera {
                 let current = self.current();
                 let (below, above) = self.layers.around(current, &self.isolated);
                 let scene = editor::Scene {
-                    current: editor::SceneLayer::of(self.layers.layer(current).expect("current layer")),
+                    current: editor::SceneLayer::of(
+                        self.layers.layer(current).expect("current layer"),
+                    ),
                     shown: self.layers.in_view(current, &self.isolated),
                     below: below.into_iter().map(editor::SceneLayer::of).collect(),
                     above: above.into_iter().map(editor::SceneLayer::of).collect(),

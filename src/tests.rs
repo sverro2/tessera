@@ -138,10 +138,12 @@ fn framing_a_shape_on_another_layer_switches_to_it() {
     let _ = app.update(Message::Layers(LayerAction::Add));
     let front = app.current();
     let points = vec![iced::Point::ORIGIN, iced::Point::new(100.0, 100.0)];
-    let frame = |layer| Message::Editor(editor::Message::Frame {
-        points: points.clone(),
-        layer,
-    });
+    let frame = |layer| {
+        Message::Editor(editor::Message::Frame {
+            points: points.clone(),
+            layer,
+        })
+    };
     let _ = app.update(frame(None));
     assert_eq!(app.current(), front);
     let _ = app.update(frame(Some(back)));

@@ -603,7 +603,10 @@ impl Drawing {
         let current = named
             .and_then(|name| {
                 let layers = layers.layers();
-                layers.iter().find(|layer| layer.name == name).map(|layer| layer.id)
+                layers
+                    .iter()
+                    .find(|layer| layer.name == name)
+                    .map(|layer| layer.id)
             })
             .unwrap_or_else(|| layers.first_layer());
         Some(Drawing { contents, current })
@@ -701,7 +704,6 @@ fn draw_frame(
     )
 }
 
-
 /// A renderer as the app's (wgpu), on a GPU without a window: to draw the
 /// canvas as the app does. `None` without a GPU.
 fn gpu_renderer() -> Option<Renderer> {
@@ -758,7 +760,10 @@ fn bench_render() {
     let size = iced::Size::new(1600.0, 1000.0);
     let bounds = Rectangle::new(Point::ORIGIN, size);
     let whole = drawing.whole(size);
-    let (min, max) = (whole.to_world(Point::ORIGIN), whole.to_world(Point::new(size.width, size.height)));
+    let (min, max) = (
+        whole.to_world(Point::ORIGIN),
+        whole.to_world(Point::new(size.width, size.height)),
+    );
     // Zoomed in on a point (world), at a zoom.
     let on = |p: Point, zoom: f32| Camera {
         pan: Vector::new(

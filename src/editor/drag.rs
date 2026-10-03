@@ -655,7 +655,13 @@ impl Editor<'_> {
     /// new vertex to `apex` like any dragged vertex, so it can go on to
     /// squash a child or rearrange the neighbours. On an empty side, add a
     /// triangle on the edge, its third corner snapped like a dragged vertex.
-    pub(super) fn extend(&self, a: VertexId, b: VertexId, start: Point, apex: Point) -> Option<Pending> {
+    pub(super) fn extend(
+        &self,
+        a: VertexId,
+        b: VertexId,
+        start: Point,
+        apex: Point,
+    ) -> Option<Pending> {
         if let Some(triangle) = self.triangle_beside(a, b, apex) {
             let Some((insert, document, id)) = self.split_from_edge(a, b, start, triangle) else {
                 return self.check(vec![Edit::InsertVertex { at: apex }], apex);
@@ -692,7 +698,13 @@ impl Editor<'_> {
 
     /// Dragging from edge `a`–`b` (grabbed at `start`) to exactly `apex` (on
     /// the grid, say): as [`Self::extend`], but snapping onto nothing.
-    pub(super) fn extend_exact(&self, a: VertexId, b: VertexId, start: Point, apex: Point) -> Option<Pending> {
+    pub(super) fn extend_exact(
+        &self,
+        a: VertexId,
+        b: VertexId,
+        start: Point,
+        apex: Point,
+    ) -> Option<Pending> {
         if let Some(triangle) = self.triangle_beside(a, b, apex) {
             let Some((insert, document, id)) = self.split_from_edge(a, b, start, triangle) else {
                 return self.check(vec![Edit::InsertVertex { at: apex }], apex);
@@ -766,7 +778,11 @@ impl Editor<'_> {
     /// The last edge the cursor crossed going from `from` to `to` (world),
     /// and where: its ends and the crossing point. `None` if it crossed
     /// none.
-    pub(super) fn last_crossed(&self, from: Point, to: Point) -> Option<(VertexId, VertexId, Point)> {
+    pub(super) fn last_crossed(
+        &self,
+        from: Point,
+        to: Point,
+    ) -> Option<(VertexId, VertexId, Point)> {
         let d = to - from;
         self.document
             .unique_edges()
@@ -788,7 +804,12 @@ impl Editor<'_> {
     }
 
     /// The triangle on edge `a`–`b` lying on the same side as `point`.
-    pub(super) fn triangle_beside(&self, a: VertexId, b: VertexId, point: Point) -> Option<TriangleId> {
+    pub(super) fn triangle_beside(
+        &self,
+        a: VertexId,
+        b: VertexId,
+        point: Point,
+    ) -> Option<TriangleId> {
         let (pa, pb) = (self.document.vertex(a), self.document.vertex(b));
         let side = area2(pa, pb, point);
 

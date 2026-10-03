@@ -238,7 +238,9 @@ impl Editor<'_> {
                 look,
             }))
             .collect();
-        let mut drawn = self.draw_cached(renderer, size, &wanted, meshes).into_iter();
+        let mut drawn = self
+            .draw_cached(renderer, size, &wanted, meshes)
+            .into_iter();
         let mut layers: Vec<Drawn> = drawn.by_ref().take(self.below.len()).flatten().collect();
         let mut above: Vec<Drawn> = drawn.by_ref().take(self.above.len()).flatten().collect();
         if look != Look::Painted {
@@ -309,7 +311,11 @@ impl Editor<'_> {
                     look,
                 })
                 .collect();
-            layers.extend(self.draw_cached(renderer, size, &lit, meshes).into_iter().flatten());
+            layers.extend(
+                self.draw_cached(renderer, size, &lit, meshes)
+                    .into_iter()
+                    .flatten(),
+            );
         }
 
         let mut overlay = Frame::new(renderer, bounds.size());
@@ -475,7 +481,10 @@ impl Editor<'_> {
             if state.selection.is_empty() && hover.is_none() {
                 let (start, _, near) = self.creation_start(world, grid, shift);
                 let reach = bounds.width + bounds.height;
-                for &guide in near.iter().filter(|&&guide| self.runs_through(guide, start)) {
+                for &guide in near
+                    .iter()
+                    .filter(|&&guide| self.runs_through(guide, start))
+                {
                     let shape = guide.shape(self.document, camera);
                     self.draw_guide_line(&mut overlay, guide, shape, true, reach);
                 }
@@ -695,7 +704,9 @@ impl Editor<'_> {
         for (i, geometry, built) in drawn {
             let id = wanted[i].layer.id;
             let previous = caches.remove(&id);
-            let group = previous.as_ref().map_or_else(Group::unique, |cache| cache.group);
+            let group = previous
+                .as_ref()
+                .map_or_else(Group::unique, |cache| cache.group);
             let geometry = geometry.cache(group, previous.map(|cache| cache.geometry));
             let key = keys[i].clone();
             caches.insert(

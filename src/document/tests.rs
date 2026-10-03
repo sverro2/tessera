@@ -540,8 +540,7 @@ pub(super) fn has_t_junction(doc: &Document) -> bool {
         (0..3).any(|k| {
             let (u, v) = (t[k], t[(k + 1) % 3]);
             used.iter().any(|&w| {
-                !t.contains(&w)
-                    && is_inside_segment(doc.vertex(w), doc.vertex(u), doc.vertex(v))
+                !t.contains(&w) && is_inside_segment(doc.vertex(w), doc.vertex(u), doc.vertex(v))
             })
         })
     })

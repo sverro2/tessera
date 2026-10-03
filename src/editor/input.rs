@@ -10,9 +10,15 @@ impl Editor<'_> {
     /// the cursor (at `inside`), on this layer or else the one in view
     /// it's over (frontmost first); else the one last highlighted; else
     /// all of the layer.
-    pub(super) fn shape_to_frame(&self, state: &State, inside: Option<Point>) -> (Vec<Point>, Option<NodeId>) {
+    pub(super) fn shape_to_frame(
+        &self,
+        state: &State,
+        inside: Option<Point>,
+    ) -> (Vec<Point>, Option<NodeId>) {
         let document = self.document;
-        let hover = inside.filter(|_| self.shown).and_then(|pos| self.hit_test(pos));
+        let hover = inside
+            .filter(|_| self.shown)
+            .and_then(|pos| self.hit_test(pos));
         if state.selection.is_empty()
             && hover.is_none()
             && let Some((points, layer)) = inside.and_then(|pos| self.shape_elsewhere(pos))
@@ -46,13 +52,17 @@ impl Editor<'_> {
         // The other layers as they are, even working through the current
         // layer's mirror image.
         let world = self.plain_camera().to_world(screen);
-        self.above.iter().rev().chain(self.below.iter().rev()).find_map(|layer| {
-            let document = layer.document;
-            let t = document.triangle_at(world)?;
-            let shape = document.connected(document.triangle_ids()[t][0]);
-            let vertices: Vec<VertexId> = shape.into_iter().flatten().collect();
-            Some((as_seen(document, &vertices, layer.mirrors), layer.id))
-        })
+        self.above
+            .iter()
+            .rev()
+            .chain(self.below.iter().rev())
+            .find_map(|layer| {
+                let document = layer.document;
+                let t = document.triangle_at(world)?;
+                let shape = document.connected(document.triangle_ids()[t][0]);
+                let vertices: Vec<VertexId> = shape.into_iter().flatten().collect();
+                Some((as_seen(document, &vertices, layer.mirrors), layer.id))
+            })
     }
 
     /// Keeping up with what changed since the last event: the shapes
@@ -891,7 +901,11 @@ impl Editor<'_> {
 
     /// A frame: where a drag got to since the last one, and the shape
     /// highlight fading over.
-    pub(super) fn on_frame(&self, state: &mut State, now: Instant) -> Option<canvas::Action<Message>> {
+    pub(super) fn on_frame(
+        &self,
+        state: &mut State,
+        now: Instant,
+    ) -> Option<canvas::Action<Message>> {
         // A frame: where the drag got to since the last one.
         if let Some(world) = state.aim.take() {
             self.follow(state, world);
@@ -923,10 +937,18 @@ impl Editor<'_> {
 
 /// The points of `vertices` of `document` as seen: with their mirror
 /// images across `mirrors`.
-pub(super) fn as_seen(document: &Document, vertices: &[VertexId], mirrors: &[Mirror]) -> Vec<Point> {
+pub(super) fn as_seen(
+    document: &Document,
+    vertices: &[VertexId],
+    mirrors: &[Mirror],
+) -> Vec<Point> {
     let images = doc::images(mirrors);
     vertices
         .iter()
-        .flat_map(|&v| images.iter().map(move |image| image.apply(document.vertex(v))))
+        .flat_map(|&v| {
+            images
+                .iter()
+                .map(move |image| image.apply(document.vertex(v)))
+        })
         .collect()
 }
