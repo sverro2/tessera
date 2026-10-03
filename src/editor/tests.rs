@@ -392,7 +392,7 @@ fn dragging_a_vertex_takes_those_nearby_along_proportionally() {
 }
 
 #[test]
-fn alt_tweaks_the_reach_while_the_move_holds_still() {
+fn shift_o_tweaks_the_reach_while_the_move_holds_still() {
     let doc = two_apart();
     let cache = Caches::default();
     let mut editor = editor(&doc, &cache);
@@ -406,7 +406,7 @@ fn alt_tweaks_the_reach_while_the_move_holds_still() {
     run(
         &editor,
         &mut state,
-        hold(keyboard::Modifiers::ALT),
+        press(letter('O'), keyboard::Modifiers::SHIFT),
         310.0,
         270.0,
     );
@@ -418,7 +418,8 @@ fn alt_tweaks_the_reach_while_the_move_holds_still() {
         matches!(moved, Some(Message::TweakReach(across)) if across == 30.0),
         "{moved:?}"
     );
-    // Let go of Alt away from where the move was: it goes on from there.
+    // Let go of O away from where the move was (Shift first, which
+    // doesn't end it): it goes on from there.
     run(
         &editor,
         &mut state,
@@ -426,6 +427,17 @@ fn alt_tweaks_the_reach_while_the_move_holds_still() {
         340.0,
         260.0,
     );
+    assert!(state.tweaking.is_some());
+    let o = letter('o');
+    let release = Event::Keyboard(keyboard::Event::KeyReleased {
+        key: o.clone(),
+        modified_key: o,
+        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyO),
+        location: keyboard::Location::Standard,
+        modifiers: keyboard::Modifiers::empty(),
+    });
+    run(&editor, &mut state, release, 340.0, 260.0);
+    assert!(state.tweaking.is_none());
     run(&editor, &mut state, Event::Mouse(MOVE), 345.0, 260.0);
     let edits = run(&editor, &mut state, Event::Mouse(PRESS), 345.0, 260.0);
     let by = Vector::new(15.0, 20.0);
@@ -1342,7 +1354,7 @@ fn ctrl_click_picks_instead_of_painting() {
 }
 
 #[test]
-fn alt_and_moving_tweaks_the_edge_width() {
+fn w_and_moving_tweaks_the_edge_width() {
     let doc = one();
     let cache = Caches::default();
     let mut editor = editor(&doc, &cache);
@@ -1362,25 +1374,28 @@ fn alt_and_moving_tweaks_the_edge_width() {
             picking: false,
         };
         let mut state = State::default();
-        let _ = run(&editor, &mut state, hold(keyboard::Modifiers::ALT), 200.0);
+        let _ = run(&editor, &mut state, key('w'), 200.0);
         let moved = run(&editor, &mut state, Event::Mouse(MOVE), 230.0).flatten();
         match moved {
             Some(Message::TweakWidth(across)) => {
                 assert!(tweaks);
                 assert_eq!(across, 30.0);
-                // The edge previewed is still looked for where Alt was
+                // The edge previewed is still looked for where W was
                 // pressed.
                 assert_eq!(state.tweaking.unwrap().at, Point::new(200.0, 300.0));
             }
             _ => assert!(!tweaks, "{target:?}: {moved:?}"),
         }
         // Let go: back to following the mouse.
-        let _ = run(
-            &editor,
-            &mut state,
-            hold(keyboard::Modifiers::empty()),
-            230.0,
-        );
+        let w = letter('w');
+        let release = Event::Keyboard(keyboard::Event::KeyReleased {
+            key: w.clone(),
+            modified_key: w,
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyW),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+        });
+        let _ = run(&editor, &mut state, release, 230.0);
         assert!(state.tweaking.is_none());
     }
 }
@@ -1429,7 +1444,7 @@ fn a_drag_is_worked_out_once_a_frame() {
 
 #[test]
 fn tweaking_an_edge_shows_the_layer_with_just_its_new_width() {
-    // The bottom edge (0 1) painted wide; Alt over it, the brush thin.
+    // The bottom edge (0 1) painted wide; W over it, the brush thin.
     let mut doc = one();
     let wide = EdgeStyle {
         color: Color::from_rgb(1.0, 0.0, 0.0),
@@ -1451,13 +1466,7 @@ fn tweaking_an_edge_shows_the_layer_with_just_its_new_width() {
     };
     let mut state = State::default();
     assert!(editor.tweaked_edge(&state).is_none());
-    run(
-        &editor,
-        &mut state,
-        hold(keyboard::Modifiers::ALT),
-        200.0,
-        300.0,
-    );
+    run(&editor, &mut state, key('w'), 200.0, 300.0);
     let tweaked = editor.tweaked_edge(&state).expect("tweaking");
     let style = tweaked.edge_style(0, 1).unwrap();
     assert_eq!(style.width, 2.0);
@@ -1528,7 +1537,7 @@ fn a_click_while_adjusting_paints_what_is_previewed() {
     let press_c = key('c');
     let brush = Brush::default();
 
-    // Alt over the bottom edge; the mouse wanders off; a click there
+    // W over the bottom edge; the mouse wanders off; a click there
     // paints the bottom edge, with the width set.
     editor.tool = Tool::Paint {
         target: paint::Target::Edges,
@@ -1537,13 +1546,7 @@ fn a_click_while_adjusting_paints_what_is_previewed() {
         picking: false,
     };
     let mut state = State::default();
-    run(
-        &editor,
-        &mut state,
-        hold(keyboard::Modifiers::ALT),
-        200.0,
-        300.0,
-    );
+    run(&editor, &mut state, key('w'), 200.0, 300.0);
     run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 450.0);
     let clicked = run(&editor, &mut state, Event::Mouse(PRESS), 200.0, 450.0);
     let style = Some(EdgeStyle {
@@ -2064,4 +2067,180 @@ fn dragging_into_a_triangle_can_go_on_into_its_neighbour() {
         assert!(result.edges().any(|e| e == (4, 3) || e == (3, 4)));
         assert!((area(result) - area(&doc)).abs() < 0.5);
     }
+}
+
+/// The triangles an extrusion adds.
+fn extruded(edits: &[Vec<Edit>]) -> usize {
+    match edits {
+        [edits] => match &edits[..] {
+            [Edit::Paste { piece }] => piece.triangles.len(),
+            _ => panic!("not an extrusion: {edits:?}"),
+        },
+        _ => panic!("expected one edit: {edits:?}"),
+    }
+}
+
+#[test]
+fn e_extrudes_the_outer_edges_facing_the_cursor() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    state.selection = vec![0, 1, 2];
+
+    // Down: only the bottom edge faces that way.
+    run(&editor, &mut state, key('e'), 200.0, 250.0);
+    assert!(run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 350.0).is_empty());
+    let edits = run(&editor, &mut state, Event::Mouse(PRESS), 200.0, 350.0);
+    assert_eq!(extruded(&edits), 2);
+    // The new bottom edge is selected, to go on from.
+    let mut after = doc.clone();
+    assert!(after.apply_all(&edits[0]));
+    let mut at: Vec<Point> = state.selection.iter().map(|&v| after.vertex(v)).collect();
+    at.sort_by(|p, q| p.x.total_cmp(&q.x));
+    assert_eq!(at, [Point::new(100.0, 400.0), Point::new(300.0, 400.0)]);
+
+    // Up: both slanted edges, joined at the swept apex.
+    let mut state = State::default();
+    state.selection = vec![0, 1, 2];
+    run(&editor, &mut state, key('e'), 200.0, 250.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 150.0);
+    let edits = run(&editor, &mut state, Event::Mouse(PRESS), 200.0, 150.0);
+    assert_eq!(extruded(&edits), 4);
+    assert_eq!(state.selection.len(), 3);
+}
+
+#[test]
+fn an_extrusion_leaves_out_edges_running_into_something() {
+    let mut doc = one();
+    // In the way of the left edge swept up, not of the right.
+    triangle(&mut doc, [(105.0, 215.0), (130.0, 215.0), (118.0, 195.0)]);
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    state.selection = vec![0, 1, 2];
+
+    run(&editor, &mut state, key('e'), 200.0, 250.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 150.0);
+    let edits = run(&editor, &mut state, Event::Mouse(PRESS), 200.0, 150.0);
+    assert_eq!(extruded(&edits), 2);
+}
+
+#[test]
+fn escape_cancels_an_extrusion() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    state.selection = vec![0, 1, 2];
+
+    run(&editor, &mut state, key('e'), 200.0, 250.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 350.0);
+    assert!(run(&editor, &mut state, escape(), 200.0, 350.0).is_empty());
+    assert!(run(&editor, &mut state, Event::Mouse(PRESS), 200.0, 350.0).is_empty());
+    assert_eq!(state.selection.len(), 3);
+}
+
+#[test]
+fn a_right_click_cancels_a_drag() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let right = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right));
+
+    // Moving corner 2, creating on blank canvas, extending from an edge,
+    // lassoing (none of it lands, or selects anything).
+    for [(x0, y0), (x1, y1)] in [
+        [(200.0, 100.0), (220.0, 60.0)],
+        [(500.0, 400.0), (560.0, 420.0)],
+        [(200.0, 300.0), (200.0, 380.0)],
+    ] {
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(PRESS), x0, y0);
+        run(&editor, &mut state, Event::Mouse(MOVE), x1, y1);
+        assert!(state.pending.is_some());
+        assert!(run(&editor, &mut state, right.clone(), x1, y1).is_empty());
+        assert!(run(&editor, &mut state, Event::Mouse(RELEASE), x1, y1).is_empty());
+        assert!(matches!(state.interaction, Interaction::Idle));
+    }
+
+    let mut state = State::default();
+    run(
+        &editor,
+        &mut state,
+        hold(keyboard::Modifiers::CTRL),
+        50.0,
+        50.0,
+    );
+    run(&editor, &mut state, Event::Mouse(PRESS), 50.0, 50.0);
+    for (x, y) in [(400.0, 50.0), (400.0, 400.0), (50.0, 400.0)] {
+        run(&editor, &mut state, Event::Mouse(MOVE), x, y);
+    }
+    run(&editor, &mut state, right, 50.0, 400.0);
+    run(&editor, &mut state, Event::Mouse(RELEASE), 50.0, 400.0);
+    assert!(state.selection.is_empty());
+}
+
+#[test]
+fn a_new_triangle_snaps_by_its_third_corner_too() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+
+    // From (500, 400): dragged to (484.9, 185.9), its third corner comes
+    // to (307, 306), in reach of corner 1 (300, 300); dragged to (307,
+    // 306), the dragged corner is. Either way it's welded on.
+    for (x, y) in [(484.9, 185.9), (307.0, 306.0)] {
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
+        run(&editor, &mut state, Event::Mouse(MOVE), x, y);
+        let edits = run(&editor, &mut state, Event::Mouse(RELEASE), x, y);
+        let mut after = doc.clone();
+        assert!(after.apply_all(&edits[0]));
+        assert_eq!(after.vertex_count(), 5, "to ({x}, {y})");
+        assert!(after.unique_vertices().iter().any(|&v| v == 1));
+    }
+}
+
+#[test]
+fn with_shift_a_new_triangle_lines_up_by_its_third_corner_and_far_side() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let create = |to: (f32, f32)| {
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(MOVE), 500.0, 400.0);
+        run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
+        run(
+            &editor,
+            &mut state,
+            hold(keyboard::Modifiers::SHIFT),
+            500.0,
+            400.0,
+        );
+        run(&editor, &mut state, Event::Mouse(MOVE), to.0, to.1);
+        let Interaction::Creating { from, to } = state.interaction else {
+            panic!("{:?}", state.interaction);
+        };
+        let lit = editor.lit(&state, state.pending.as_ref().expect("lined up"));
+        (to, editor.third_corner(from, to), lit)
+    };
+
+    // Dragged to (635, 440), its third corner comes to about (x, 303):
+    // level with the bottom corners instead.
+    let (_, third, lit) = create((635.0, 440.0));
+    assert!((third.y - 300.0).abs() < 1e-3, "{third:?}");
+    assert!(lit.iter().any(|guide| matches!(
+        guide,
+        Guide::Level { upright: false, .. } | Guide::Along { .. }
+    )));
+
+    // Dragged to (632, 474), its far side comes out about upright:
+    // upright.
+    let (to, third, lit) = create((632.0, 474.0));
+    assert!((third.x - to.x).abs() < 1e-2, "{to:?} {third:?}");
+    assert!(
+        lit.iter()
+            .any(|guide| matches!(guide, Guide::Across { edge: None, .. }))
+    );
 }

@@ -63,21 +63,24 @@ pub enum Action {
     Grab,
     Rotate,
     Scale,
+    Extrude,
     SelectShape,
     SelectAll,
     Copy,
     CutFaces,
     Paste,
     Proportional,
+    Reach,
     // Paint mode.
     PaintFaces,
     PaintEdges,
     Pipette,
     Lightness,
+    Width,
 }
 
 impl Action {
-    pub const ALL: [Action; 26] = [
+    pub const ALL: [Action; 29] = [
         Action::ToggleMode,
         Action::New,
         Action::Open,
@@ -94,16 +97,19 @@ impl Action {
         Action::Grab,
         Action::Rotate,
         Action::Scale,
+        Action::Extrude,
         Action::SelectShape,
         Action::SelectAll,
         Action::Copy,
         Action::CutFaces,
         Action::Paste,
         Action::Proportional,
+        Action::Reach,
         Action::PaintFaces,
         Action::PaintEdges,
         Action::Pipette,
         Action::Lightness,
+        Action::Width,
     ];
 
     pub fn context(self) -> Context {
@@ -111,9 +117,9 @@ impl Action {
         match self {
             ToggleMode | New | Open | Save | SaveAs | Undo | Redo | Mirror | DuplicateLayer
             | FrameShape | ShowKeys => Context::Global,
-            CutEdge | Delete | Grab | Rotate | Scale | SelectShape | SelectAll | Copy
-            | CutFaces | Paste | Proportional => Context::Shape,
-            PaintFaces | PaintEdges | Pipette | Lightness => Context::Paint,
+            CutEdge | Delete | Grab | Rotate | Scale | Extrude | SelectShape | SelectAll | Copy
+            | CutFaces | Paste | Proportional | Reach => Context::Shape,
+            PaintFaces | PaintEdges | Pipette | Lightness | Width => Context::Paint,
         }
     }
 
@@ -137,16 +143,19 @@ impl Action {
             Grab => "Grab the selection (click to put down)",
             Rotate => "Rotate the selection",
             Scale => "Scale the selection",
+            Extrude => "Extrude the selection's outer edges (click to put down)",
             SelectShape => "Select the whole shape",
             SelectAll => "Select every vertex of the layer",
             Copy => "Copy the selected faces",
             CutFaces => "Cut the selected faces",
             Paste => "Paste (click to put down)",
             Proportional => "Proportional editing on/off",
+            Reach => "Hold and move: how far proportional editing reaches",
             PaintFaces => "Paint faces",
             PaintEdges => "Paint edges",
             Pipette => "Pipette on/off",
             Lightness => "Hold and move: lighter or darker",
+            Width => "Hold and move: edge width",
         }
     }
 
@@ -170,16 +179,19 @@ impl Action {
             Grab => &["G"],
             Rotate => &["R"],
             Scale => &["T"],
+            Extrude => &["E"],
             SelectShape => &["Ctrl+L"],
             SelectAll => &["Ctrl+A"],
             Copy => &["Ctrl+C"],
             CutFaces => &["Ctrl+X"],
             Paste => &["Ctrl+V"],
             Proportional => &["O"],
+            Reach => &["Shift+O"],
             PaintFaces => &["F"],
             PaintEdges => &["E"],
             Pipette => &["I"],
             Lightness => &["C"],
+            Width => &["W"],
         }
     }
 
@@ -193,7 +205,7 @@ impl Action {
 
 /// What the mouse does with keys held: not changed here, but shown in the
 /// lookup, by where it works.
-pub const GESTURES: [(Context, &str, &str); 12] = [
+pub const GESTURES: [(Context, &str, &str); 10] = [
     (
         Context::Global,
         "Esc",
@@ -215,16 +227,10 @@ pub const GESTURES: [(Context, &str, &str); 12] = [
     ),
     (
         Context::Shape,
-        "Alt+move",
-        "How far proportional editing reaches",
-    ),
-    (
-        Context::Shape,
         "Right-click",
-        "Cancel grabbing, rotating, scaling or pasting",
+        "Cancel a drag, or grabbing, rotating, scaling, extruding or pasting",
     ),
     (Context::Paint, "Ctrl+click", "Pick up a colour"),
-    (Context::Paint, "Alt+move", "Edge width"),
     (Context::Paint, "Click or drag", "Paint"),
 ];
 

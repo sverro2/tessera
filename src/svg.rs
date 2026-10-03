@@ -12,12 +12,14 @@ use crate::paint;
 
 const PADDING: f32 = 10.0;
 
-/// The area exported: around everything drawn (mirrored too), with some
-/// room; its top left corner and size (world units, a pixel each).
+/// The area exported: around everything shown (mirrored too), with some
+/// room; its top left corner and size (world units, a pixel each). Hidden
+/// layers are in the SVG, but don't show, so they don't count.
 pub fn area(layers: &Layers) -> (iced::Point, iced::Size) {
     let bounds = layers
         .layers()
         .iter()
+        .filter(|layer| layers.shown(layer.id))
         .filter_map(|layer| layer.drawing().bounds())
         .reduce(|(min1, max1), (min2, max2)| {
             (

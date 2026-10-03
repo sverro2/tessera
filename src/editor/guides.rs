@@ -49,6 +49,16 @@ pub(super) enum Guide {
     /// From a point that's no vertex yet (where a new triangle starts), at
     /// the same angle as edge `u`–`v`.
     ParallelFrom { at: Point, u: VertexId, v: VertexId },
+    /// The far side of a new triangle started at `at` (from its dragged
+    /// corner to its third) running along `side`: level or upright in the
+    /// view, or parallel to `edge`. For that, the dragged corner is on the
+    /// line from `at` along `line` (where it runs, as the others).
+    Across {
+        at: Point,
+        line: Vector,
+        side: Vector,
+        edge: Option<(VertexId, VertexId)>,
+    },
 }
 
 impl Guide {
@@ -60,6 +70,7 @@ impl Guide {
             Guide::Level { n, upright } => level(at(n), upright, camera),
             Guide::Along { u, v } => Shape::Line(at(u), at(v) - at(u)),
             Guide::ParallelFrom { at: from, u, v } => Shape::Line(from, at(v) - at(u)),
+            Guide::Across { at, line, .. } => Shape::Line(at, line),
             Guide::Axis { at, upright } => level(at, upright, camera),
             Guide::Straight { m, n } => Shape::Line(at(n), at(n) - at(m)),
             Guide::Square { m, n } => {
@@ -87,6 +98,7 @@ impl Guide {
             Guide::Parallel { u, v, .. }
             | Guide::Along { u, v }
             | Guide::ParallelFrom { u, v, .. } => Some((u, v)),
+            Guide::Across { edge, .. } => edge,
             Guide::Between { .. }
             | Guide::Corner { .. }
             | Guide::Level { .. }
@@ -107,7 +119,8 @@ impl Guide {
             | Guide::Middle { .. }
             | Guide::Axis { .. }
             | Guide::Along { .. }
-            | Guide::ParallelFrom { .. } => None,
+            | Guide::ParallelFrom { .. }
+            | Guide::Across { .. } => None,
         }
     }
 
@@ -262,34 +275,81 @@ impl Editor<'_> {
         Some((fine, all_near, found))
     }
 
-    /// Lining up the corner dragged out for a new triangle started at
-    /// `from` (the cursor at `world`): level or upright with its start, or
-    /// with the vertices there are; at the angle of the shapes' outlines,
-    /// or in line with them. As [`Self::guided`].
+    /// Lining up a new triangle started at `from` (the cursor at `world`):
+    /// its dragged corner, and its third, level or upright with its start
+    /// or with the vertices there are, or in line with the shapes'
+    /// outlines; the sides from its start level, upright or at the angle of
+    /// the outlines; and its far side likewise. As [`Self::guided`].
     pub(super) fn guided_creation(&self, from: Point, world: Point) -> Guided {
-        let mut guides = Vec::new();
+        let camera = self.camera;
+        let outlines = self.outlines(|_| false);
+        // For either corner.
+        let mut corner = Vec::new();
         for upright in [false, true] {
-            guides.push(Guide::Axis { at: from, upright });
+            corner.push(Guide::Axis { at: from, upright });
             for n in self.document.unique_vertices() {
-                guides.push(Guide::Level { n, upright });
+                corner.push(Guide::Level { n, upright });
             }
         }
-        for (u, v) in self.outlines(|_| false) {
-            guides.push(Guide::ParallelFrom { at: from, u, v });
-            guides.push(Guide::Along { u, v });
+        for &(u, v) in &outlines {
+            corner.push(Guide::ParallelFrom { at: from, u, v });
+            corner.push(Guide::Along { u, v });
         }
-        let (near, all_near, candidates) = self.line_up(&guides, world);
+        // The far side runs twice sixty degrees off the side dragged out.
+        let across = |side: Vector, edge| Guide::Across {
+            at: from,
+            line: turn(side, 2.0 * self.sixty()),
+            side,
+            edge,
+        };
+        let mut far_side = Vec::new();
+        for upright in [false, true] {
+            if let Shape::Line(_, side) = level(from, upright, camera) {
+                far_side.push(across(side, None));
+            }
+        }
+        for &(u, v) in &outlines {
+            let side = self.document.vertex(v) - self.document.vertex(u);
+            far_side.push(across(side, Some((u, v))));
+        }
+
+        // The dragged corner first, as it's where the cursor is; then the
+        // far side, then the third corner.
+        let third = self.third_corner(from, world);
+        let (mut near, mut all_near, lined) = self.line_up(&corner, world);
+        let (near_far, all_far, lined_far) = self.line_up(&far_side, world);
+        let (near_third, all_third, lined_third) = self.line_up(&corner, third);
+        near.extend(near_far);
+        all_near.extend(all_far);
+        all_near.extend(all_third);
+
         let attempt = |at: Point| {
             let pending = self.pending(Interaction::Creating { from, to: at })?;
             self.keeps_shape(&pending).then_some(pending)
         };
-        let found = candidates
+        // Where the dragged corner goes for each to line up, best first.
+        let candidates: Vec<Point> = lined
             .into_iter()
             .take(2 * MAX_SNAPS)
+            .chain(lined_far.into_iter().take(2 * MAX_SNAPS))
+            .chain(
+                lined_third
+                    .into_iter()
+                    .take(2 * MAX_SNAPS)
+                    .map(|p| self.dragged_corner(from, p)),
+            )
+            .collect();
+        let found = candidates
+            .into_iter()
             .find_map(|at| Some((at, attempt(at)?)));
         let fine = near
             .iter()
             .filter(|&&(_, closest)| attempt(closest).is_some())
+            .chain(
+                near_third
+                    .iter()
+                    .filter(|&&(_, closest)| attempt(self.dragged_corner(from, closest)).is_some()),
+            )
             .map(|&(guide, _)| guide)
             .collect();
         (fine, all_near, found)
@@ -483,7 +543,8 @@ impl Editor<'_> {
                 | Guide::Level { .. }
                 | Guide::Middle { .. }
                 | Guide::Axis { .. }
-                | Guide::Along { .. } => &[],
+                | Guide::Along { .. }
+                | Guide::Across { .. } => &[],
             };
             if let Shape::Line(o, d) = shape {
                 for &way in ways {
@@ -531,12 +592,24 @@ impl Editor<'_> {
         if !self.keeps_shape(pending) {
             return Vec::new();
         }
+        let third = self.creating_third(state);
         state
             .near_guides
             .iter()
             .copied()
-            .filter(|&guide| self.runs_through(guide, pending.at))
+            .filter(|&guide| {
+                self.runs_through(guide, pending.at)
+                    || third.is_some_and(|third| self.runs_through(guide, third))
+            })
             .collect()
+    }
+
+    /// Creating a triangle: its third corner (world), which lines up too.
+    fn creating_third(&self, state: &State) -> Option<Point> {
+        match state.interaction {
+            Interaction::Creating { from, to } => Some(self.third_corner(from, to)),
+            _ => None,
+        }
     }
 
     /// Whether `guide` runs through `at` (world), on screen to the pixel.
@@ -574,6 +647,14 @@ impl Editor<'_> {
         let others = state.guides.iter().filter(|guide| !lit.contains(guide));
         shown.extend(others.take(GUIDES_SHOWN.saturating_sub(lit.len())));
 
+        // Creating a triangle: its corners dragged and third, which line up
+        // too.
+        let creating = match state.interaction {
+            Interaction::Creating { to, .. } => {
+                Some((to, self.creating_third(state).unwrap_or(to)))
+            }
+            _ => None,
+        };
         let reach = bounds.width + bounds.height;
         for guide in &shown {
             let on = lit.contains(guide);
@@ -590,7 +671,12 @@ impl Editor<'_> {
                     if on { 1.5 } else { 1.0 },
                 )
             };
-            match guide.shape(document, camera) {
+            // The far side's runs through the far side.
+            let shape = match (*guide, creating) {
+                (Guide::Across { side, .. }, Some((to, _))) => Shape::Line(to, side),
+                _ => guide.shape(document, camera),
+            };
+            match shape {
                 Shape::Line(o, d) => {
                     let (a, b) = (camera.to_screen(o), camera.to_screen(o + d));
                     let length = a.distance(b).max(1e-6);
@@ -650,6 +736,16 @@ impl Editor<'_> {
             frame.stroke(&path, stroke(GUIDE, 2.0));
         };
         for guide in &lit {
+            // Where the new edge lining up ends: the point dragged, or (as
+            // it lines up) a new triangle's third corner.
+            let p = match creating {
+                Some((_, third))
+                    if matches!(guide, Guide::Across { .. }) || !self.runs_through(*guide, at) =>
+                {
+                    camera.to_screen(third)
+                }
+                _ => p,
+            };
             match *guide {
                 Guide::Corner { a, b } => {
                     frame.stroke(&Path::line(screen(a), p), stroke(GUIDE, 2.0));
@@ -668,7 +764,12 @@ impl Editor<'_> {
                 Guide::Between { .. } => continue,
                 _ => {}
             }
-            let Some(start) = guide.start(document).map(|at| camera.to_screen(at)) else {
+            let start = match (*guide, creating) {
+                // The far side: from the corner dragged to the third.
+                (Guide::Across { .. }, Some((to, _))) => Some(to),
+                _ => guide.start(document),
+            };
+            let Some(start) = start.map(|at| camera.to_screen(at)) else {
                 continue;
             };
             // The new edge, from where it starts; marked alike with the one
@@ -679,7 +780,10 @@ impl Editor<'_> {
             };
             // Just as long: only if it is.
             let equal = (start.distance(p) - screen(u).distance(screen(v))).abs() < 0.75;
-            let parallel = matches!(guide, Guide::Parallel { .. } | Guide::ParallelFrom { .. });
+            let parallel = matches!(
+                guide,
+                Guide::Parallel { .. } | Guide::ParallelFrom { .. } | Guide::Across { .. }
+            );
             // Both: the arrowheads just before the middle, the ticks just
             // after, side by side rather than over each other.
             let aside = if equal && parallel { 7.0 } else { 0.0 };

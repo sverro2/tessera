@@ -207,7 +207,7 @@ impl Editor<'_> {
                     self.draw_changes(&mut frame, pending, source);
                     layers.push(frame.into_geometry());
                 }
-                // Tweaking a painted edge (holding Alt, or C): the layer as
+                // Tweaking a painted edge (holding W or C): the layer as
                 // it will be, that edge in its new style only, so a wide one
                 // made thin doesn't show from under it.
                 None if let Some(tweaked) = self.tweaked_edge(state) => {
@@ -428,7 +428,8 @@ impl Editor<'_> {
             (
                 Interaction::Lassoing
                 | Interaction::MovingSelection { .. }
-                | Interaction::PivotingSelection { .. },
+                | Interaction::PivotingSelection { .. }
+                | Interaction::Extruding { .. },
                 _,
             ) => {}
             // With a selection, clicking is about it: no hovering, but for

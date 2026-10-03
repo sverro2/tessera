@@ -56,6 +56,7 @@ use crate::layers::{Crossfade, NodeId};
 use crate::paint::{self, Brush};
 
 mod draw;
+mod extrude;
 mod guides;
 mod mirror;
 mod painting;
@@ -146,7 +147,7 @@ pub enum Picked {
 pub enum Message {
     /// The pipette picked this up.
     Pick(Picked),
-    /// Holding Alt while painting edges, the mouse moved this far across
+    /// Holding W while painting edges, the mouse moved this far across
     /// (screen px): make the stroke wider (or, to the left, thinner).
     TweakWidth(f32),
     /// Holding C while painting, the mouse moved this far across (screen
@@ -164,7 +165,7 @@ pub enum Message {
     /// A mirror was placed on the current layer (instead of the one it
     /// had).
     SetMirror(Mirror),
-    /// Holding Alt with a selection (proportional editing on), the mouse
+    /// Holding Shift+O, editing proportionally, the mouse
     /// moved this far across (screen px): reach further (or less far).
     TweakReach(f32),
     Pan(Vector),
@@ -498,11 +499,11 @@ struct Tweak {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tweaking {
-    /// The stroke width (Alt, painting edges).
+    /// The stroke width (W, painting edges).
     Width,
     /// How light the colour is (C).
     Lightness,
-    /// How far proportional editing reaches (Alt, with a selection).
+    /// How far proportional editing reaches (Shift+O, in the shape mode).
     Reach,
 }
 
@@ -557,6 +558,12 @@ enum Interaction {
         to: Point,
         held: bool,
     },
+    /// Extruding the selection (E) by as much as the cursor moved `from` →
+    /// `to`, until a click (see [`extrude`]).
+    Extruding {
+        from: Point,
+        to: Point,
+    },
     /// Placing a mirror (world): along the line `from` → `to`, as snapped;
     /// started at `start`, on a vertex if `anchored`.
     PlacingMirror {
@@ -610,6 +617,7 @@ impl Interaction {
             self,
             Interaction::MovingSelection { held: false, .. }
                 | Interaction::PivotingSelection { .. }
+                | Interaction::Extruding { .. }
                 | Interaction::Pasting { .. }
         )
     }
@@ -813,6 +821,7 @@ impl Editor<'_> {
                 Interaction::Lassoing
                     | Interaction::MovingSelection { .. }
                     | Interaction::PivotingSelection { .. }
+                    | Interaction::Extruding { .. }
             ) {
                 state.interaction = Interaction::Idle;
                 state.pending = None;
@@ -851,40 +860,6 @@ impl Editor<'_> {
         match event {
             keyboard::Event::ModifiersChanged(modifiers) => {
                 state.modifiers = *modifiers;
-                // Holding Alt over the canvas, painting edges, tweaks the
-                // stroke width; the edge previewed stays meanwhile. With a
-                // selection to edit proportionally, how far that reaches;
-                // what's being moved stays meanwhile.
-                let alt = if !modifiers.alt() {
-                    None
-                } else if self.paints_edges() {
-                    Some(Tweaking::Width)
-                } else if self.tool == Tool::Shape && self.proportional.is_some() {
-                    Some(Tweaking::Reach)
-                } else {
-                    None
-                };
-                let was = state.tweaking;
-                state.tweaking = match (was, alt) {
-                    (Some(tweak), _) if tweak.what == Tweaking::Lightness => Some(tweak),
-                    (Some(tweak), Some(what)) if tweak.what == what => Some(tweak),
-                    (_, Some(what)) => {
-                        let at = if what == Tweaking::Reach {
-                            screen
-                        } else {
-                            inside
-                        };
-                        at.map(|at| Tweak { what, at, last: at })
-                    }
-                    (_, None) => None,
-                };
-                // Done: what's being moved goes on from where the cursor is.
-                if was.is_some_and(|tweak| tweak.what == Tweaking::Reach)
-                    && state.tweaking.is_none()
-                    && let Some(pos) = screen
-                {
-                    rebase(&mut state.interaction, self.camera.to_world(pos));
-                }
                 if self.tool == Tool::Shape {
                     // Shift down or up mid-drag: guides on or off.
                     if matches!(
@@ -902,22 +877,46 @@ impl Editor<'_> {
                 // Holding Ctrl turns the brush into the pipette.
                 matches!(self.tool, Tool::Paint { .. }).then(canvas::Action::request_redraw)
             }
+            // Holding the reach key (Shift+O) editing proportionally tweaks
+            // how far that reaches; what's being moved stays meanwhile.
+            keyboard::Event::KeyPressed { repeat, .. }
+                if pressed == Some(Action::Reach)
+                    && self.tool == Tool::Shape
+                    && self.proportional.is_some() =>
+            {
+                if !repeat && state.tweaking.is_none() {
+                    let at = screen?;
+                    state.tweaking = Some(Tweak {
+                        what: Tweaking::Reach,
+                        at,
+                        last: at,
+                    });
+                }
+                Some(canvas::Action::request_redraw().and_capture())
+            }
             // Holding the lightness key (C) while painting (with a colour)
-            // tweaks how light it is; the face or edge previewed stays
+            // tweaks how light it is; holding the width key (W) while
+            // painting edges, how wide. The face or edge previewed stays
             // meanwhile.
             keyboard::Event::KeyPressed { repeat, .. }
-                if pressed == Some(Action::Lightness)
+                if (pressed == Some(Action::Lightness)
                     && matches!(
                         self.tool,
                         Tool::Paint {
                             brush: Brush::Color(_),
                             ..
                         }
-                    ) =>
+                    ))
+                    || (pressed == Some(Action::Width) && self.paints_edges()) =>
             {
                 if !repeat && state.tweaking.is_none() {
+                    let what = if pressed == Some(Action::Width) {
+                        Tweaking::Width
+                    } else {
+                        Tweaking::Lightness
+                    };
                     state.tweaking = Some(Tweak {
-                        what: Tweaking::Lightness,
+                        what,
                         at: inside?,
                         last: inside?,
                     });
@@ -926,15 +925,28 @@ impl Editor<'_> {
             }
             keyboard::Event::KeyReleased {
                 key, physical_key, ..
-            } if state
-                .tweaking
-                .is_some_and(|tweak| tweak.what == Tweaking::Lightness)
-                && self.keys.is_some_and(|keys| {
+            } if state.tweaking.is_some_and(|tweak| {
+                let action = match tweak.what {
+                    Tweaking::Lightness => Action::Lightness,
+                    Tweaking::Width => Action::Width,
+                    Tweaking::Reach => Action::Reach,
+                };
+                self.keys.is_some_and(|keys| {
                     Chord::pressed(key, *physical_key, keyboard::Modifiers::empty())
-                        .is_some_and(|chord| keys.releases(&chord, Action::Lightness))
-                }) =>
+                        .is_some_and(|chord| keys.releases(&chord, action))
+                })
+            }) =>
             {
-                state.tweaking = None;
+                // Done reaching: what's being moved goes on from where the
+                // cursor is.
+                if state
+                    .tweaking
+                    .take()
+                    .is_some_and(|tweak| tweak.what == Tweaking::Reach)
+                    && let Some(pos) = screen
+                {
+                    rebase(&mut state.interaction, self.camera.to_world(pos));
+                }
                 Some(canvas::Action::request_redraw().and_capture())
             }
             // Copy (Ctrl+C) copies the selected faces, cut (Ctrl+X) cuts
@@ -1057,8 +1069,8 @@ impl Editor<'_> {
                 state.selected_in = self.document.revision();
                 Some(canvas::Action::request_redraw().and_capture())
             }
-            // With a selection: grab (G), rotate (R), scale (T); Esc lets go
-            // of that, or else of the selection.
+            // With a selection: grab (G), rotate (R), scale (T), extrude (E);
+            // Esc lets go of that, or else of the selection.
             keyboard::Event::KeyPressed { key, .. }
                 if (*key == keyboard::Key::Named(keyboard::key::Named::Escape)
                     && (!state.selection.is_empty()
@@ -1067,7 +1079,7 @@ impl Editor<'_> {
                         && self.tool == Tool::Shape
                         && matches!(
                             pressed,
-                            Some(Action::Grab | Action::Rotate | Action::Scale)
+                            Some(Action::Grab | Action::Rotate | Action::Scale | Action::Extrude)
                         )) =>
             {
                 let escape = *key == keyboard::Key::Named(keyboard::key::Named::Escape);
@@ -1088,6 +1100,7 @@ impl Editor<'_> {
                                 held: false,
                             },
                             Some(Action::Rotate) => pivot(Pivot::Rotate),
+                            Some(Action::Extrude) => Interaction::Extruding { from: at, to: at },
                             _ => pivot(Pivot::Scale),
                         };
                         state.pending = None;
@@ -1162,6 +1175,29 @@ impl Editor<'_> {
         if button == mouse::Button::Left && !self.editable() {
             return None;
         }
+        // Mid-drag, a right click cancels it: all is as it was, and letting
+        // go of the left button then does nothing.
+        if button == mouse::Button::Right
+            && matches!(
+                state.interaction,
+                Interaction::Creating { .. }
+                    | Interaction::MovingVertex { .. }
+                    | Interaction::Extending { .. }
+                    | Interaction::LeavingFace { .. }
+                    | Interaction::MovingSelection { held: true, .. }
+                    | Interaction::Lassoing
+                    | Interaction::PlacingMirror { .. }
+                    | Interaction::Painting { .. }
+            )
+        {
+            state.interaction = Interaction::Idle;
+            state.pending = None;
+            state.aim = None;
+            state.lasso.clear();
+            state.stroke.clear();
+            state.edge_stroke.clear();
+            return Some(canvas::Action::request_redraw().and_capture());
+        }
         // Grabbed, rotating or scaling, the selection follows the cursor: a
         // click applies that; a right click cancels it.
         if state.interaction.is_transforming() {
@@ -1169,6 +1205,7 @@ impl Editor<'_> {
                 self.follow(state, world);
             }
             let pasting = matches!(state.interaction, Interaction::Pasting { .. });
+            let extruding = matches!(state.interaction, Interaction::Extruding { .. });
             // Pasting, a click where it doesn't fit does nothing.
             if pasting && button == mouse::Button::Left && state.pending.is_none() {
                 return Some(canvas::Action::request_redraw().and_capture());
@@ -1190,6 +1227,11 @@ impl Editor<'_> {
                         pasted.sort_unstable();
                         pasted.dedup();
                         state.selection = pasted;
+                        state.selected_in = self.document.revision();
+                    }
+                    // What was extruded: its far edges, to go on from.
+                    if extruding {
+                        state.selection = self.extruded(&state.selection, &pending);
                         state.selected_in = self.document.revision();
                     }
                     canvas::Action::publish(Message::Edit {
@@ -1246,7 +1288,7 @@ impl Editor<'_> {
                     to: start,
                 }
             }
-            // Adjusting the brush (holding Alt or C): a click applies it
+            // Adjusting the brush (holding W or C): a click applies it
             // to what's previewed, not what's under the mouse.
             mouse::Button::Left
                 if state.tweaking.is_some() && matches!(self.tool, Tool::Paint { .. }) =>
@@ -1548,8 +1590,16 @@ impl Editor<'_> {
                         return;
                     }
                 }
-                *to = world;
-                state.pending = self.pending(state.interaction);
+                match self.create_snapped(from, world) {
+                    Some((at, pending)) => {
+                        *to = at;
+                        state.pending = Some(pending);
+                    }
+                    None => {
+                        *to = world;
+                        state.pending = None;
+                    }
+                }
             }
             Interaction::MovingVertex { id, to } => {
                 if let Some((at, pending)) = guided(
@@ -1666,6 +1716,24 @@ impl Editor<'_> {
                     *to = world;
                     state.pending = Some(pending);
                 }
+            }
+            Interaction::Extruding { from, to } => {
+                let by = world - *from;
+                // Snapped, so its far edges join up where they land; not
+                // onto what it's extruded from.
+                let selected: std::collections::HashSet<VertexId> =
+                    state.selection.iter().copied().collect();
+                let ends: Vec<Point> = self
+                    .extruded_ends(&state.selection)
+                    .into_iter()
+                    .map(|v| self.document.vertex(v) + by)
+                    .collect();
+                *to = world;
+                state.pending = self
+                    .snap_offsets(&ends, &|v| selected.contains(&v))
+                    .into_iter()
+                    .chain([Vector::ZERO])
+                    .find_map(|snap| self.extrude(&state.selection, by + snap, world));
             }
             Interaction::PivotingSelection {
                 pivot,
@@ -1867,20 +1935,9 @@ impl Editor<'_> {
             // Worked out as they move (see `follow`); not moved yet, nothing.
             Interaction::MovingSelection { .. }
             | Interaction::PivotingSelection { .. }
+            | Interaction::Extruding { .. }
             | Interaction::Pasting { .. } => None,
-            Interaction::Creating { from, to } => self.check(
-                vec![Edit::AddTriangle {
-                    // Seen mirrored, the other way round, so it's still to
-                    // the left as seen.
-                    corners: if self.camera.image.is_some_and(Affine::flips) {
-                        equilateral(to, from)
-                    } else {
-                        equilateral(from, to)
-                    },
-                    snap: self.snap_distance(),
-                }],
-                to,
-            ),
+            Interaction::Creating { from, to } => self.create(from, to, to),
             Interaction::MovingVertex { id, to } => self.move_to(id, to),
             Interaction::LeavingFace { edge, apex, .. } => {
                 let (a, b, start) = edge?;
@@ -1986,6 +2043,78 @@ impl Editor<'_> {
             .map(|(_, p)| p)
             .chain([to])
             .find_map(|p| self.check(vec![Edit::MoveVertex { id, to: p }], p))
+    }
+
+    /// Creating a triangle dragged from `from` to `to` (placing a point
+    /// `at`): equilateral, its third corner to the left as seen.
+    fn create(&self, from: Point, to: Point, at: Point) -> Option<Pending> {
+        // Seen mirrored, the other way round, so it's still to the left as
+        // seen.
+        let flips = self.camera.image.is_some_and(Affine::flips);
+        let corners = if flips {
+            equilateral(to, from)
+        } else {
+            equilateral(from, to)
+        };
+        self.check(
+            vec![Edit::AddTriangle {
+                corners,
+                snap: self.snap_distance(),
+            }],
+            at,
+        )
+    }
+
+    /// Creating a triangle dragged from `from` to `to`, its dragged corner
+    /// or its third one snapped onto the best snap that works out (a
+    /// vertex, an edge), else as it is: where the drag ends up, and what
+    /// that adds. `None` if nothing works out.
+    fn create_snapped(&self, from: Point, to: Point) -> Option<(Point, Pending)> {
+        let third = self.third_corner(from, to);
+
+        // Each snap as (onto a vertex, how far on screen, where the drag
+        // ends up, where the point snapped lands).
+        let mut found: Vec<(bool, f32, Point, Point)> = Vec::new();
+        for (corner, dragged) in [(to, true), (third, false)] {
+            let at = self.camera.to_screen(corner);
+            for (target, p) in self.snaps(at, |_| false, |_, _| false, &[]) {
+                let end = if dragged {
+                    p
+                } else {
+                    self.dragged_corner(from, p)
+                };
+                let distance = self.camera.to_screen(p).distance(at);
+                found.push((matches!(target, Target::Vertex(_)), distance, end, p));
+            }
+        }
+        found.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.total_cmp(&y.1)));
+
+        found
+            .into_iter()
+            .take(MAX_SNAPS)
+            .map(|(_, _, end, p)| (end, p))
+            .chain([(to, to)])
+            .find_map(|(end, p)| Some((end, self.create(from, end, p)?)))
+    }
+
+    /// A new triangle's sixty degrees, as seen: turning its dragged corner
+    /// by minus this around where it started gives its third corner (the
+    /// other way round seen mirrored, so it's still to the left as seen).
+    fn sixty(&self) -> f32 {
+        let flips = self.camera.image.is_some_and(Affine::flips);
+        let sign = if flips { -1.0 } else { 1.0 };
+        sign * std::f32::consts::FRAC_PI_3
+    }
+
+    /// The third corner of a new triangle dragged from `from` to `to`.
+    fn third_corner(&self, from: Point, to: Point) -> Point {
+        from + turn(to - from, -self.sixty())
+    }
+
+    /// Where a new triangle started at `from` is dragged to for its third
+    /// corner to be at `third`.
+    fn dragged_corner(&self, from: Point, third: Point) -> Point {
+        from + turn(third - from, self.sixty())
     }
 
     /// Dragging from edge `a`–`b` (grabbed at `start`) to `apex`. On a side of
@@ -2305,6 +2434,12 @@ fn longest_edge([a, b, c]: [Point; 3]) -> (Point, Point) {
         .into_iter()
         .max_by(|x, y| x.0.distance(x.1).total_cmp(&y.0.distance(y.1)))
         .unwrap()
+}
+
+/// `v` turned by `angle` (radians).
+fn turn(v: Vector, angle: f32) -> Vector {
+    let (sin, cos) = angle.sin_cos();
+    Vector::new(v.x * cos - v.y * sin, v.x * sin + v.y * cos)
 }
 
 fn dot(a: Vector, b: Vector) -> f32 {

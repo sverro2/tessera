@@ -216,6 +216,7 @@ impl Editor<'_> {
             Interaction::Idle
             | Interaction::MovingSelection { .. }
             | Interaction::PivotingSelection { .. }
+            | Interaction::Extruding { .. }
                 if !state.selection.is_empty() =>
             {
                 let arrows = Path::new(|path| {

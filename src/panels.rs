@@ -121,7 +121,11 @@ impl Tessera {
                 .spacing(8)
                 .align_y(Center),
             );
-            body = body.push(text("Alt+move: reach").size(11).style(text::secondary));
+            body = body.push(
+                text("Hold Shift+O and move: reach")
+                    .size(11)
+                    .style(text::secondary),
+            );
         }
         container(opaque(
             container(body)

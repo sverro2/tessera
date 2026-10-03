@@ -126,7 +126,7 @@ impl Editor<'_> {
         edge_near(self.document, screen, self.camera)
     }
 
-    /// Whether edges are being painted (where Alt tweaks the width).
+    /// Whether edges are being painted (where holding W tweaks the width).
     pub(super) fn paints_edges(&self) -> bool {
         matches!(
             self.tool,
@@ -172,7 +172,7 @@ impl Editor<'_> {
     }
 
     /// Tweaking a painted edge's width or lightness (painting edges, holding
-    /// Alt or C): the current layer with the edge being tweaked painted as
+    /// W or C): the current layer with the edge being tweaked painted as
     /// it will be.
     pub(super) fn tweaked_edge(&self, state: &State) -> Option<Document> {
         let Tool::Paint {
