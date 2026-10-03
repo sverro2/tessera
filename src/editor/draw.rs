@@ -64,13 +64,23 @@ pub(super) fn interior(document: &Document) -> Vec<(VertexId, VertexId)> {
 }
 
 /// The dot grid: a dot every [`MAJOR`] steps of the snapping grid, from
-/// the world's origin (so dots are where it snaps to); none zoomed out so far
-/// they'd crowd.
+/// the world's origin (so dots are where it snaps to); fading as they
+/// crowd zoomed out, none once they'd blur together.
 pub(super) fn draw_grid(frame: &mut Frame, camera: Camera, grid: Grid) {
+    /// How far apart (screen px) dots are drawn fully; closer, they fade.
+    const SHOWN: f32 = 16.0;
+    /// Closer than this (screen px), no dots.
+    const HIDDEN: f32 = 8.0;
     let spacing = grid.step * MAJOR as f32;
-    if spacing * camera.zoom < 8.0 {
+    let apart = spacing * camera.zoom;
+    if apart < HIDDEN {
         return;
     }
+    let shown = ((apart - HIDDEN) / (SHOWN - HIDDEN)).min(1.0);
+    let color = Color {
+        a: GRID_DOT.a * shown,
+        ..GRID_DOT
+    };
     let o = Point::ORIGIN;
 
     // The world-space bounds of the (possibly rotated) visible area.
@@ -86,26 +96,26 @@ pub(super) fn draw_grid(frame: &mut Frame, camera: Camera, grid: Grid) {
     let max = |f: fn(&Point) -> f32| corners.iter().map(f).fold(f32::NEG_INFINITY, f32::max);
     let visible = Rectangle::new(Point::ORIGIN, size);
 
-    let dots = Path::new(|p| {
-        // Counted off from the origin, so they don't drift far from it.
-        let first = |min: f32, o: f32| ((min - o) / spacing).floor() as i64;
-        let (i0, j0) = (first(min(|p| p.x), o.x), first(min(|p| p.y), o.y));
-        let mut j = j0;
-        while o.y + j as f32 * spacing <= max(|p| p.y) {
-            let mut i = i0;
-            while o.x + i as f32 * spacing <= max(|p| p.x) {
-                let world = Point::new(o.x + i as f32 * spacing, o.y + j as f32 * spacing);
-                let dot = camera.to_screen(world);
-                if visible.contains(dot) {
-                    p.circle(dot, 1.2);
-                }
-                i += 1;
+    // Each dot a little square, as tiny as they are: one path of
+    // thousands of circles takes ages to fill (lyon sweeps it all), and
+    // rectangles are filled directly.
+    let dot = Size::new(2.0, 2.0);
+    // Counted off from the origin, so they don't drift far from it.
+    let first = |min: f32, o: f32| ((min - o) / spacing).floor() as i64;
+    let (i0, j0) = (first(min(|p| p.x), o.x), first(min(|p| p.y), o.y));
+    let mut j = j0;
+    while o.y + j as f32 * spacing <= max(|p| p.y) {
+        let mut i = i0;
+        while o.x + i as f32 * spacing <= max(|p| p.x) {
+            let world = Point::new(o.x + i as f32 * spacing, o.y + j as f32 * spacing);
+            let at = camera.to_screen(world);
+            if visible.contains(at) {
+                frame.fill_rectangle(at - Vector::new(1.0, 1.0), dot, color);
             }
-            j += 1;
+            i += 1;
         }
-    });
-
-    frame.fill(&dots, GRID_DOT);
+        j += 1;
+    }
 }
 
 /// The dashes of a line from `a` to `b`: `on` long, `off` apart, from `a`.
@@ -124,6 +134,77 @@ pub(super) fn dashes(a: Point, b: Point, on: f32, off: f32) -> Vec<(Point, Point
         at += on + off;
     }
     dashes
+}
+
+/// Lines shorter than this (screen px) aren't drawn: zoomed out so far,
+/// they'd crowd into a blur, too close together to tell apart or grab.
+const DETAIL_HIDDEN: f32 = 3.0;
+/// Lines at least this long (screen px) are drawn fully; shorter ones
+/// fade out, so zooming out thins them gradually.
+const DETAIL_SHOWN: f32 = 8.0;
+
+/// How much of a line `length` long (screen px) to draw: from none (too
+/// short to make out) to all of it.
+pub(super) fn detail(length: f32) -> f32 {
+    let t = ((length - DETAIL_HIDDEN) / (DETAIL_SHOWN - DETAIL_HIDDEN)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// How crowded a drawing's lines are (world units: times the zoom, on
+/// screen; see [`detail`]). An edge by its length or by how close the
+/// edges beside it are, whichever is less: a sliver's long sides lie as
+/// close together as it's thin (its height across them), crowding as much
+/// as short edges do.
+pub(super) struct Spacing {
+    /// Each triangle's edges (`ab`, `bc`, `ca`); infinite on the outline,
+    /// which the plain look keeps however far out, so the shape stays.
+    by_triangle: Vec<[f32; 3]>,
+    /// Each edge once, as `(low, high)`.
+    edges: Vec<((VertexId, VertexId), f32)>,
+    /// Each vertex's shortest edge (by vertex id).
+    shortest: Vec<f32>,
+}
+
+impl Spacing {
+    fn of(document: &Document) -> Spacing {
+        let triangles = document.triangle_ids();
+        let mut shortest = vec![f32::INFINITY; document.vertex_slots()];
+        // Each side of each triangle: its edge, spacing, and where it is.
+        let mut sides = Vec::with_capacity(triangles.len() * 3);
+        for (t, &[a, b, c]) in triangles.iter().enumerate() {
+            let [pa, pb, pc] = [a, b, c].map(|v| document.vertex(v));
+            let area2 = ((pb - pa).x * (pc - pa).y - (pb - pa).y * (pc - pa).x).abs();
+            for (k, ((u, v), (p, q))) in [((a, b), (pa, pb)), ((b, c), (pb, pc)), ((c, a), (pc, pa))]
+                .into_iter()
+                .enumerate()
+            {
+                let length = p.distance(q);
+                // Its height across this edge.
+                let height = if length > 0.0 { area2 / length } else { 0.0 };
+                sides.push(((u.min(v), u.max(v)), length.min(height), t * 3 + k));
+                shortest[u] = shortest[u].min(length);
+                shortest[v] = shortest[v].min(length);
+            }
+        }
+        sides.sort_unstable_by_key(|&(edge, ..)| edge);
+        let mut by_triangle = vec![[f32::INFINITY; 3]; triangles.len()];
+        let mut edges = Vec::new();
+        for run in sides.chunk_by(|x, y| x.0 == y.0) {
+            let near = run.iter().map(|&(_, near, _)| near).fold(f32::INFINITY, f32::min);
+            edges.push((run[0].0, near));
+            // Between two triangles (else on the outline).
+            if run.len() > 1 {
+                for &(_, _, at) in run {
+                    by_triangle[at / 3][at % 3] = near;
+                }
+            }
+        }
+        Spacing {
+            by_triangle,
+            edges,
+            shortest,
+        }
+    }
 }
 
 /// The painted faces `seen` says, by colour.
@@ -854,24 +935,39 @@ impl Editor<'_> {
 
         // Unpainted edges dashed, thin: not exported either. Each edge's
         // dashes its own (see `dashes`).
+        // Zoomed out, short ones fade away (see `detail`).
         let dashed = Color { a: 0.5, ..EDGE };
-        let unpainted = document
-            .unique_edges()
-            .into_iter()
-            .filter(|&(a, b)| document.edge_style(a, b).is_none() && shows(a, b))
-            .flat_map(|(a, b)| dashes(screen(a), screen(b), 4.0, 4.0));
+        let zoom = self.camera.zoom;
+        let unpainted: Vec<_> = self
+            .spacing(document)
+            .edges
+            .iter()
+            .map(|&((a, b), near)| (a, b, detail(near * zoom)))
+            .filter(|&(a, b, shown)| {
+                shown > 0.0 && document.edge_style(a, b).is_none() && shows(a, b)
+            })
+            .map(|(a, b, shown)| (screen(a), screen(b), shown))
+            .collect();
         match meshes.as_deref_mut() {
             // Over the faces, under the painted edges.
             Some(meshes) => {
-                for (from, to) in unpainted {
-                    meshes.under.line(from, to, 1.0, dashed);
+                for (a, b, shown) in unpainted {
+                    let color = Color { a: dashed.a * shown, ..dashed };
+                    for (from, to) in dashes(a, b, 4.0, 4.0) {
+                        meshes.under.line(from, to, 1.0, color);
+                    }
                 }
             }
+            // One colour for all: those mostly faded, left out.
             None => {
                 let path = Path::new(|p| {
-                    for (from, to) in unpainted {
-                        p.move_to(from);
-                        p.line_to(to);
+                    for (a, b, shown) in unpainted {
+                        if shown >= 0.5 {
+                            for (from, to) in dashes(a, b, 4.0, 4.0) {
+                                p.move_to(from);
+                                p.line_to(to);
+                            }
+                        }
                     }
                 });
                 frame.stroke(&path, stroke(dashed, 1.0));
@@ -944,7 +1040,9 @@ impl Editor<'_> {
         self.tool == Tool::Shape && look == Look::Plain
     }
 
-    /// A dot on each vertex (over everything else, with meshes).
+    /// A dot on each vertex (over everything else, with meshes). Zoomed
+    /// out, those crowding their neighbours fade away (see `detail`): by
+    /// their shortest edge, as long as two dots are wide.
     pub(super) fn draw_vertices(
         &self,
         frame: &mut Frame,
@@ -952,27 +1050,44 @@ impl Editor<'_> {
         meshes: Option<&mut LayerMeshes>,
     ) {
         let seen = self.view(frame, 4.0);
+        let screen = |v| self.camera.to_screen(document.vertex(v));
+        let spacing = self.spacing(document);
+        let zoom = self.camera.zoom;
         let dots = document
             .unique_vertices()
             .into_iter()
-            .map(|v| document.vertex(v))
-            .filter(|&p| seen.shows(&[p]))
-            .map(|p| self.camera.to_screen(p));
+            .filter(|&v| seen.shows(&[document.vertex(v)]))
+            .map(|v| (screen(v), detail(spacing.shortest[v] * zoom / 2.0)))
+            .filter(|&(_, shown)| shown > 0.0);
         match meshes {
             Some(meshes) => {
-                for dot in dots {
-                    meshes.over.dot(dot, 2.5, EDGE);
+                for (dot, shown) in dots {
+                    meshes.over.dot(dot, 2.5, Color { a: shown, ..EDGE });
                 }
             }
             None => {
                 let path = Path::new(|p| {
-                    for dot in dots {
-                        p.circle(dot, 2.5);
+                    for (dot, shown) in dots {
+                        if shown >= 0.5 {
+                            p.circle(dot, 2.5);
+                        }
                     }
                 });
                 frame.fill(&path, EDGE);
             }
         }
+    }
+
+    /// How crowded `document`'s lines are, remembered per drawing.
+    fn spacing(&self, document: &Document) -> Rc<Spacing> {
+        let mut memo = self.caches.spacings.borrow_mut();
+        // Only a few drawings at a time (those drawn lately).
+        if memo.len() > 64 && !memo.contains_key(&document.revision()) {
+            memo.clear();
+        }
+        memo.entry(document.revision())
+            .or_insert_with(|| Rc::new(Spacing::of(document)))
+            .clone()
     }
 
     /// The plain look, `strength` strong (1: full), edges `width` wide, with
@@ -991,13 +1106,29 @@ impl Editor<'_> {
         };
         // Only what may show.
         let seen = self.view(frame, width + 2.0);
+        let screen = |v| self.camera.to_screen(document.vertex(v));
+        // Each visible triangle's edges, on screen, and how much of each to
+        // draw: zoomed out, crowded ones fade away (see `Spacing`), but not
+        // the outline, so the shape stays.
+        let wireframe = || {
+            let spacing = self.spacing(document);
+            let zoom = self.camera.zoom;
+            let mut lines = Vec::new();
+            for (&[a, b, c], near) in document.triangle_ids().iter().zip(&spacing.by_triangle) {
+                if !seen.shows(&[a, b, c].map(|v| document.vertex(v))) {
+                    continue;
+                }
+                for ((u, v), near) in [(a, b), (b, c), (c, a)].into_iter().zip(near) {
+                    let shown = detail(near * zoom);
+                    if shown > 0.0 {
+                        lines.push((screen(u), screen(v), shown));
+                    }
+                }
+            }
+            lines
+        };
         match meshes.as_deref_mut() {
             Some(meshes) => {
-                let visible: Vec<[Point; 3]> = document
-                    .triangles()
-                    .filter(|t| seen.shows(t))
-                    .map(|t| t.map(|p| self.camera.to_screen(p)))
-                    .collect();
                 for (t, color) in document.triangles().zip(document.colors()) {
                     if seen.shows(&t) {
                         let t = t.map(|p| self.camera.to_screen(p));
@@ -1009,10 +1140,8 @@ impl Editor<'_> {
                 }
                 // Each triangle outlined, over all the faces (shared edges
                 // twice, as stroking the triangles does).
-                for [a, b, c] in visible {
-                    for (from, to) in [(a, b), (b, c), (c, a)] {
-                        meshes.under.line(from, to, width, faint(EDGE, 1.0));
-                    }
+                for (from, to, shown) in wireframe() {
+                    meshes.under.line(from, to, width, faint(EDGE, shown));
                 }
             }
             None => {
@@ -1021,10 +1150,18 @@ impl Editor<'_> {
                 for (color, triangles) in painted_faces(document, &seen) {
                     frame.fill(&self.mesh(triangles.into_iter()), faint(color, 0.25));
                 }
-                frame.stroke(&mesh, stroke(faint(EDGE, 1.0), width));
+                // One colour for all: those mostly faded, left out.
+                let lines = Path::new(|p| {
+                    for (from, to, shown) in wireframe() {
+                        if shown >= 0.5 {
+                            p.move_to(from);
+                            p.line_to(to);
+                        }
+                    }
+                });
+                frame.stroke(&lines, stroke(faint(EDGE, 1.0), width));
             }
         }
-        let screen = |v| self.camera.to_screen(document.vertex(v));
         // Each colour's edges as one path.
         let mut by_color = ByColor::default();
         for (a, b, style) in document.edge_styles() {
@@ -1371,5 +1508,32 @@ impl Editor<'_> {
                 p.close();
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slivers_crowd_as_much_as_they_are_thin() {
+        // A sliver 100 long and 2 thick, beside a fat triangle on its long
+        // side (0 1).
+        let points = [(0.0, 0.0), (100.0, 0.0), (50.0, 2.0), (50.0, -80.0)];
+        let document = Document::from_parts(
+            points.map(|(x, y)| Point::new(x, y)).to_vec(),
+            vec![[0, 1, 2], [1, 0, 3]],
+        )
+        .unwrap();
+        let spacing = Spacing::of(&document);
+        let shared = spacing.edges.iter().find(|&&(edge, _)| edge == (0, 1)).unwrap().1;
+        assert!((shared - 2.0).abs() < 0.01, "{shared}");
+        // Shared: as crowded as on the sliver's side; on the outline: kept.
+        assert_eq!(spacing.by_triangle[1][0], shared);
+        assert!(spacing.by_triangle[1][1].is_infinite());
+        // Thinned out zoomed out (2 px apart), not zoomed in (20 px).
+        assert_eq!(detail(shared), 0.0);
+        assert_eq!(detail(shared * 10.0), 1.0);
+        assert_eq!(spacing.shortest[2], 2.0f32.hypot(50.0));
     }
 }

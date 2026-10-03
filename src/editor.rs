@@ -28,6 +28,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use rayon::prelude::*;
 
@@ -222,6 +223,9 @@ pub struct Caches {
     layers: RefCell<HashMap<NodeId, LayerCache>>,
     /// Painted edges' outlines worked out, by drawing (its revision).
     outlines: RefCell<HashMap<u64, EdgeOutlines>>,
+    /// How crowded drawings' lines are, by drawing (its revision): to
+    /// thin them out, zoomed out.
+    spacings: RefCell<HashMap<u64, Rc<draw::Spacing>>>,
 }
 
 /// A drawing's painted edges' outlines (world), as at `zoom`, and around
