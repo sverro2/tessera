@@ -974,6 +974,15 @@ mod tests {
         let set = app.layers.page().expect("set");
         assert_eq!(set.size, iced::Size::new(1080.0, 1920.0));
         assert_eq!(set.center, Point::new(200.0, 200.0));
+        // All of it in view.
+        let canvas = Tessera::canvas_size(WINDOW_SIZE);
+        for corner in set.corners() {
+            let p = app.camera.to_screen(corner);
+            assert!(
+                (0.0..=canvas.width).contains(&p.x) && (0.0..=canvas.height).contains(&p.y),
+                "{p:?}"
+            );
+        }
 
         // A custom size, where it was.
         page(&mut app, PageMessage::Show(true));

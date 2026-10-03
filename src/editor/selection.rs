@@ -101,10 +101,20 @@ impl Editor<'_> {
             }
             _ => Vec::new(),
         };
-        if let Some(reach) = self.proportional.filter(|_| !subjects.is_empty()) {
+        // Where it reaches from (screen): what's moved; else, tweaking with
+        // nothing to move, where that started, to see how far it reaches.
+        let mut centres: Vec<Point> = subjects.iter().map(|&v| camera.to_screen(at(v))).collect();
+        let weights = match state.tweaking {
+            Some(tweak) if tweaking && subjects.is_empty() => {
+                centres.push(tweak.at);
+                self.weights_around(tweak.at)
+            }
+            _ => self.weights(&subjects),
+        };
+        if let Some(reach) = self.proportional.filter(|_| !centres.is_empty()) {
             let around = Path::new(|p| {
-                for &v in &subjects {
-                    p.circle(camera.to_screen(at(v)), reach);
+                for &centre in &centres {
+                    p.circle(centre, reach);
                 }
             });
             frame.fill(
@@ -114,7 +124,7 @@ impl Editor<'_> {
                     ..HOVER
                 },
             );
-            if let [v] = subjects[..] {
+            if let [centre] = centres[..] {
                 let dashed = Stroke {
                     line_dash: LineDash {
                         segments: &[6.0, 4.0],
@@ -122,9 +132,9 @@ impl Editor<'_> {
                     },
                     ..stroke(Color { a: 0.5, ..HOVER }, 1.0)
                 };
-                frame.stroke(&Path::circle(camera.to_screen(at(v)), reach), dashed);
+                frame.stroke(&Path::circle(centre, reach), dashed);
             }
-            for (v, w) in self.weights(&subjects) {
+            for (v, w) in weights {
                 if w < 1.0 {
                     let p = camera.to_screen(at(v));
                     frame.fill(&Path::circle(p, 3.5), Color { a: w, ..SELECTED });
@@ -333,6 +343,28 @@ impl Editor<'_> {
             }
         }
         weights
+    }
+
+    /// How much each vertex within reach of `centre` (screen) would go
+    /// along with something moved there, as [`Self::weights`] has it.
+    pub(super) fn weights_around(&self, centre: Point) -> Vec<(VertexId, f32)> {
+        let Some(reach) = self.proportional else {
+            return Vec::new();
+        };
+        self.document
+            .unique_vertices()
+            .into_iter()
+            .filter_map(|v| {
+                let near = self
+                    .camera
+                    .to_screen(self.document.vertex(v))
+                    .distance(centre);
+                (near < reach).then(|| {
+                    let t = 1.0 - near / reach;
+                    (v, t * t * (3.0 - 2.0 * t))
+                })
+            })
+            .collect()
     }
 
     /// The centre of `selection`: the average of its vertices.

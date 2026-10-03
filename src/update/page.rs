@@ -104,7 +104,13 @@ impl Tessera {
                     Some(page) if !dialog.centre => page.center,
                     _ => self.middle(),
                 };
-                self.set_page(Some(Page { center, size }));
+                let page = Page { center, size };
+                self.set_page(Some(page));
+                // All of it in view, clear of the panels over the canvas.
+                const MARGIN: f32 = 60.0;
+                let canvas = Self::canvas_size(self.window_size.unwrap_or(WINDOW_SIZE));
+                self.camera = self.camera.framing(&page.corners(), canvas, MARGIN);
+                self.caches.grid.clear();
             }
             PageMessage::Remove => {
                 self.page_dialog = None;
