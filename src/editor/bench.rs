@@ -68,11 +68,10 @@ fn time<R>(label: &str, runs: u32, mut f: impl FnMut() -> R) {
 #[test]
 #[ignore = "a benchmark: slow, and needs a drawing to time"]
 fn bench_file() {
-    let Ok(path) = std::env::var("TESSERA_BENCH") else {
+    let Some(drawing) = Drawing::open() else {
         return;
     };
-    let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
-    let layers = contents.layers.layers();
+    let layers = drawing.layers().layers();
     let doc = &layers
         .iter()
         .max_by_key(|layer| layer.document.triangle_ids().len())
@@ -80,7 +79,7 @@ fn bench_file() {
         .document;
     let cache = Caches::default();
     let mut editor = super::tests::editor(doc, &cache);
-    editor.camera = contents.camera;
+    editor.camera = drawing.contents.camera;
     let (min, max) = doc.bounds().unwrap();
     let centre = Point::new((min.x + max.x) / 2.0, (min.y + max.y) / 2.0);
     println!(
@@ -588,6 +587,120 @@ fn bench_big_drag() {
         editor.limit_move(middle, from + Vector::new(300.0, 200.0))
     });
 }
+/// A drawing to time: the one in `TESSERA_BENCH` (none if that's unset),
+/// worked on at its layer named in `TESSERA_BENCH_LAYER` (else the first).
+struct Drawing {
+    contents: crate::file::Contents,
+    current: NodeId,
+}
+
+impl Drawing {
+    fn open() -> Option<Drawing> {
+        let path = std::env::var("TESSERA_BENCH").ok()?;
+        let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
+        let layers = &contents.layers;
+        let named = std::env::var("TESSERA_BENCH_LAYER").ok();
+        let current = named
+            .and_then(|name| {
+                let layers = layers.layers();
+                layers.iter().find(|layer| layer.name == name).map(|layer| layer.id)
+            })
+            .unwrap_or_else(|| layers.first_layer());
+        Some(Drawing { contents, current })
+    }
+
+    fn layers(&self) -> &crate::layers::Layers {
+        &self.contents.layers
+    }
+
+    /// All of it in view, on a canvas `size` big.
+    fn whole(&self, size: iced::Size) -> Camera {
+        let points: Vec<Point> = self
+            .layers()
+            .layers()
+            .iter()
+            .filter_map(|layer| layer.document.bounds())
+            .flat_map(|(min, max)| [min, max])
+            .collect();
+        Camera::default().framing(&points, size, 40.0)
+    }
+
+    /// An editor on its layer, with the others in view around it.
+    fn editor<'a>(&'a self, cache: &'a Caches) -> Editor<'a> {
+        let layers = self.layers();
+        let layer = layers.layer(self.current).unwrap();
+        let (below, above) = layers.around(self.current, &Default::default());
+        let mut editor = super::tests::editor(&layer.document, cache);
+        editor.current = self.current;
+        editor.crossfade = layer.crossfade;
+        editor.show_edges = layer.show_edges;
+        editor.mirrors = layer.mirror.as_slice();
+        editor.below = below.into_iter().map(SceneLayer::of).collect();
+        editor.above = above.into_iter().map(SceneLayer::of).collect();
+        editor
+    }
+}
+
+/// The renderer the app draws with on a GPU, without a window: to draw
+/// whole frames (and read them back).
+fn headless_renderer() -> Option<Renderer> {
+    use iced::advanced::renderer::Headless;
+    iced::futures::executor::block_on(<Renderer as Headless>::new(
+        iced_renderer::core::renderer::Settings::default(),
+        Some("wgpu"),
+    ))
+}
+
+/// Painting `target`, with the default brush.
+fn painting(target: paint::Target) -> Tool {
+    Tool::Paint {
+        target,
+        brush: Brush::default(),
+        width: 2.0,
+        picking: false,
+    }
+}
+
+/// The modes to time in: shaping, and painting faces and edges.
+fn modes() -> [(&'static str, Tool); 3] {
+    [
+        ("shape", Tool::Shape),
+        ("faces", painting(paint::Target::Faces)),
+        ("edges", painting(paint::Target::Edges)),
+    ]
+}
+
+/// A whole frame of `editor` drawn by `renderer` (uploaded, rendered and
+/// read back): its pixels.
+fn draw_frame(
+    renderer: &mut Renderer,
+    editor: &Editor,
+    state: &State,
+    bounds: Rectangle,
+    cursor: mouse::Cursor,
+    meshes: bool,
+) -> Vec<u8> {
+    use iced::advanced::graphics::geometry::Renderer as _;
+    use iced::advanced::graphics::mesh::Renderer as _;
+    use iced::advanced::renderer::{Headless as _, Renderer as _};
+    // A new frame, as the app starts each.
+    renderer.reset(bounds);
+    renderer.with_translation(Vector::ZERO, |renderer| {
+        for part in editor.draw_parts(state, renderer, bounds, cursor, meshes) {
+            match part {
+                meshes::Drawn::Geometry(geometry) => renderer.draw_geometry(geometry),
+                meshes::Drawn::Meshes(cache) => renderer.draw_mesh_cache(cache),
+            }
+        }
+    });
+    let size = bounds.size();
+    renderer.screenshot(
+        iced::Size::new(size.width as u32, size.height as u32),
+        1.0,
+        BACKGROUND,
+    )
+}
+
 
 /// A renderer as the app's (wgpu), on a GPU without a window: to draw the
 /// canvas as the app does. `None` without a GPU.
@@ -624,32 +737,14 @@ fn gpu_renderer() -> Option<Renderer> {
 #[test]
 #[ignore = "a benchmark: slow, and needs a drawing and a GPU"]
 fn bench_render() {
-    use canvas::Program;
-    let Ok(path) = std::env::var("TESSERA_BENCH") else {
+    let Some(drawing) = Drawing::open() else {
         return;
     };
     let Some(renderer) = gpu_renderer() else {
         println!("BENCH render: no GPU");
         return;
     };
-    let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
-    let layers = &contents.layers;
-    let named = std::env::var("TESSERA_BENCH_LAYER").ok();
-    let current = named
-        .and_then(|name| layers.layers().iter().find(|layer| layer.name == name).map(|layer| layer.id))
-        .unwrap_or_else(|| layers.first_layer());
-    fn scene_layer(layer: &crate::layers::Layer) -> SceneLayer<'_> {
-        SceneLayer {
-            id: layer.id,
-            document: &layer.document,
-            crossfade: layer.crossfade,
-            show_edges: layer.show_edges,
-            mirrors: layer.mirror.as_slice(),
-        }
-    }
-    let (below, above) = layers.around(current, &Default::default());
-    let below: Vec<SceneLayer> = below.into_iter().map(scene_layer).collect();
-    let above: Vec<SceneLayer> = above.into_iter().map(scene_layer).collect();
+    let layers = drawing.layers();
     let total: usize = layers
         .layers()
         .iter()
@@ -662,23 +757,8 @@ fn bench_render() {
 
     let size = iced::Size::new(1600.0, 1000.0);
     let bounds = Rectangle::new(Point::ORIGIN, size);
-    let (min, max) = layers
-        .layers()
-        .iter()
-        .filter_map(|layer| layer.document.bounds())
-        .fold(
-            (
-                Point::new(f32::MAX, f32::MAX),
-                Point::new(f32::MIN, f32::MIN),
-            ),
-            |(a, b), (min, max)| {
-                (
-                    Point::new(a.x.min(min.x), a.y.min(min.y)),
-                    Point::new(b.x.max(max.x), b.y.max(max.y)),
-                )
-            },
-        );
-    let whole = Camera::default().framing(&[min, max], size, 40.0);
+    let whole = drawing.whole(size);
+    let (min, max) = (whole.to_world(Point::ORIGIN), whole.to_world(Point::new(size.width, size.height)));
     // Zoomed in on a point (world), at a zoom.
     let on = |p: Point, zoom: f32| Camera {
         pan: Vector::new(
@@ -690,7 +770,7 @@ fn bench_render() {
     };
     let middle = Point::new((min.x + max.x) / 2.0, (min.y + max.y) / 2.0);
     let views = [
-        ("as saved", contents.camera),
+        ("as saved", drawing.contents.camera),
         ("whole", whole),
         ("middle ×1", on(middle, 1.0)),
         ("middle ×4", on(middle, 4.0)),
@@ -708,16 +788,10 @@ fn bench_render() {
             },
         ),
     ];
-    let current_layer = layers.layer(current).unwrap();
     for (tool_name, tool) in tools {
         for (view_name, camera) in views {
             let cache = Caches::default();
-            let mut editor = super::tests::editor(&current_layer.document, &cache);
-            editor.current = current;
-            editor.crossfade = current_layer.crossfade;
-            editor.show_edges = current_layer.show_edges;
-            editor.below = below.iter().map(|l| SceneLayer { ..*l }).collect();
-            editor.above = above.iter().map(|l| SceneLayer { ..*l }).collect();
+            let mut editor = drawing.editor(&cache);
             editor.tool = tool;
             let state = State::default();
             // Only with meshes (as the app on a GPU), if `TESSERA_BENCH_MESHES` is set.
@@ -765,26 +839,16 @@ fn bench_render() {
 fn bench_face_meshes() {
     use iced_renderer::graphics::color;
     use iced_renderer::graphics::mesh::{self, Mesh, SolidVertex2D};
-    let Ok(path) = std::env::var("TESSERA_BENCH") else {
+    let Some(drawing) = Drawing::open() else {
         return;
     };
     let Some(renderer) = gpu_renderer() else {
         return;
     };
-    let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
-    let docs: Vec<&Document> = contents
-        .layers
-        .layers()
-        .iter()
-        .map(|layer| &*layer.document)
-        .collect();
+    let layers = drawing.layers().layers();
+    let docs: Vec<&Document> = layers.iter().map(|layer| &*layer.document).collect();
     let size = iced::Size::new(1600.0, 1000.0);
-    let points: Vec<Point> = docs
-        .iter()
-        .filter_map(|doc| doc.bounds())
-        .flat_map(|(min, max)| [min, max])
-        .collect();
-    let camera = Camera::default().framing(&points, size, 40.0);
+    let camera = drawing.whole(size);
     let cache = Caches::default();
 
     time("faces as canvas paths (tessellated)", 10, || {
@@ -938,58 +1002,23 @@ fn bench_face_meshes() {
 #[test]
 #[ignore = "a benchmark: needs a drawing and a GPU"]
 fn bench_frames() {
-    use iced::advanced::graphics::geometry::Renderer as _;
-    use iced::advanced::graphics::mesh::Renderer as _;
-    use iced::advanced::renderer::{Headless, Renderer as _};
-    let Ok(path) = std::env::var("TESSERA_BENCH") else {
+    let Some(drawing) = Drawing::open() else {
         return;
     };
-    let Some(mut renderer) = iced::futures::executor::block_on(<Renderer as Headless>::new(
-        iced_renderer::core::renderer::Settings::default(),
-        Some("wgpu"),
-    )) else {
+    let Some(mut renderer) = headless_renderer() else {
         println!("BENCH frames: no GPU");
         return;
     };
-    let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
-    let layers = &contents.layers;
-    // The layer to work on: named in `TESSERA_BENCH_LAYER`, else the first.
-    let named = std::env::var("TESSERA_BENCH_LAYER").ok();
-    for layer in layers.layers() {
+    for layer in drawing.layers().layers() {
         println!(
             "BENCH frames: layer {:?}, {} triangles",
             layer.name,
             layer.document.triangle_ids().len()
         );
     }
-    let current = named
-        .and_then(|name| {
-            layers
-                .layers()
-                .iter()
-                .find(|layer| layer.name == name)
-                .map(|layer| layer.id)
-        })
-        .unwrap_or_else(|| layers.first_layer());
-    fn scene_layer(layer: &crate::layers::Layer) -> SceneLayer<'_> {
-        SceneLayer {
-            id: layer.id,
-            document: &layer.document,
-            crossfade: layer.crossfade,
-            show_edges: layer.show_edges,
-            mirrors: layer.mirror.as_slice(),
-        }
-    }
-    let (below, above) = layers.around(current, &Default::default());
     let size = iced::Size::new(1600.0, 1000.0);
     let bounds = Rectangle::new(Point::ORIGIN, size);
-    let points: Vec<Point> = layers
-        .layers()
-        .iter()
-        .filter_map(|layer| layer.document.bounds())
-        .flat_map(|(min, max)| [min, max])
-        .collect();
-    let whole = Camera::default().framing(&points, size, 40.0);
+    let whole = drawing.whole(size);
     let middle = Point::new(
         (whole.to_world(Point::ORIGIN).x + whole.to_world(Point::new(size.width, 0.0)).x) / 2.0,
         (whole.to_world(Point::ORIGIN).y + whole.to_world(Point::new(0.0, size.height)).y) / 2.0,
@@ -1002,35 +1031,11 @@ fn bench_frames() {
         zoom,
         ..Camera::default()
     };
-    let current_layer = layers.layer(current).unwrap();
-    for (tool_name, tool) in [
-        ("shape", Tool::Shape),
-        (
-            "edges",
-            Tool::Paint {
-                target: paint::Target::Edges,
-                brush: Brush::default(),
-                width: 2.0,
-                picking: false,
-            },
-        ),
-        (
-            "paint",
-            Tool::Paint {
-                target: paint::Target::Faces,
-                brush: Brush::default(),
-                width: 2.0,
-                picking: false,
-            },
-        ),
-    ] {
+    for (tool_name, tool) in modes() {
         for (view_name, camera) in [("whole", whole), ("×1", on(1.0)), ("×8", on(8.0))] {
             for meshes in [false, true] {
                 let cache = Caches::default();
-                let mut editor = super::tests::editor(&current_layer.document, &cache);
-                editor.current = current;
-                editor.below = below.iter().map(|&l| scene_layer(l)).collect();
-                editor.above = above.iter().map(|&l| scene_layer(l)).collect();
+                let mut editor = drawing.editor(&cache);
                 editor.tool = tool;
                 let state = State::default();
                 // The pointer over the middle, as when working.
@@ -1043,24 +1048,7 @@ fn bench_frames() {
                         ..camera
                     };
                     let start = std::time::Instant::now();
-                    // A new frame, as the app starts each.
-                    renderer.reset(bounds);
-                    renderer.with_translation(Vector::ZERO, |renderer| {
-                        let parts = editor.draw_parts(&state, renderer, bounds, cursor, meshes);
-                        for part in parts {
-                            match part {
-                                meshes::Drawn::Geometry(geometry) => {
-                                    renderer.draw_geometry(geometry)
-                                }
-                                meshes::Drawn::Meshes(cache) => renderer.draw_mesh_cache(cache),
-                            }
-                        }
-                    });
-                    let pixels = renderer.screenshot(
-                        iced::Size::new(size.width as u32, size.height as u32),
-                        1.0,
-                        BACKGROUND,
-                    );
+                    let pixels = draw_frame(&mut renderer, &editor, &state, bounds, cursor, meshes);
                     std::hint::black_box(pixels);
                     times.push(start.elapsed());
                 }
@@ -1087,68 +1075,20 @@ fn bench_frames() {
 #[ignore = "a benchmark: needs a drawing and a GPU"]
 fn bench_hover() {
     use canvas::Program;
-    let Ok(path) = std::env::var("TESSERA_BENCH") else {
+    let Some(drawing) = Drawing::open() else {
         return;
     };
     let Some(renderer) = gpu_renderer() else {
         println!("BENCH hover: no GPU");
         return;
     };
-    let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
-    let layers = &contents.layers;
-    let named = std::env::var("TESSERA_BENCH_LAYER").ok();
-    let current = named
-        .and_then(|name| layers.layers().iter().find(|layer| layer.name == name).map(|layer| layer.id))
-        .unwrap_or_else(|| layers.first_layer());
-    fn scene_layer(layer: &crate::layers::Layer) -> SceneLayer<'_> {
-        SceneLayer {
-            id: layer.id,
-            document: &layer.document,
-            crossfade: layer.crossfade,
-            show_edges: layer.show_edges,
-            mirrors: layer.mirror.as_slice(),
-        }
-    }
-    let (below, above) = layers.around(current, &Default::default());
     let size = iced::Size::new(1600.0, 1000.0);
     let bounds = Rectangle::new(Point::ORIGIN, size);
-    let points: Vec<Point> = layers
-        .layers()
-        .iter()
-        .filter_map(|layer| layer.document.bounds())
-        .flat_map(|(min, max)| [min, max])
-        .collect();
-    let whole = Camera::default().framing(&points, size, 40.0);
-    let current_layer = layers.layer(current).unwrap();
-    let tools = [
-        ("shape", Tool::Shape),
-        (
-            "edges",
-            Tool::Paint {
-                target: paint::Target::Edges,
-                brush: Brush::default(),
-                width: 2.0,
-                picking: false,
-            },
-        ),
-        (
-            "faces",
-            Tool::Paint {
-                target: paint::Target::Faces,
-                brush: Brush::default(),
-                width: 2.0,
-                picking: false,
-            },
-        ),
-    ];
-    for (tool_name, tool) in tools {
+    let whole = drawing.whole(size);
+    let name = &drawing.layers().layer(drawing.current).unwrap().name;
+    for (tool_name, tool) in modes() {
         let cache = Caches::default();
-        let mut editor = super::tests::editor(&current_layer.document, &cache);
-        editor.current = current;
-        editor.crossfade = current_layer.crossfade;
-        editor.show_edges = current_layer.show_edges;
-        editor.below = below.iter().map(|&l| scene_layer(l)).collect();
-        editor.above = above.iter().map(|&l| scene_layer(l)).collect();
+        let mut editor = drawing.editor(&cache);
         editor.tool = tool;
         editor.camera = whole;
         let mut state = State::default();
@@ -1175,7 +1115,7 @@ fn bench_hover() {
         let (draw, draw_max) = median(draws);
         println!(
             "BENCH hover {tool_name:>5} {:?}: update median {update:?} (max {update_max:?}), draw median {draw:?} (max {draw_max:?})",
-            current_layer.name
+            name
         );
     }
 }
@@ -1188,88 +1128,33 @@ fn bench_hover() {
 #[test]
 #[ignore = "writes files; needs a drawing and a GPU"]
 fn shoot_canvas() {
-    use iced::advanced::graphics::geometry::Renderer as _;
-    use iced::advanced::graphics::mesh::Renderer as _;
-    use iced::advanced::renderer::{Headless, Renderer as _};
-    let (Ok(path), Ok(shots)) = (std::env::var("TESSERA_BENCH"), std::env::var("TESSERA_SHOTS")) else {
+    let Ok(shots) = std::env::var("TESSERA_SHOTS") else {
         return;
     };
-    let Some(mut renderer) = iced::futures::executor::block_on(<Renderer as Headless>::new(
-        iced_renderer::core::renderer::Settings::default(),
-        Some("wgpu"),
-    )) else {
+    let Some(drawing) = Drawing::open() else {
+        return;
+    };
+    let Some(mut renderer) = headless_renderer() else {
         println!("SHOTS: no GPU");
         return;
     };
-    let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
-    let layers = &contents.layers;
-    let named = std::env::var("TESSERA_BENCH_LAYER").ok();
-    let current = named
-        .and_then(|name| layers.layers().iter().find(|layer| layer.name == name).map(|layer| layer.id))
-        .unwrap_or_else(|| layers.first_layer());
-    fn scene_layer(layer: &crate::layers::Layer) -> SceneLayer<'_> {
-        SceneLayer {
-            id: layer.id,
-            document: &layer.document,
-            crossfade: layer.crossfade,
-            show_edges: layer.show_edges,
-            mirrors: layer.mirror.as_slice(),
-        }
-    }
-    let (below, above) = layers.around(current, &Default::default());
     let size = iced::Size::new(1600.0, 1000.0);
     let bounds = Rectangle::new(Point::ORIGIN, size);
-    let points: Vec<Point> = layers
-        .layers()
-        .iter()
-        .filter_map(|layer| layer.document.bounds())
-        .flat_map(|(min, max)| [min, max])
-        .collect();
-    let whole = Camera::default().framing(&points, size, 40.0);
+    let whole = drawing.whole(size);
     let half = Camera {
         zoom: whole.zoom / 2.0,
         pan: Vector::new(size.width / 4.0, size.height / 4.0) + whole.pan * 0.5,
         ..whole
     };
-    let paint = |target| Tool::Paint {
-        target,
-        brush: Brush::default(),
-        width: 2.0,
-        picking: false,
-    };
-    let current_layer = layers.layer(current).unwrap();
-    for (tool_name, tool) in [
-        ("shape", Tool::Shape),
-        ("faces", paint(paint::Target::Faces)),
-        ("edges", paint(paint::Target::Edges)),
-    ] {
+    for (tool_name, tool) in modes() {
         for (view_name, camera) in [("whole", whole), ("half", half)] {
             let cache = Caches::default();
-            let mut editor = super::tests::editor(&current_layer.document, &cache);
-            editor.current = current;
-            editor.crossfade = current_layer.crossfade;
-            editor.show_edges = current_layer.show_edges;
-            editor.below = below.iter().map(|&l| scene_layer(l)).collect();
-            editor.above = above.iter().map(|&l| scene_layer(l)).collect();
+            let mut editor = drawing.editor(&cache);
             editor.tool = tool;
             editor.camera = camera;
             let state = State::default();
-            renderer.reset(bounds);
-            renderer.with_translation(Vector::ZERO, |renderer| {
-                let parts =
-                    editor.draw_parts(&state, renderer, bounds, mouse::Cursor::Unavailable, true);
-                for part in parts {
-                    match part {
-                        meshes::Drawn::Geometry(geometry) => renderer.draw_geometry(geometry),
-                        meshes::Drawn::Meshes(cache) => renderer.draw_mesh_cache(cache),
-                    }
-                }
-            });
-            let pixels = renderer.screenshot(
-                iced::Size::new(size.width as u32, size.height as u32),
-                1.0,
-                BACKGROUND,
-            );
+            let cursor = mouse::Cursor::Unavailable;
+            let pixels = draw_frame(&mut renderer, &editor, &state, bounds, cursor, true);
             let image =
                 image::RgbaImage::from_raw(size.width as u32, size.height as u32, pixels).unwrap();
             let file = format!("{shots}/{tool_name}-{view_name}.png");

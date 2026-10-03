@@ -840,10 +840,10 @@ impl Tessera {
                 let current = self.current();
                 let (below, above) = self.layers.around(current, &self.isolated);
                 let scene = editor::Scene {
-                    current: scene_layer(self.layers.layer(current).expect("current layer")),
+                    current: editor::SceneLayer::of(self.layers.layer(current).expect("current layer")),
                     shown: self.layers.in_view(current, &self.isolated),
-                    below: below.into_iter().map(scene_layer).collect(),
-                    above: above.into_iter().map(scene_layer).collect(),
+                    below: below.into_iter().map(editor::SceneLayer::of).collect(),
+                    above: above.into_iter().map(editor::SceneLayer::of).collect(),
                 };
                 editor::view(
                     scene,
@@ -866,7 +866,7 @@ impl Tessera {
                             .rev()
                             .filter(|&id| self.layers.shown(id))
                             .filter_map(|id| self.layers.layer(id))
-                            .map(scene_layer)
+                            .map(editor::SceneLayer::of)
                             .collect(),
                         page: self.layers.page(),
                         grid: editor::Grid {
@@ -945,17 +945,6 @@ impl Tessera {
                 picking: self.picking,
             },
         }
-    }
-}
-
-/// A layer as the canvas gets it.
-fn scene_layer(layer: &layers::Layer) -> editor::SceneLayer<'_> {
-    editor::SceneLayer {
-        id: layer.id,
-        document: &layer.document,
-        crossfade: layer.crossfade,
-        show_edges: layer.show_edges,
-        mirrors: layer.mirror.as_slice(),
     }
 }
 

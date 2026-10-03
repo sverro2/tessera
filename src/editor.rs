@@ -277,6 +277,19 @@ pub struct SceneLayer<'a> {
     pub mirrors: &'a [Mirror],
 }
 
+impl<'a> SceneLayer<'a> {
+    /// A layer as the canvas gets it.
+    pub fn of(layer: &'a crate::layers::Layer) -> Self {
+        SceneLayer {
+            id: layer.id,
+            document: &layer.document,
+            crossfade: layer.crossfade,
+            show_edges: layer.show_edges,
+            mirrors: layer.mirror.as_slice(),
+        }
+    }
+}
+
 /// The layers on the canvas: the current one and the other visible ones.
 pub struct Scene<'a> {
     /// The current layer: the one edited.
