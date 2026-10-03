@@ -2185,8 +2185,10 @@ fn e_extrudes_the_outer_edges_facing_the_cursor() {
     let doc = one();
     let cache = Caches::default();
     let editor = editor(&doc, &cache);
-    let mut state = State::default();
-    state.selection = vec![0, 1, 2];
+    let mut state = State {
+        selection: vec![0, 1, 2],
+        ..State::default()
+    };
 
     // Down: only the bottom edge faces that way.
     run(&editor, &mut state, key('e'), 200.0, 250.0);
@@ -2201,8 +2203,10 @@ fn e_extrudes_the_outer_edges_facing_the_cursor() {
     assert_eq!(at, [Point::new(100.0, 400.0), Point::new(300.0, 400.0)]);
 
     // Up: both slanted edges, joined at the swept apex.
-    let mut state = State::default();
-    state.selection = vec![0, 1, 2];
+    let mut state = State {
+        selection: vec![0, 1, 2],
+        ..State::default()
+    };
     run(&editor, &mut state, key('e'), 200.0, 250.0);
     run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 150.0);
     let edits = run(&editor, &mut state, Event::Mouse(PRESS), 200.0, 150.0);
@@ -2217,8 +2221,10 @@ fn an_extrusion_leaves_out_edges_running_into_something() {
     triangle(&mut doc, [(105.0, 215.0), (130.0, 215.0), (118.0, 195.0)]);
     let cache = Caches::default();
     let editor = editor(&doc, &cache);
-    let mut state = State::default();
-    state.selection = vec![0, 1, 2];
+    let mut state = State {
+        selection: vec![0, 1, 2],
+        ..State::default()
+    };
 
     run(&editor, &mut state, key('e'), 200.0, 250.0);
     run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 150.0);
@@ -2231,8 +2237,10 @@ fn escape_cancels_an_extrusion() {
     let doc = one();
     let cache = Caches::default();
     let editor = editor(&doc, &cache);
-    let mut state = State::default();
-    state.selection = vec![0, 1, 2];
+    let mut state = State {
+        selection: vec![0, 1, 2],
+        ..State::default()
+    };
 
     run(&editor, &mut state, key('e'), 200.0, 250.0);
     run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 350.0);
@@ -2292,7 +2300,7 @@ fn a_new_triangle_snaps_by_its_third_corner_too() {
         let mut after = doc.clone();
         assert!(after.apply_all(&edits[0]));
         assert_eq!(after.vertex_count(), 5, "to ({x}, {y})");
-        assert!(after.unique_vertices().iter().any(|&v| v == 1));
+        assert!(after.unique_vertices().contains(&1));
     }
 }
 
@@ -2364,7 +2372,7 @@ fn e_over_an_outer_edge_extrudes_it() {
 
 /// The corners of what an extrusion adds.
 fn extruded_corners(edits: &[Vec<Edit>]) -> Vec<Point> {
-    match &edits[..] {
+    match edits {
         [edits] => match &edits[..] {
             [Edit::Paste { piece }] => piece.vertices.clone(),
             _ => panic!("not an extrusion: {edits:?}"),

@@ -875,15 +875,8 @@ fn bench_face_meshes() {
         for doc in &docs {
             let mut editor = super::tests::editor(doc, &cache);
             editor.camera = camera;
-            editor.draw_layer(
-                &mut frame,
-                doc,
-                Look::Painted,
-                Crossfade::default(),
-                false,
-                &[],
-                None,
-            );
+            let style = Style::of(Look::Painted, Crossfade::default(), false);
+            editor.draw_layer(&mut frame, doc, style, &[], None);
         }
         frame.into_geometry()
     });
@@ -892,15 +885,8 @@ fn bench_face_meshes() {
         for doc in &docs {
             let mut editor = super::tests::editor(doc, &cache);
             editor.camera = camera;
-            editor.draw_layer(
-                &mut frame,
-                doc,
-                Look::Painted,
-                Crossfade::default(),
-                true,
-                &[],
-                None,
-            );
+            let style = Style::of(Look::Painted, Crossfade::default(), true);
+            editor.draw_layer(&mut frame, doc, style, &[], None);
         }
         frame.into_geometry()
     });
@@ -909,15 +895,8 @@ fn bench_face_meshes() {
         for doc in &docs {
             let mut editor = super::tests::editor(doc, &cache);
             editor.camera = camera;
-            editor.draw_layer(
-                &mut frame,
-                doc,
-                Look::Faded,
-                Crossfade::default(),
-                true,
-                &[],
-                None,
-            );
+            let style = Style::of(Look::Faded, Crossfade::default(), true);
+            editor.draw_layer(&mut frame, doc, style, &[], None);
         }
         frame.into_geometry()
     });

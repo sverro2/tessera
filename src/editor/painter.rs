@@ -271,6 +271,40 @@ pub(super) enum Look {
     Faded,
 }
 
+/// How a layer is drawn: its look and, in the painted look (the paint
+/// mode), whether its painted edges crossfade and whether its edges show.
+/// The other looks have neither.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Style {
+    pub(super) look: Look,
+    pub(super) crossfade: Crossfade,
+    pub(super) show_edges: bool,
+}
+
+impl Style {
+    /// A layer's, crossfading as `crossfade` says and showing its edges if
+    /// `show_edges`, in `look`.
+    pub(super) fn of(look: Look, crossfade: Crossfade, show_edges: bool) -> Style {
+        match look {
+            Look::Painted => Style {
+                look,
+                crossfade,
+                show_edges,
+            },
+            Look::Plain | Look::Faded => Style::plain(look),
+        }
+    }
+
+    /// In `look`, not crossfading, with its edges.
+    pub(super) fn plain(look: Look) -> Style {
+        Style {
+            look,
+            crossfade: Crossfade::default(),
+            show_edges: true,
+        }
+    }
+}
+
 /// What drawing a layer takes from the editor: how it's seen, the tool,
 /// and what's remembered of the drawings. Unlike the editor (with its
 /// caches of what's on the GPU), it can go to other threads, so that
@@ -316,15 +350,12 @@ impl Editor<'_> {
         &self,
         frame: &mut Frame,
         document: &Document,
-        look: Look,
-        crossfade: Crossfade,
-        show_edges: bool,
+        style: Style,
         mirrors: &[Mirror],
         meshes: Option<&mut LayerMeshes>,
     ) {
-        self.painter().draw_layer(
-            frame, document, look, crossfade, show_edges, mirrors, meshes,
-        );
+        self.painter()
+            .draw_layer(frame, document, style, mirrors, meshes);
     }
 
     pub(super) fn edge_width(&self, width: f32) -> f32 {
@@ -436,19 +467,22 @@ impl Painter<'_> {
         &self,
         frame: &mut Frame,
         document: &Document,
-        look: Look,
-        crossfade: Crossfade,
-        show_edges: bool,
+        style: Style,
         mirrors: &[Mirror],
         mut meshes: Option<&mut LayerMeshes>,
     ) {
+        let Style {
+            look,
+            crossfade,
+            show_edges,
+        } = style;
         if !mirrors.is_empty() {
             // Mapped so that, as this sees it, it's where it is.
             let seen = self.camera.image.unwrap_or(Affine::IDENTITY);
             let unseen = seen.inverse();
             if look == Look::Painted {
                 let mirrored = document.with_mirrors(mirrors).transformed(unseen);
-                self.draw_layer(frame, &mirrored, look, crossfade, show_edges, &[], meshes);
+                self.draw_layer(frame, &mirrored, style, &[], meshes);
             } else {
                 let strength = if look == Look::Faded { 0.35 } else { 1.0 };
                 for image in doc::images(mirrors) {
@@ -457,7 +491,7 @@ impl Painter<'_> {
                         self.draw_hinted(frame, &ghost, strength * 0.4, 1.0, meshes.as_deref_mut());
                     }
                 }
-                self.draw_layer(frame, document, look, crossfade, show_edges, &[], meshes);
+                self.draw_layer(frame, document, style, &[], meshes);
             }
             return;
         }

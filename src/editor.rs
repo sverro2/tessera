@@ -253,9 +253,7 @@ struct LayerCache {
 #[derive(Debug, Clone, PartialEq)]
 struct LayerKey {
     revision: u64,
-    look: Look,
-    crossfade: Crossfade,
-    show_edges: bool,
+    style: Style,
     vertices: bool,
     mirrors: Vec<Mirror>,
     camera: (Vector, f32, f32, Option<Affine>),

@@ -263,15 +263,8 @@ impl Editor<'_> {
                 None if let Some(tweaked) = &tweaked => {
                     let mut sink = meshes.then(LayerMeshes::default);
                     let mut frame = Frame::new(renderer, size);
-                    self.draw_layer(
-                        &mut frame,
-                        tweaked,
-                        look,
-                        self.crossfade,
-                        self.show_edges,
-                        self.mirrors,
-                        sink.as_mut(),
-                    );
+                    let style = Style::of(look, self.crossfade, self.show_edges);
+                    self.draw_layer(&mut frame, tweaked, style, self.mirrors, sink.as_mut());
                     push_layer(&mut layers, frame, sink, size);
                 }
                 None => layers.extend(drawn.flatten()),
@@ -619,15 +612,8 @@ impl Editor<'_> {
         document: &Document,
         meshes: Option<&mut LayerMeshes>,
     ) {
-        self.draw_layer(
-            frame,
-            document,
-            self.look(),
-            Crossfade::default(),
-            true,
-            self.mirrors,
-            meshes,
-        );
+        let style = Style::plain(self.look());
+        self.draw_layer(frame, document, style, self.mirrors, meshes);
     }
 
     /// The drawings of the `wanted` layers, each from its cache if what
@@ -650,21 +636,11 @@ impl Editor<'_> {
                 layer,
                 look,
             } = *wanted;
-            // Only the paint mode shows colours as they are, and may hide
-            // the edges.
-            let painted = look == Look::Painted;
-            let crossfade = if painted {
-                layer.crossfade
-            } else {
-                Crossfade::default()
-            };
-            let show_edges = !painted || layer.show_edges;
+            let style = Style::of(look, layer.crossfade, layer.show_edges);
             let camera = painter.camera;
             let key = LayerKey {
                 revision: layer.document.revision(),
-                look,
-                crossfade,
-                show_edges,
+                style,
                 vertices: painter.shows_vertices(look),
                 mirrors: layer.mirrors.to_vec(),
                 camera: (camera.pan, camera.zoom, camera.rotation, camera.image),
@@ -672,24 +648,18 @@ impl Editor<'_> {
                 meshes,
             };
             if caches.get(&layer.id).is_none_or(|cache| cache.key != key) {
-                jobs.push((i, Frame::new(renderer, size), crossfade, show_edges));
+                jobs.push((i, Frame::new(renderer, size), style));
             }
             keys.push(key);
         }
 
-        let draw = |(i, mut frame, crossfade, show_edges): (usize, Frame, Crossfade, bool)| {
-            let Wanted {
-                painter,
-                layer,
-                look,
-            } = wanted[i];
+        let draw = |(i, mut frame, style): (usize, Frame, Style)| {
+            let Wanted { painter, layer, .. } = wanted[i];
             let mut sink = meshes.then(LayerMeshes::default);
             painter.draw_layer(
                 &mut frame,
                 layer.document,
-                look,
-                crossfade,
-                show_edges,
+                style,
                 layer.mirrors,
                 sink.as_mut(),
             );
