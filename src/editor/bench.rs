@@ -708,32 +708,184 @@ fn bench_render() {
             editor.above = above.iter().map(|l| SceneLayer { ..*l }).collect();
             editor.tool = tool;
             let state = State::default();
-            let frames = 8;
-            let mut times = Vec::new();
-            for frame in 0..frames {
-                // Panned a little each frame.
-                editor.camera = Camera {
-                    pan: camera.pan + Vector::new(frame as f32 * 3.0, 0.0),
-                    ..camera
-                };
-                let start = std::time::Instant::now();
-                let geometry = editor.draw(
-                    &state,
-                    &renderer,
-                    &Theme::Dark,
-                    bounds,
-                    mouse::Cursor::Unavailable,
+            for meshes in [false, true] {
+                let frames = 8;
+                let mut times = Vec::new();
+                for frame in 0..frames {
+                    // Panned a little each frame.
+                    editor.camera = Camera {
+                        pan: camera.pan + Vector::new(frame as f32 * 3.0, 0.0),
+                        ..camera
+                    };
+                    let start = std::time::Instant::now();
+                    let parts = editor.draw_parts(
+                        &state,
+                        &renderer,
+                        bounds,
+                        mouse::Cursor::Unavailable,
+                        meshes,
+                    );
+                    std::hint::black_box(parts);
+                    times.push(start.elapsed());
+                }
+                times.sort();
+                let how = if meshes { "meshes" } else { "paths" };
+                println!(
+                    "BENCH render {tool_name:>5} {view_name:<11} (zoom {:>5.2}) {how:<6}: median {:?}, max {:?}",
+                    camera.zoom,
+                    times[times.len() / 2],
+                    times.last().unwrap()
                 );
-                std::hint::black_box(geometry);
-                times.push(start.elapsed());
             }
-            times.sort();
-            println!(
-                "BENCH render {tool_name:>5} {view_name:<11} (zoom {:.2}): median {:?}, max {:?}",
-                camera.zoom,
-                times[times.len() / 2],
-                times.last().unwrap()
-            );
         }
     }
+}
+
+/// Faces drawn as canvas paths (tessellated) against built as a triangle
+/// mesh straight away, for the drawing in `TESSERA_BENCH`, all in view:
+/// whether drawing faces as meshes is worth it. Run with
+/// `TESSERA_BENCH=file.tessera cargo test --release bench_face_meshes --
+/// --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark: needs a drawing and a GPU"]
+fn bench_face_meshes() {
+    use iced_renderer::graphics::color;
+    use iced_renderer::graphics::mesh::{self, Mesh, SolidVertex2D};
+    let Ok(path) = std::env::var("TESSERA_BENCH") else {
+        return;
+    };
+    let Some(renderer) = gpu_renderer() else {
+        return;
+    };
+    let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
+    let docs: Vec<&Document> = contents
+        .layers
+        .layers()
+        .iter()
+        .map(|layer| &*layer.document)
+        .collect();
+    let size = iced::Size::new(1600.0, 1000.0);
+    let points: Vec<Point> = docs
+        .iter()
+        .filter_map(|doc| doc.bounds())
+        .flat_map(|(min, max)| [min, max])
+        .collect();
+    let camera = Camera::default().framing(&points, size, 40.0);
+    let cache = Caches::default();
+
+    time("faces as canvas paths (tessellated)", 10, || {
+        let mut frame = Frame::new(&renderer, size);
+        for doc in &docs {
+            let mut editor = super::tests::editor(doc, &cache);
+            editor.camera = camera;
+            let seen = editor.view(&frame, 0.0);
+            for (color, triangles) in painted_faces(doc, &seen) {
+                frame.fill(&editor.mesh(triangles.into_iter()), color);
+            }
+        }
+        frame.into_geometry()
+    });
+    time("one painted layer each, edges hidden", 10, || {
+        let mut frame = Frame::new(&renderer, size);
+        for doc in &docs {
+            let mut editor = super::tests::editor(doc, &cache);
+            editor.camera = camera;
+            editor.draw_layer(&mut frame, doc, Look::Painted, Crossfade::default(), false, &[], None);
+        }
+        frame.into_geometry()
+    });
+    time("one painted layer each, edges shown", 10, || {
+        let mut frame = Frame::new(&renderer, size);
+        for doc in &docs {
+            let mut editor = super::tests::editor(doc, &cache);
+            editor.camera = camera;
+            editor.draw_layer(&mut frame, doc, Look::Painted, Crossfade::default(), true, &[], None);
+        }
+        frame.into_geometry()
+    });
+    time("plain look (shape mode, faded)", 10, || {
+        let mut frame = Frame::new(&renderer, size);
+        for doc in &docs {
+            let mut editor = super::tests::editor(doc, &cache);
+            editor.camera = camera;
+            editor.draw_layer(&mut frame, doc, Look::Faded, Crossfade::default(), true, &[], None);
+        }
+        frame.into_geometry()
+    });
+    let editors: Vec<Editor> = docs
+        .iter()
+        .map(|doc| {
+            let mut editor = super::tests::editor(doc, &cache);
+            editor.camera = camera;
+            editor
+        })
+        .collect();
+    let dashed = Stroke {
+        line_dash: LineDash {
+            segments: &[4.0, 4.0],
+            offset: 0,
+        },
+        ..stroke(Color { a: 0.5, ..EDGE }, 1.0)
+    };
+    time("unpainted edges, dashed strokes", 10, || {
+        let mut frame = Frame::new(&renderer, size);
+        for (doc, editor) in docs.iter().zip(&editors) {
+            let path = Path::new(|p| {
+                for (a, b) in doc.unique_edges() {
+                    if doc.edge_style(a, b).is_none() {
+                        p.move_to(editor.camera.to_screen(doc.vertex(a)));
+                        p.line_to(editor.camera.to_screen(doc.vertex(b)));
+                    }
+                }
+            });
+            frame.stroke(&path, dashed);
+        }
+        frame.into_geometry()
+    });
+    time("painted edges: outlines worked out", 10, || {
+        for (doc, editor) in docs.iter().zip(&editors) {
+            let edges: Vec<_> = doc
+                .edge_styles()
+                .map(|(a, b, style)| (a, b, editor.edge_width(style.width)))
+                .collect();
+            std::hint::black_box(joints::outlines(&edges, |v| {
+                editor.camera.to_screen(doc.vertex(v))
+            }));
+        }
+    });
+    time("plain look: every triangle stroked", 10, || {
+        let mut frame = Frame::new(&renderer, size);
+        for (doc, editor) in docs.iter().zip(&editors) {
+            frame.stroke(&editor.mesh(doc.triangles()), stroke(EDGE, 1.0));
+        }
+        frame.into_geometry()
+    });
+    time("faces as a triangle mesh", 10, || {
+        let mut meshes = Vec::new();
+        for doc in &docs {
+            let mut buffers = mesh::Indexed {
+                vertices: Vec::new(),
+                indices: Vec::new(),
+            };
+            for (t, c) in doc.triangles().zip(doc.colors()) {
+                let Some(c) = c else { continue };
+                let packed = color::pack(c);
+                let first = buffers.vertices.len() as u32;
+                for p in t {
+                    let p = camera.to_screen(p);
+                    buffers.vertices.push(SolidVertex2D {
+                        position: [p.x, p.y],
+                        color: packed,
+                    });
+                }
+                buffers.indices.extend([first, first + 1, first + 2]);
+            }
+            meshes.push(Mesh::Solid {
+                buffers,
+                transformation: iced::Transformation::IDENTITY,
+                clip_bounds: Rectangle::new(Point::ORIGIN, size),
+            });
+        }
+        meshes
+    });
 }

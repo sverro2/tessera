@@ -194,9 +194,27 @@ pub(super) enum Look {
     Faded,
 }
 
+/// A layer drawn on `frame`, with (with meshes) its faces under and its
+/// painted edges over.
+pub(super) fn push_layer(
+    layers: &mut Vec<Drawn>,
+    frame: Frame,
+    meshes: Option<LayerMeshes>,
+    size: Size,
+) {
+    match meshes.map(|meshes| meshes.finish(size)) {
+        Some((under, over)) => {
+            layers.push(Drawn::Meshes(under));
+            layers.push(Drawn::Geometry(frame.into_geometry()));
+            layers.push(Drawn::Meshes(over));
+        }
+        None => layers.push(Drawn::Geometry(frame.into_geometry())),
+    }
+}
+
 /// The layers, with the overlay over them.
-pub(super) fn with_overlay(mut layers: Vec<Geometry>, overlay: Frame) -> Vec<Geometry> {
-    layers.push(overlay.into_geometry());
+pub(super) fn with_overlay(mut layers: Vec<Drawn>, overlay: Frame) -> Vec<Drawn> {
+    layers.push(Drawn::Geometry(overlay.into_geometry()));
     layers
 }
 
@@ -226,7 +244,8 @@ impl Editor<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
         others_view: &Editor,
-    ) -> Vec<Geometry> {
+        meshes: bool,
+    ) -> Vec<Drawn> {
         let camera = self.camera;
 
         // While dragging, draw the document as it will be after release.
@@ -259,11 +278,11 @@ impl Editor<'_> {
         };
         let mut layers = Vec::new();
         for layer in &self.below {
-            others_view.draw_cached(renderer, size, *layer, others, &mut layers);
+            others_view.draw_cached(renderer, size, *layer, others, &mut layers, meshes);
         }
         let mut above = Vec::new();
         for layer in &self.above {
-            others_view.draw_cached(renderer, size, *layer, others, &mut above);
+            others_view.draw_cached(renderer, size, *layer, others, &mut above, meshes);
         }
         if look != Look::Painted {
             layers.append(&mut above);
@@ -271,15 +290,19 @@ impl Editor<'_> {
         if self.shown {
             match &pending {
                 Some(pending) => {
+                    let mut sink = meshes.then(LayerMeshes::default);
                     let mut frame = Frame::new(renderer, size);
-                    self.draw_document(&mut frame, &pending.result);
-                    self.draw_changes(&mut frame, pending, source);
-                    layers.push(frame.into_geometry());
+                    self.draw_document(&mut frame, &pending.result, sink.as_mut());
+                    push_layer(&mut layers, frame, sink, size);
+                    let mut changes = Frame::new(renderer, size);
+                    self.draw_changes(&mut changes, pending, source);
+                    layers.push(Drawn::Geometry(changes.into_geometry()));
                 }
                 // Tweaking a painted edge (holding W or C): the layer as
                 // it will be, that edge in its new style only, so a wide one
                 // made thin doesn't show from under it.
                 None if let Some(tweaked) = self.tweaked_edge(state) => {
+                    let mut sink = meshes.then(LayerMeshes::default);
                     let mut frame = Frame::new(renderer, size);
                     self.draw_layer(
                         &mut frame,
@@ -288,8 +311,9 @@ impl Editor<'_> {
                         self.crossfade,
                         self.show_edges,
                         self.mirrors,
+                        sink.as_mut(),
                     );
-                    layers.push(frame.into_geometry());
+                    push_layer(&mut layers, frame, sink, size);
                 }
                 None => {
                     let current = SceneLayer {
@@ -299,7 +323,7 @@ impl Editor<'_> {
                         show_edges: self.show_edges,
                         mirrors: self.mirrors,
                     };
-                    self.draw_cached(renderer, size, current, look, &mut layers);
+                    self.draw_cached(renderer, size, current, look, &mut layers, meshes);
                 }
             }
         }
@@ -326,7 +350,7 @@ impl Editor<'_> {
                     ..BACKGROUND
                 },
             );
-            layers.push(wash.into_geometry());
+            layers.push(Drawn::Geometry(wash.into_geometry()));
             let current = SceneLayer {
                 id: self.current,
                 document: self.document,
@@ -340,7 +364,7 @@ impl Editor<'_> {
                 .filter(|layer| self.lit.contains(&layer.id))
                 .collect();
             for layer in lit {
-                self.draw_cached(renderer, size, layer, look, &mut layers);
+                self.draw_cached(renderer, size, layer, look, &mut layers, meshes);
             }
         }
 
@@ -622,7 +646,12 @@ impl Editor<'_> {
     }
 
     /// Draws the current layer, or what it's about to become.
-    pub(super) fn draw_document(&self, frame: &mut Frame, document: &Document) {
+    pub(super) fn draw_document(
+        &self,
+        frame: &mut Frame,
+        document: &Document,
+        meshes: Option<&mut LayerMeshes>,
+    ) {
         self.draw_layer(
             frame,
             document,
@@ -630,6 +659,7 @@ impl Editor<'_> {
             Crossfade::default(),
             true,
             self.mirrors,
+            meshes,
         );
     }
 
@@ -675,6 +705,7 @@ impl Editor<'_> {
         crossfade: Crossfade,
         show_edges: bool,
         mirrors: &[Mirror],
+        mut meshes: Option<&mut LayerMeshes>,
     ) {
         if !mirrors.is_empty() {
             // Mapped so that, as this sees it, it's where it is.
@@ -682,16 +713,22 @@ impl Editor<'_> {
             let unseen = seen.inverse();
             if look == Look::Painted {
                 let mirrored = document.with_mirrors(mirrors).transformed(unseen);
-                self.draw_layer(frame, &mirrored, look, crossfade, show_edges, &[]);
+                self.draw_layer(frame, &mirrored, look, crossfade, show_edges, &[], meshes);
             } else {
                 let strength = if look == Look::Faded { 0.35 } else { 1.0 };
                 for image in doc::images(mirrors) {
                     if !image.near(seen) {
                         let ghost = document.transformed(image.then(unseen));
-                        self.draw_hinted(frame, &ghost, strength * 0.4, 1.0);
+                        self.draw_hinted(
+                            frame,
+                            &ghost,
+                            strength * 0.4,
+                            1.0,
+                            meshes.as_deref_mut(),
+                        );
                     }
                 }
-                self.draw_layer(frame, document, look, crossfade, show_edges, &[]);
+                self.draw_layer(frame, document, look, crossfade, show_edges, &[], meshes);
             }
             return;
         }
@@ -700,14 +737,14 @@ impl Editor<'_> {
             // Both with a hint of the colours, to still tell what's
             // painted; other layers fainter.
             Look::Plain => {
-                self.draw_hinted(frame, document, 1.0, 1.5);
+                self.draw_hinted(frame, document, 1.0, 1.5, meshes);
                 if self.shows_vertices(look) {
                     self.draw_vertices(frame, document);
                 }
                 return;
             }
             Look::Faded => {
-                self.draw_hinted(frame, document, 0.35, 1.0);
+                self.draw_hinted(frame, document, 0.35, 1.0, meshes);
                 return;
             }
         }
@@ -726,17 +763,31 @@ impl Editor<'_> {
             .filter(|(t, color)| color.is_none() && seen.shows(t))
             .map(|(t, _)| t)
             .collect();
-        frame.fill(
-            &self.mesh(unpainted.iter().copied()),
-            Color { a: 0.05, ..EDGE },
-        );
+        let unpainted_tint = Color { a: 0.05, ..EDGE };
+        match meshes.as_deref_mut() {
+            Some(meshes) => {
+                for &t in &unpainted {
+                    meshes.under.triangle(t.map(|p| self.camera.to_screen(p)), unpainted_tint);
+                }
+                for (t, color) in document.triangles().zip(document.colors()) {
+                    if let Some(color) = color
+                        && seen.shows(&t)
+                    {
+                        meshes.under.triangle(t.map(|p| self.camera.to_screen(p)), color);
+                    }
+                }
+            }
+            None => {
+                frame.fill(&self.mesh(unpainted.iter().copied()), unpainted_tint);
+                for (color, triangles) in painted_faces(document, &seen) {
+                    frame.fill(&self.mesh(triangles.into_iter()), color);
+                }
+            }
+        }
         frame.stroke(
             &self.hatch(&unpainted),
             stroke(Color { a: 0.3, ..EDGE }, 1.0),
         );
-        for (color, triangles) in painted_faces(document, &seen) {
-            frame.fill(&self.mesh(triangles.into_iter()), color);
-        }
         if !show_edges {
             return;
         }
@@ -799,7 +850,17 @@ impl Editor<'_> {
                 frame.fill(&path(&[outline]), gradient);
                 continue;
             }
-            by_color.add(color, outline);
+            match meshes.as_deref_mut() {
+                // A fan round the edge's middle, which sees all its outline.
+                Some(meshes) => {
+                    let middle = Point::new(
+                        (screen(a).x + screen(b).x) / 2.0,
+                        (screen(a).y + screen(b).y) / 2.0,
+                    );
+                    meshes.over.fan(middle, outline, color);
+                }
+                None => by_color.add(color, outline),
+            }
         }
         for (color, outlines) in by_color.0 {
             frame.fill(&path(&outlines), color);
@@ -833,6 +894,7 @@ impl Editor<'_> {
         document: &Document,
         strength: f32,
         width: f32,
+        meshes: Option<&mut LayerMeshes>,
     ) {
         let faint = |color: Color, alpha: f32| Color {
             a: color.a * alpha * strength,
@@ -841,9 +903,24 @@ impl Editor<'_> {
         // Only what may show.
         let seen = self.view(frame, width + 2.0);
         let mesh = self.mesh(document.triangles().filter(|t| seen.shows(t)));
-        frame.fill(&mesh, faint(FILL, 1.0));
-        for (color, triangles) in painted_faces(document, &seen) {
-            frame.fill(&self.mesh(triangles.into_iter()), faint(color, 0.25));
+        match meshes {
+            Some(meshes) => {
+                for (t, color) in document.triangles().zip(document.colors()) {
+                    if seen.shows(&t) {
+                        let t = t.map(|p| self.camera.to_screen(p));
+                        meshes.under.triangle(t, faint(FILL, 1.0));
+                        if let Some(color) = color {
+                            meshes.under.triangle(t, faint(color, 0.25));
+                        }
+                    }
+                }
+            }
+            None => {
+                frame.fill(&mesh, faint(FILL, 1.0));
+                for (color, triangles) in painted_faces(document, &seen) {
+                    frame.fill(&self.mesh(triangles.into_iter()), faint(color, 0.25));
+                }
+            }
         }
         frame.stroke(&mesh, stroke(faint(EDGE, 1.0), width));
         let screen = |v| self.camera.to_screen(document.vertex(v));
@@ -873,7 +950,8 @@ impl Editor<'_> {
         size: Size,
         layer: SceneLayer<'_>,
         look: Look,
-        layers: &mut Vec<Geometry>,
+        layers: &mut Vec<Drawn>,
+        meshes: bool,
     ) {
         // Only the paint mode shows colours as they are, and may hide the
         // edges.
@@ -894,17 +972,23 @@ impl Editor<'_> {
             mirrors: layer.mirrors.to_vec(),
             camera: (camera.pan, camera.zoom, camera.rotation, camera.image),
             size,
+            meshes,
         };
         let mut caches = self.caches.layers.borrow_mut();
         let cache = caches.entry(layer.id).or_insert_with(|| LayerCache {
             key: None,
             cache: canvas::Cache::new(),
+            meshes: None,
         });
         if cache.key.as_ref() != Some(&key) {
             cache.key = Some(key);
             cache.cache.clear();
+            cache.meshes = None;
         }
-        layers.push(cache.cache.draw(renderer, size, |frame| {
+        // Drawn again (the canvas's cache was cleared): its meshes too.
+        let mut built = None;
+        let geometry = cache.cache.draw(renderer, size, |frame| {
+            let mut sink = meshes.then(LayerMeshes::default);
             self.draw_layer(
                 frame,
                 layer.document,
@@ -912,8 +996,21 @@ impl Editor<'_> {
                 crossfade,
                 show_edges,
                 layer.mirrors,
+                sink.as_mut(),
             );
-        }));
+            built = sink.map(|sink| sink.finish(size));
+        });
+        if built.is_some() {
+            cache.meshes = built;
+        }
+        match &cache.meshes {
+            Some((under, over)) => {
+                layers.push(Drawn::Meshes(under.clone()));
+                layers.push(Drawn::Geometry(geometry));
+                layers.push(Drawn::Meshes(over.clone()));
+            }
+            None => layers.push(Drawn::Geometry(geometry)),
+        }
     }
 
     /// The layers pointed at in the layers panel, lit up (more than the

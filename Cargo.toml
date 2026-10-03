@@ -5,7 +5,10 @@ authors = ["Sven Brettschneider"]
 edition = "2024"
 
 [dependencies]
-iced = { git = "https://github.com/iced-rs/iced", branch = "master", features = ["canvas", "image", "svg", "tokio"] }
+iced = { git = "https://github.com/iced-rs/iced", branch = "master", features = ["advanced", "canvas", "image", "svg", "tokio"] }
+# To tell the GPU renderer (which draws meshes) from its fallback; the same
+# iced as above.
+iced_renderer = { git = "https://github.com/iced-rs/iced", branch = "master" }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,5 +32,4 @@ opt-level = 3
 # Only to draw the canvas in benchmarks, with the renderer the app uses
 # (on a GPU without a window); the same iced as above.
 [dev-dependencies]
-iced_renderer = { git = "https://github.com/iced-rs/iced", branch = "master" }
 iced_wgpu = { git = "https://github.com/iced-rs/iced", branch = "master" }

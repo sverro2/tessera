@@ -60,6 +60,7 @@ mod draw;
 mod extrude;
 mod grid;
 mod guides;
+mod meshes;
 mod mirror;
 mod painting;
 mod selection;
@@ -70,6 +71,7 @@ mod bench;
 mod tests;
 
 use draw::*;
+use meshes::{Drawn, EditorView, LayerMeshes};
 pub use grid::Grid;
 use grid::MAJOR;
 use guides::*;
@@ -224,6 +226,12 @@ pub struct Caches {
 struct LayerCache {
     key: Option<LayerKey>,
     cache: canvas::Cache,
+    /// Its faces and painted edges as meshes (under and over what the
+    /// canvas draws), if drawn with meshes.
+    meshes: Option<(
+        iced::advanced::graphics::mesh::Cache,
+        iced::advanced::graphics::mesh::Cache,
+    )>,
 }
 
 /// What a layer's drawing depends on.
@@ -237,6 +245,8 @@ struct LayerKey {
     mirrors: Vec<Mirror>,
     camera: (Vector, f32, f32, Option<Affine>),
     size: Size,
+    /// Drawn with meshes (else all on the canvas).
+    meshes: bool,
 }
 
 /// A layer on the canvas.
@@ -312,7 +322,7 @@ pub fn view<'a>(
         page,
         grid,
     });
-    let editor = Canvas::new(Editor {
+    let editor = EditorView::new(Editor {
         document: current.document,
         current: current.id,
         crossfade: current.crossfade,
@@ -334,11 +344,7 @@ pub fn view<'a>(
     });
     // Apart, as images (the background) are drawn after shapes within a
     // canvas: the stack draws the drawing in a pass of its own, over it.
-    stack![
-        backdrop.width(Fill).height(Fill),
-        editor.width(Fill).height(Fill)
-    ]
-    .into()
+    stack![backdrop.width(Fill).height(Fill), Element::from(editor)].into()
 }
 
 /// The background colour, the document (its size set), the background
@@ -782,10 +788,14 @@ impl canvas::Program<Message> for Editor<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        match self.flipped(state) {
-            Some(flipped) => flipped.draw_scene(state, renderer, bounds, cursor, self),
-            None => self.draw_scene(state, renderer, bounds, cursor, self),
-        }
+        // All on the canvas: no meshes.
+        self.draw_parts(state, renderer, bounds, cursor, false)
+            .into_iter()
+            .filter_map(|part| match part {
+                Drawn::Geometry(geometry) => Some(geometry),
+                Drawn::Meshes(_) => None,
+            })
+            .collect()
     }
 
     fn mouse_interaction(
@@ -811,6 +821,22 @@ impl canvas::Program<Message> for Editor<'_> {
 }
 
 impl Editor<'_> {
+    /// What to draw, in order: canvas geometry, and (with `meshes`) faces
+    /// and painted edges as meshes. Through a mirror image, as that sees it.
+    fn draw_parts(
+        &self,
+        state: &State,
+        renderer: &Renderer,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+        meshes: bool,
+    ) -> Vec<Drawn> {
+        match self.flipped(state) {
+            Some(flipped) => flipped.draw_scene(state, renderer, bounds, cursor, self, meshes),
+            None => self.draw_scene(state, renderer, bounds, cursor, self, meshes),
+        }
+    }
+
     /// The shape to frame (world, as seen: with its mirror images): the
     /// selection; else the shape under the cursor (at `inside`); else the
     /// one last highlighted; else all of the layer.
