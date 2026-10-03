@@ -63,6 +63,7 @@ mod grid;
 mod guides;
 mod meshes;
 mod mirror;
+mod painter;
 mod painting;
 mod selection;
 
@@ -77,6 +78,7 @@ pub use grid::Grid;
 use grid::MAJOR;
 use guides::*;
 use mirror::*;
+use painter::*;
 use selection::*;
 
 /// Screen-space distance within which a corner is grabbed.
@@ -222,7 +224,7 @@ pub struct Caches {
     /// Each layer's drawing.
     layers: RefCell<HashMap<NodeId, LayerCache>>,
     /// What's remembered of drawings to draw them (see `draw::Memos`).
-    memos: draw::Memos,
+    memos: painter::Memos,
 }
 
 /// A layer as last drawn, and what that depended on.

@@ -1804,7 +1804,7 @@ fn a_highlight_from_another_drawing_is_dropped() {
 
 #[test]
 fn an_edge_is_dashed_on_its_own() {
-    let dashes = super::draw::dashes(Point::new(0.0, 0.0), Point::new(20.0, 0.0), 4.0, 4.0);
+    let dashes = super::painter::dashes(Point::new(0.0, 0.0), Point::new(20.0, 0.0), 4.0, 4.0);
     let x = |p: Point| (p.x, p.y);
     let dashes: Vec<_> = dashes.into_iter().map(|(a, b)| (x(a), x(b))).collect();
     // From its start, the last cut short at its end; nothing past it.
@@ -1817,7 +1817,7 @@ fn an_edge_is_dashed_on_its_own() {
         ]
     );
     let point = Point::new(3.0, 3.0);
-    assert!(super::draw::dashes(point, point, 4.0, 4.0).is_empty());
+    assert!(super::painter::dashes(point, point, 4.0, 4.0).is_empty());
 }
 
 #[test]
