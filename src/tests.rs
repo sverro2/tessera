@@ -534,16 +534,16 @@ fn the_about_box_opens_and_closes() {
 #[test]
 fn proportional_editing_toggles_and_reaches_as_far_as_set() {
     let mut app = Tessera::new();
-    assert!(!app.proportional);
+    assert!(!app.shape.proportional);
     let _ = app.update(Message::Shape(ShapeMessage::ToggleProportional));
-    assert!(app.proportional);
-    let start = app.reach;
+    assert!(app.shape.proportional);
+    let start = app.shape.reach;
     let _ = app.update(Message::Editor(editor::Message::TweakReach(100.0)));
-    assert!((app.reach - start * 1f32.exp()).abs() < 1e-3);
+    assert!((app.shape.reach - start * 1f32.exp()).abs() < 1e-3);
     let _ = app.update(Message::Editor(editor::Message::TweakReach(-10_000.0)));
-    assert_eq!(app.reach, REACH.0);
+    assert_eq!(app.shape.reach, REACH.0);
     let _ = app.update(Message::Shape(ShapeMessage::Reach(1e6)));
-    assert_eq!(app.reach, REACH.1);
+    assert_eq!(app.shape.reach, REACH.1);
 }
 
 #[test]
@@ -561,7 +561,7 @@ fn a_mirror_is_placed_moved_applied_and_undone() {
     let _ = app.update(Message::Editor(editor::Message::SetMirror(
         at(max.x + 50.0),
     )));
-    assert!(!app.placing_mirror);
+    assert!(!app.shape.placing_mirror);
     // Placed again: instead.
     let mirror = at(max.x + 20.0);
     let _ = app.update(Message::Editor(editor::Message::SetMirror(mirror)));

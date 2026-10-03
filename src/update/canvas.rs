@@ -59,7 +59,8 @@ impl Tessera {
                 Task::none()
             }
             editor::Message::TweakReach(across) => {
-                self.reach = (self.reach * (across * 0.01).exp()).clamp(REACH.0, REACH.1);
+                self.shape.reach =
+                    (self.shape.reach * (across * 0.01).exp()).clamp(REACH.0, REACH.1);
                 Task::none()
             }
             editor::Message::TweakLightness(across) => {
@@ -115,7 +116,7 @@ impl Tessera {
             editor::Message::SetMirror(mirror) => {
                 let before = self.layers.clone();
                 self.layers.set_mirror(self.current(), Some(mirror));
-                self.placing_mirror = false;
+                self.shape.placing_mirror = false;
                 self.push_undo(before);
                 Task::none()
             }

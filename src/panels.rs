@@ -42,7 +42,7 @@ impl Tessera {
             .is_some_and(|layer| layer.mirror.is_some());
         let bar = if self.backgrounds.editing {
             return space().into();
-        } else if self.placing_mirror {
+        } else if self.shape.placing_mirror {
             row![
                 small(if mirrored {
                     "Placing the mirror again"
@@ -98,7 +98,7 @@ impl Tessera {
         }
         let mut body =
             column![tooltip(
-            checkbox(self.proportional)
+            checkbox(self.shape.proportional)
                 .label("Proportional (O)")
                 .size(14)
                 .text_size(13)
@@ -107,16 +107,20 @@ impl Tessera {
             tooltip::Position::Bottom,
         )]
             .spacing(8);
-        if self.proportional {
+        if self.shape.proportional {
             // On a log scale: a small reach is as easy to set as a large one.
             body = body.push(
                 row![
                     text("Reach").size(13).width(44),
-                    slider(REACH.0.ln()..=REACH.1.ln(), self.reach.ln(), |reach| {
-                        Message::Shape(ShapeMessage::Reach(reach.exp()))
-                    })
+                    slider(
+                        REACH.0.ln()..=REACH.1.ln(),
+                        self.shape.reach.ln(),
+                        |reach| { Message::Shape(ShapeMessage::Reach(reach.exp())) }
+                    )
                     .step(0.01),
-                    text(format!("{:.0} px", self.reach)).size(13).width(48),
+                    text(format!("{:.0} px", self.shape.reach))
+                        .size(13)
+                        .width(48),
                 ]
                 .spacing(8)
                 .align_y(Center),

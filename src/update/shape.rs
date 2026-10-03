@@ -21,7 +21,7 @@ impl Tessera {
     pub(crate) fn update_shape(&mut self, message: ShapeMessage) -> Task<Message> {
         match message {
             ShapeMessage::PlaceMirror(placing) => {
-                self.placing_mirror = placing;
+                self.shape.placing_mirror = placing;
                 Task::none()
             }
             ShapeMessage::ApplyMirror => {
@@ -49,13 +49,34 @@ impl Tessera {
                 Task::none()
             }
             ShapeMessage::ToggleProportional => {
-                self.proportional = !self.proportional;
+                self.shape.proportional = !self.shape.proportional;
                 Task::none()
             }
             ShapeMessage::Reach(reach) => {
-                self.reach = reach.clamp(REACH.0, REACH.1);
+                self.shape.reach = reach.clamp(REACH.0, REACH.1);
                 Task::none()
             }
+        }
+    }
+}
+
+/// The shape mode's tools: proportional editing, and placing a mirror.
+pub struct Shaping {
+    /// Proportional editing (shape mode): moving vertices takes those within
+    /// `reach` (screen px, so zoomed out it reaches further) along, the less
+    /// the further.
+    pub proportional: bool,
+    pub reach: f32,
+    /// Placing a mirror on the current layer (Ctrl+M).
+    pub placing_mirror: bool,
+}
+
+impl Default for Shaping {
+    fn default() -> Self {
+        Shaping {
+            proportional: false,
+            reach: 100.0,
+            placing_mirror: false,
         }
     }
 }

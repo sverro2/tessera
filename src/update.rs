@@ -22,5 +22,5 @@ pub use layers::{LayerAction, LayersPanel};
 pub use menu::MenuMessage;
 pub use page::{PageDialog, PageMessage};
 pub use paint::{PaintMessage, Painting};
-pub use shape::ShapeMessage;
+pub use shape::{ShapeMessage, Shaping};
 pub use snap::SnapMessage;

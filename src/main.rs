@@ -57,7 +57,7 @@ use panels::{joined, tip};
 use update::{
     BackgroundMessage, Backgrounds, ExportMessage, ExportSettings, Field, Fields, FileMessage,
     Files, Format, KeysMessage, LayerAction, LayersPanel, MenuMessage, PageDialog, PageMessage,
-    PaintMessage, Painting, ShapeMessage, SnapMessage,
+    PaintMessage, Painting, ShapeMessage, Shaping, SnapMessage,
 };
 
 pub fn main() -> iced::Result {
@@ -114,13 +114,6 @@ struct Tessera {
     notice: Option<Notice>,
     /// What dragging on the canvas does.
     mode: Mode,
-    /// Proportional editing (shape mode): moving vertices takes those within
-    /// `reach` (screen px, so zoomed out it reaches further) along, the less
-    /// the further.
-    proportional: bool,
-    reach: f32,
-    /// Placing a mirror on the current layer (Ctrl+M).
-    placing_mirror: bool,
     /// What was copied (Ctrl+C), to paste on any layer (Ctrl+V).
     clipboard: Option<document::Piece>,
     /// Which keys do what (kept in the config folder).
@@ -147,6 +140,8 @@ struct Tessera {
     backgrounds: Backgrounds,
     /// The drawing's file, and files met lately.
     files: Files,
+    /// The shape mode's tools: proportional editing, and placing a mirror.
+    shape: Shaping,
 }
 
 /// A short message shown at the bottom right for a while, then fading out.
@@ -415,7 +410,6 @@ impl Tessera {
 
     fn new() -> Self {
         Tessera {
-            reach: 100.0,
             keys: Keymap::load(),
             snap: snap::Snap::load(),
             files: Files {
@@ -561,7 +555,7 @@ impl Tessera {
             self.dialogs = Dialogs::default();
             self.backgrounds.editing = false;
             self.paint.picking = false;
-            self.placing_mirror = false;
+            self.shape.placing_mirror = false;
             return Task::none();
         }
         if self.dialogs.dialog_open() {
@@ -585,7 +579,7 @@ impl Tessera {
             Action::SaveAs => Message::File(FileMessage::SaveAs),
             Action::Undo => Message::Undo,
             Action::Redo => Message::Redo,
-            Action::Mirror => Message::Shape(ShapeMessage::PlaceMirror(!self.placing_mirror)),
+            Action::Mirror => Message::Shape(ShapeMessage::PlaceMirror(!self.shape.placing_mirror)),
             Action::DuplicateLayer => Message::Layers(LayerAction::Duplicate),
             Action::ShowKeys => Message::Keys(KeysMessage::ShowKeys(true)),
             Action::Proportional => Message::Shape(ShapeMessage::ToggleProportional),
@@ -758,7 +752,7 @@ impl Tessera {
                     self.background(),
                     editor::Settings {
                         tool: self.tool(),
-                        proportional: self.proportional.then_some(self.reach),
+                        proportional: self.shape.proportional.then_some(self.shape.reach),
                         clipboard: self.clipboard.as_ref(),
                         // Not while they're being looked up (or set).
                         keys: (!self.dialogs.keys_open).then_some(&self.keys),
@@ -843,7 +837,7 @@ impl Tessera {
             _ if self.backgrounds.editing => Tool::Background {
                 painted: self.mode == Mode::Paint,
             },
-            _ if self.placing_mirror => Tool::Mirror,
+            _ if self.shape.placing_mirror => Tool::Mirror,
             Mode::Shape => Tool::Shape,
             Mode::Paint => Tool::Paint {
                 target: self.paint.target,
