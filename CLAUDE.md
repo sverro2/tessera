@@ -95,8 +95,9 @@ The iced (Elm) architecture throughout: state, messages, `update`, `view`.
 - Canvas behaviour: `editor/input.rs` (and `drag.rs` for drags), publishing
   an `editor::Message` if the app must act.
 - Every change comes with tests: `src/tests.rs` (the app, message by
-  message), `src/editor/tests.rs` (events through the canvas),
-  `src/document/tests.rs` (edits), or a module's own.
+  message), `src/editor/tests/<area>.rs` (events through the canvas; the
+  helpers to set them up in `src/editor/tests.rs`), `src/document/tests.rs`
+  (edits), or a module's own.
 
 ## Style
 
