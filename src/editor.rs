@@ -28,7 +28,6 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use rayon::prelude::*;
 
@@ -38,6 +37,7 @@ use iced::time::{Duration, Instant};
 use iced::widget::canvas::{
     self, Canvas, Event, Frame, Geometry, LineCap, LineDash, LineJoin, Path, Stroke,
 };
+use iced::advanced::graphics::cache::{Cached, Group};
 use iced::widget::stack;
 use iced::window;
 use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Size, Theme, Vector};
@@ -221,26 +221,17 @@ pub struct Caches {
     pub grid: canvas::Cache,
     /// Each layer's drawing.
     layers: RefCell<HashMap<NodeId, LayerCache>>,
-    /// Painted edges' outlines worked out, by drawing (its revision).
-    outlines: RefCell<HashMap<u64, EdgeOutlines>>,
-    /// What drawing drawings needs worked out from them (see
-    /// `draw::Derived`), by drawing (its revision).
-    derived: RefCell<HashMap<u64, Rc<draw::Derived>>>,
-}
-
-/// A drawing's painted edges' outlines (world), as at `zoom`, and around
-/// each vertex its painted edges (to work out more).
-#[derive(Default)]
-struct EdgeOutlines {
-    zoom: f32,
-    outlines: HashMap<(VertexId, VertexId), Vec<Point>>,
-    around: HashMap<VertexId, Vec<(VertexId, VertexId)>>,
+    /// What's remembered of drawings to draw them (see `draw::Memos`).
+    memos: draw::Memos,
 }
 
 /// A layer as last drawn, and what that depended on.
 struct LayerCache {
-    key: Option<LayerKey>,
-    cache: canvas::Cache,
+    key: LayerKey,
+    /// Its own, kept from one drawing of it to the next.
+    group: Group,
+    /// What's drawn on the canvas, kept (on the GPU) while unchanged.
+    geometry: <Geometry as Cached>::Cache,
     /// Its faces and painted edges as meshes (under and over what the
     /// canvas draws), if drawn with meshes.
     meshes: Option<(

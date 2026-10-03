@@ -1,7 +1,8 @@
 //! Drawing the canvas: the layers (each cached), and over them what a
 //! drag would do.
 
-use std::cell::OnceCell;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::*;
 use crate::document::cells::Cells;
@@ -181,28 +182,28 @@ pub(super) struct Side {
 /// it's needed.
 pub(super) struct Derived {
     /// Each triangle's sides.
-    sides: OnceCell<Vec<[Side; 3]>>,
+    sides: OnceLock<Vec<[Side; 3]>>,
     /// Each vertex's shortest edge (by vertex id; world units).
-    shortest: OnceCell<Vec<f32>>,
+    shortest: OnceLock<Vec<f32>>,
     /// Each triangle's colour, as [`Document::colors`] has them (looked up
     /// one by one, they take a while).
-    colors: OnceCell<Vec<Option<Color>>>,
+    colors: OnceLock<Vec<Option<Color>>>,
     /// The triangles by place, with the bounds of all of them, to find
     /// those in view without going through all of them; none if empty.
-    index: OnceCell<Option<(Cells, Point, Point)>>,
+    index: OnceLock<Option<(Cells, Point, Point)>>,
     /// How often it was asked for: one drawn just once (a mirror image
     /// worked out anew each time) isn't worth indexing.
-    uses: Cell<u32>,
+    uses: AtomicU32,
 }
 
 impl Derived {
     fn new() -> Self {
         Derived {
-            sides: OnceCell::new(),
-            shortest: OnceCell::new(),
-            colors: OnceCell::new(),
-            index: OnceCell::new(),
-            uses: Cell::new(0),
+            sides: OnceLock::new(),
+            shortest: OnceLock::new(),
+            colors: OnceLock::new(),
+            index: OnceLock::new(),
+            uses: AtomicU32::new(0),
         }
     }
 
@@ -235,7 +236,7 @@ impl Derived {
         let shows = |t: TriangleId| seen.shows(&triangles[t].map(|v| document.vertex(v)));
         let area = |min: Point, max: Point| (max.x - min.x).max(0.0) * (max.y - min.y).max(0.0);
         // Drawn more than once, and big enough to bother.
-        let indexed = (self.uses.get() > 1 && triangles.len() > 256)
+        let indexed = (self.uses.load(Ordering::Relaxed) > 1 && triangles.len() > 256)
             .then(|| {
                 self.index.get_or_init(|| {
                     let (min, max) = document.bounds()?;
@@ -417,7 +418,76 @@ pub(super) fn stroke(color: Color, width: f32) -> Stroke<'static> {
         .with_line_cap(LineCap::Round)
 }
 
+/// What drawing a layer takes from the editor: how it's seen, the tool,
+/// and what's remembered of the drawings. Unlike the editor (with its
+/// caches of what's on the GPU), it can go to other threads, so that
+/// layers can be drawn side by side.
+#[derive(Clone, Copy)]
+pub(super) struct Painter<'a> {
+    camera: Camera,
+    tool: Tool,
+    memos: &'a Memos,
+}
+
+/// What's remembered of the drawings drawn lately, by drawing (its
+/// revision): shared by layers drawn side by side.
+#[derive(Default)]
+pub(super) struct Memos {
+    /// Painted edges' outlines worked out; each drawing's apart.
+    outlines: Mutex<HashMap<u64, Arc<Mutex<EdgeOutlines>>>>,
+    /// What drawing them needs worked out (see [`Derived`]).
+    derived: Mutex<HashMap<u64, Arc<Derived>>>,
+}
+
+/// A drawing's painted edges' outlines (world), as at `zoom`, and around
+/// each vertex its painted edges (to work out more).
+#[derive(Default)]
+struct EdgeOutlines {
+    zoom: f32,
+    outlines: HashMap<(VertexId, VertexId), Vec<Point>>,
+    around: HashMap<VertexId, Vec<(VertexId, VertexId)>>,
+}
+
+/// A layer to draw, with the painter to draw it with, and how.
+pub(super) struct Wanted<'a> {
+    painter: Painter<'a>,
+    layer: SceneLayer<'a>,
+    look: Look,
+}
+
 impl Editor<'_> {
+    /// How this draws layers (see [`Painter`]).
+    pub(super) fn painter(&self) -> Painter<'_> {
+        Painter {
+            camera: self.camera,
+            tool: self.tool,
+            memos: &self.caches.memos,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn draw_layer(
+        &self,
+        frame: &mut Frame,
+        document: &Document,
+        look: Look,
+        crossfade: Crossfade,
+        show_edges: bool,
+        mirrors: &[Mirror],
+        meshes: Option<&mut LayerMeshes>,
+    ) {
+        self.painter()
+            .draw_layer(frame, document, look, crossfade, show_edges, mirrors, meshes);
+    }
+
+    pub(super) fn edge_width(&self, width: f32) -> f32 {
+        self.painter().edge_width(width)
+    }
+
+    pub(super) fn mesh(&self, triangles: impl Iterator<Item = [Point; 3]>) -> Path {
+        self.painter().mesh(triangles)
+    }
+
     /// What to draw: the layers and, over them, what's going on.
     /// What to draw: the layers and, over them, what's going on. The
     /// other layers as `others` sees them (not mirrored, when this works
@@ -461,14 +531,39 @@ impl Editor<'_> {
         } else {
             Look::Faded
         };
-        let mut layers = Vec::new();
-        for layer in &self.below {
-            others_view.draw_cached(renderer, size, *layer, others, &mut layers, meshes);
-        }
-        let mut above = Vec::new();
-        for layer in &self.above {
-            others_view.draw_cached(renderer, size, *layer, others, &mut above, meshes);
-        }
+        // Each from its cache, or drawn anew side by side: those behind,
+        // those in front, and (unless drawn as it will be, below) the
+        // current one.
+        let current = SceneLayer {
+            id: self.current,
+            document: self.document,
+            crossfade: self.crossfade,
+            show_edges: self.show_edges,
+            mirrors: self.mirrors,
+        };
+        let tweaked = (self.shown && pending.is_none())
+            .then(|| self.tweaked_edge(state))
+            .flatten();
+        let cached_current = self.shown && pending.is_none() && tweaked.is_none();
+        let others_painter = others_view.painter();
+        let wanted: Vec<Wanted> = self
+            .below
+            .iter()
+            .chain(&self.above)
+            .map(|&layer| Wanted {
+                painter: others_painter,
+                layer,
+                look: others,
+            })
+            .chain(cached_current.then(|| Wanted {
+                painter: self.painter(),
+                layer: current,
+                look,
+            }))
+            .collect();
+        let mut drawn = self.draw_cached(renderer, size, &wanted, meshes).into_iter();
+        let mut layers: Vec<Drawn> = drawn.by_ref().take(self.below.len()).flatten().collect();
+        let mut above: Vec<Drawn> = drawn.by_ref().take(self.above.len()).flatten().collect();
         if look != Look::Painted {
             layers.append(&mut above);
         }
@@ -486,12 +581,12 @@ impl Editor<'_> {
                 // Tweaking a painted edge (holding W or C): the layer as
                 // it will be, that edge in its new style only, so a wide one
                 // made thin doesn't show from under it.
-                None if let Some(tweaked) = self.tweaked_edge(state) => {
+                None if let Some(tweaked) = &tweaked => {
                     let mut sink = meshes.then(LayerMeshes::default);
                     let mut frame = Frame::new(renderer, size);
                     self.draw_layer(
                         &mut frame,
-                        &tweaked,
+                        tweaked,
                         look,
                         self.crossfade,
                         self.show_edges,
@@ -500,16 +595,7 @@ impl Editor<'_> {
                     );
                     push_layer(&mut layers, frame, sink, size);
                 }
-                None => {
-                    let current = SceneLayer {
-                        id: self.current,
-                        document: self.document,
-                        crossfade: self.crossfade,
-                        show_edges: self.show_edges,
-                        mirrors: self.mirrors,
-                    };
-                    self.draw_cached(renderer, size, current, look, &mut layers, meshes);
-                }
+                None => layers.extend(drawn.flatten()),
             }
         }
         layers.append(&mut above);
@@ -537,9 +623,16 @@ impl Editor<'_> {
                 },
             );
             layers.push(Drawn::Geometry(wash.into_geometry()));
-            for &layer in &self.lit {
-                self.draw_cached(renderer, size, layer, look, &mut layers, meshes);
-            }
+            let lit: Vec<Wanted> = self
+                .lit
+                .iter()
+                .map(|&layer| Wanted {
+                    painter: self.painter(),
+                    layer,
+                    look,
+                })
+                .collect();
+            layers.extend(self.draw_cached(renderer, size, &lit, meshes).into_iter().flatten());
         }
 
         let mut overlay = Frame::new(renderer, bounds.size());
@@ -851,6 +944,311 @@ impl Editor<'_> {
         );
     }
 
+    /// The drawings of the `wanted` layers, each from its cache if what
+    /// it's drawn from hasn't changed; those that changed drawn anew, side
+    /// by side (on several cores).
+    pub(super) fn draw_cached(
+        &self,
+        renderer: &Renderer,
+        size: Size,
+        wanted: &[Wanted<'_>],
+        meshes: bool,
+    ) -> Vec<Vec<Drawn>> {
+        let mut caches = self.caches.layers.borrow_mut();
+        // What each depends on, and a frame for those to draw anew.
+        let mut jobs = Vec::new();
+        let mut keys = Vec::with_capacity(wanted.len());
+        for (i, wanted) in wanted.iter().enumerate() {
+            let Wanted {
+                painter,
+                layer,
+                look,
+            } = *wanted;
+            // Only the paint mode shows colours as they are, and may hide
+            // the edges.
+            let painted = look == Look::Painted;
+            let crossfade = if painted {
+                layer.crossfade
+            } else {
+                Crossfade::default()
+            };
+            let show_edges = !painted || layer.show_edges;
+            let camera = painter.camera;
+            let key = LayerKey {
+                revision: layer.document.revision(),
+                look,
+                crossfade,
+                show_edges,
+                vertices: painter.shows_vertices(look),
+                mirrors: layer.mirrors.to_vec(),
+                camera: (camera.pan, camera.zoom, camera.rotation, camera.image),
+                size,
+                meshes,
+            };
+            if caches.get(&layer.id).is_none_or(|cache| cache.key != key) {
+                jobs.push((i, Frame::new(renderer, size), crossfade, show_edges));
+            }
+            keys.push(key);
+        }
+
+        let draw = |(i, mut frame, crossfade, show_edges): (usize, Frame, Crossfade, bool)| {
+            let Wanted {
+                painter,
+                layer,
+                look,
+            } = wanted[i];
+            let mut sink = meshes.then(LayerMeshes::default);
+            painter.draw_layer(
+                &mut frame,
+                layer.document,
+                look,
+                crossfade,
+                show_edges,
+                layer.mirrors,
+                sink.as_mut(),
+            );
+            (i, frame.into_geometry(), sink.map(|sink| sink.finish(size)))
+        };
+        // One alone isn't worth handing to another thread.
+        let drawn: Vec<_> = if jobs.len() > 1 {
+            jobs.into_par_iter().map(draw).collect()
+        } else {
+            jobs.into_iter().map(draw).collect()
+        };
+        for (i, geometry, built) in drawn {
+            let id = wanted[i].layer.id;
+            let previous = caches.remove(&id);
+            let group = previous.as_ref().map_or_else(Group::unique, |cache| cache.group);
+            let geometry = geometry.cache(group, previous.map(|cache| cache.geometry));
+            let key = keys[i].clone();
+            caches.insert(
+                id,
+                LayerCache {
+                    key,
+                    group,
+                    geometry,
+                    meshes: built,
+                },
+            );
+        }
+
+        wanted
+            .iter()
+            .map(|wanted| {
+                let cache = &caches[&wanted.layer.id];
+                let geometry = Drawn::Geometry(Cached::load(&cache.geometry));
+                match &cache.meshes {
+                    Some((under, over)) => vec![
+                        Drawn::Meshes(under.clone()),
+                        geometry,
+                        Drawn::Meshes(over.clone()),
+                    ],
+                    None => vec![geometry],
+                }
+            })
+            .collect()
+    }
+
+    /// The layers pointed at in the layers panel, lit up (more than the
+    /// current one ever is), whatever the mode: their faces tinted a little,
+    /// their outlines bright; with their mirror images, as seen. (Everything
+    /// else is faded back meanwhile: see `draw_scene`.)
+    fn draw_lit(&self, frame: &mut Frame) {
+        if self.lit.is_empty() {
+            return;
+        }
+        let camera = self.plain_camera();
+        for layer in &self.lit {
+            let document = layer.document;
+            let images = doc::images(layer.mirrors);
+            let faces = Path::new(|p| {
+                for image in &images {
+                    for t in document.triangles() {
+                        let [a, b, c] = t.map(|q| camera.to_screen(image.apply(q)));
+                        p.move_to(a);
+                        p.line_to(b);
+                        p.line_to(c);
+                        p.close();
+                    }
+                }
+            });
+            // Lightly: they're shown as they look underneath.
+            frame.fill(&faces, Color { a: 0.06, ..HOVER });
+            let outline = Path::new(|p| {
+                for image in &images {
+                    for (a, b) in outline(document) {
+                        p.move_to(camera.to_screen(image.apply(document.vertex(a))));
+                        p.line_to(camera.to_screen(image.apply(document.vertex(b))));
+                    }
+                }
+            });
+            frame.stroke(&outline, stroke(BACKGROUND, 4.0));
+            frame.stroke(&outline, stroke(HOVER, 2.0));
+        }
+    }
+
+    /// Highlights how the pending result differs from the current document:
+    /// added triangles in green; removed edges, and triangles squashed flat
+    /// (as the line they collapse into), in red; and in yellow where things
+    /// join up: vertices welded together, outline edges that become shared
+    /// (other than `source`) and outline edges cut where a vertex lands on
+    /// them.
+    pub(super) fn draw_changes(
+        &self,
+        frame: &mut Frame,
+        pending: &Pending,
+        source: Option<(VertexId, VertexId)>,
+    ) {
+        let Pending {
+            result, changes, ..
+        } = pending;
+        let before = self.document;
+        let screen = |v| self.camera.to_screen(result.vertex(v));
+        let segments = |edges: &[(VertexId, VertexId)]| {
+            Path::new(|p| {
+                for &(u, v) in edges {
+                    p.move_to(screen(u));
+                    p.line_to(screen(v));
+                }
+            })
+        };
+
+        let added = self.mesh(pending.added.iter().map(|t| t.map(|v| result.vertex(v))));
+        frame.fill(&added, Color { a: 0.2, ..ADDED });
+        frame.stroke(&added, stroke(ADDED, 1.5));
+
+        frame.stroke(
+            &segments(&removed_edges(before, pending)),
+            stroke(REMOVED, 2.0),
+        );
+
+        let squashed = Path::new(|p| {
+            for t in &changes.squashed {
+                let (from, to) = longest_edge(t.map(screen));
+                p.move_to(from);
+                p.line_to(to);
+            }
+        });
+        frame.stroke(&squashed, stroke(REMOVED, 3.0));
+
+        let (joined, rings) = self.joins(pending, source);
+        frame.stroke(&segments(&joined), stroke(JOINED, 4.0));
+        for v in rings {
+            frame.stroke(&Path::circle(screen(v), 10.0), stroke(JOINED, 2.5));
+        }
+    }
+
+    /// The shape `start` belongs to, to highlight.
+    pub(super) fn highlight(&self, start: VertexId) -> Highlight {
+        let mut triangles = self.document.connected(start);
+        for t in &mut triangles {
+            t.sort_unstable();
+        }
+        triangles.sort_unstable();
+        Highlight {
+            revision: self.document.revision(),
+            start,
+            outline: outline_of(&triangles),
+            triangles,
+        }
+    }
+
+    /// Highlights a `shape` (with its vertices where `document` has them):
+    /// a faint tint, and its outline with a soft glow. `strength` (0 to 1)
+    /// fades it.
+    pub(super) fn draw_shape(
+        &self,
+        frame: &mut Frame,
+        document: &Document,
+        shape: &Highlight,
+        strength: f32,
+    ) {
+        if strength <= 0.0 {
+            return;
+        }
+        let screen = |v| self.camera.to_screen(document.vertex(v));
+        let edges = Path::new(|p| {
+            for &(u, v) in &shape.outline {
+                p.move_to(screen(u));
+                p.line_to(screen(v));
+            }
+        });
+        let tint = self.mesh(
+            shape
+                .triangles
+                .iter()
+                .map(|t| t.map(|v| document.vertex(v))),
+        );
+        let faded = |a: f32| Color {
+            a: a * strength,
+            ..HOVER
+        };
+
+        frame.fill(&tint, faded(0.08));
+        frame.stroke(&edges, stroke(faded(0.2), 8.0));
+        frame.stroke(&edges, stroke(faded(1.0), 2.0));
+    }
+
+    /// Where the pending result joins things up: outline edges that become
+    /// shared (other than `source`) or are cut where a vertex lands on
+    /// them, and the vertices that join, as ids after it.
+    pub(super) fn joins(
+        &self,
+        pending: &Pending,
+        source: Option<(VertexId, VertexId)>,
+    ) -> (Vec<(VertexId, VertexId)>, Vec<VertexId>) {
+        let Pending {
+            result, changes, ..
+        } = pending;
+        let before = self.document;
+        let kept = |v| changes.kept(v);
+        let key = |(u, v): (VertexId, VertexId)| {
+            let (u, v) = (kept(u), kept(v));
+            (u.min(v), u.max(v))
+        };
+
+        let outline_before: Vec<_> = outline(before).into_iter().map(key).collect();
+        let interior_before: Vec<_> = interior(before).into_iter().map(key).collect();
+        let source = source.map(key);
+        let mut joined: Vec<_> = interior(result)
+            .into_iter()
+            .filter(|&e| Some(e) != source)
+            .filter(|e| outline_before.contains(e) && !interior_before.contains(e))
+            .collect();
+        let mut rings: Vec<VertexId> = joined.iter().flat_map(|&(u, v)| [u, v]).collect();
+        rings.extend(changes.welded.iter().map(|&(_, k)| kept(k)));
+        // Where added triangles attach to existing vertices; the ends of the
+        // source edge are no news.
+        rings.extend(
+            changes
+                .attached
+                .iter()
+                .map(|&v| kept(v))
+                .filter(|&v| source.is_none_or(|(a, b)| v != a && v != b)),
+        );
+
+        // A vertex landing on an outline edge it wasn't connected to.
+        let connected = |w, x| {
+            before
+                .triangle_ids()
+                .iter()
+                .any(|t| t.iter().any(|&v| kept(v) == w) && t.iter().any(|&v| kept(v) == x))
+        };
+        for &(a, b, w) in &changes.cut {
+            let edge = (a.min(b), a.max(b));
+            if outline_before.contains(&edge) && !connected(w, a) && !connected(w, b) {
+                joined.extend([(a, w), (w, b)]);
+                rings.push(w);
+            }
+        }
+        rings.sort_unstable();
+        rings.dedup();
+
+        (joined, rings)
+    }
+}
+
+impl Painter<'_> {
     /// Draws a layer; in the painted look crossfaded as `crossfade` says,
     /// and its edges only if `show_edges`. With `mirrors`, mirrored: in the
     /// painted look as it will be, otherwise its mirror images faint, so
@@ -889,12 +1287,18 @@ impl Editor<'_> {
             let style = document.edge_style(a, b).unwrap_or(doc::DEFAULT_EDGE);
             self.edge_width(style.width) / zoom
         };
-        let mut memo = self.caches.outlines.borrow_mut();
-        // Only a few drawings at a time (those drawn lately).
-        if memo.len() > 64 && !memo.contains_key(&document.revision()) {
-            memo.clear();
-        }
-        let known = memo.entry(document.revision()).or_default();
+        // Each drawing's apart, so layers drawn side by side don't wait for
+        // each other.
+        let entry = {
+            let mut memo = self.memos.outlines.lock().expect("outlines");
+            // Only a few drawings at a time (those drawn lately).
+            if memo.len() > 64 && !memo.contains_key(&document.revision()) {
+                memo.clear();
+            }
+            memo.entry(document.revision()).or_default().clone()
+        };
+        let mut known = entry.lock().expect("outlines");
+        let known = &mut *known;
         if known.zoom != zoom {
             known.zoom = zoom;
             known.outlines.clear();
@@ -1193,17 +1597,17 @@ impl Editor<'_> {
     }
 
     /// What drawing `document` needs worked out, remembered per drawing.
-    pub(super) fn derived(&self, document: &Document) -> Rc<Derived> {
-        let mut memo = self.caches.derived.borrow_mut();
+    pub(super) fn derived(&self, document: &Document) -> Arc<Derived> {
+        let mut memo = self.memos.derived.lock().expect("derived");
         // Only a few drawings at a time (those drawn lately).
         if memo.len() > 64 && !memo.contains_key(&document.revision()) {
             memo.clear();
         }
         let derived = memo
             .entry(document.revision())
-            .or_insert_with(|| Rc::new(Derived::new()))
+            .or_insert_with(|| Arc::new(Derived::new()))
             .clone();
-        derived.uses.set(derived.uses.get().saturating_add(1));
+        derived.uses.fetch_add(1, Ordering::Relaxed);
         derived
     }
 
@@ -1312,115 +1716,6 @@ impl Editor<'_> {
         }
     }
 
-    /// Adds a layer's drawing to `layers`, from its cache if what it's drawn
-    /// from hasn't changed.
-    pub(super) fn draw_cached(
-        &self,
-        renderer: &Renderer,
-        size: Size,
-        layer: SceneLayer<'_>,
-        look: Look,
-        layers: &mut Vec<Drawn>,
-        meshes: bool,
-    ) {
-        // Only the paint mode shows colours as they are, and may hide the
-        // edges.
-        let painted = look == Look::Painted;
-        let crossfade = if painted {
-            layer.crossfade
-        } else {
-            Crossfade::default()
-        };
-        let show_edges = !painted || layer.show_edges;
-        let camera = self.camera;
-        let key = LayerKey {
-            revision: layer.document.revision(),
-            look,
-            crossfade,
-            show_edges,
-            vertices: self.shows_vertices(look),
-            mirrors: layer.mirrors.to_vec(),
-            camera: (camera.pan, camera.zoom, camera.rotation, camera.image),
-            size,
-            meshes,
-        };
-        let mut caches = self.caches.layers.borrow_mut();
-        let cache = caches.entry(layer.id).or_insert_with(|| LayerCache {
-            key: None,
-            cache: canvas::Cache::new(),
-            meshes: None,
-        });
-        if cache.key.as_ref() != Some(&key) {
-            cache.key = Some(key);
-            cache.cache.clear();
-            cache.meshes = None;
-        }
-        // Drawn again (the canvas's cache was cleared): its meshes too.
-        let mut built = None;
-        let geometry = cache.cache.draw(renderer, size, |frame| {
-            let mut sink = meshes.then(LayerMeshes::default);
-            self.draw_layer(
-                frame,
-                layer.document,
-                look,
-                crossfade,
-                show_edges,
-                layer.mirrors,
-                sink.as_mut(),
-            );
-            built = sink.map(|sink| sink.finish(size));
-        });
-        if built.is_some() {
-            cache.meshes = built;
-        }
-        match &cache.meshes {
-            Some((under, over)) => {
-                layers.push(Drawn::Meshes(under.clone()));
-                layers.push(Drawn::Geometry(geometry));
-                layers.push(Drawn::Meshes(over.clone()));
-            }
-            None => layers.push(Drawn::Geometry(geometry)),
-        }
-    }
-
-    /// The layers pointed at in the layers panel, lit up (more than the
-    /// current one ever is), whatever the mode: their faces tinted a little,
-    /// their outlines bright; with their mirror images, as seen. (Everything
-    /// else is faded back meanwhile: see `draw_scene`.)
-    fn draw_lit(&self, frame: &mut Frame) {
-        if self.lit.is_empty() {
-            return;
-        }
-        let camera = self.plain_camera();
-        for layer in &self.lit {
-            let document = layer.document;
-            let images = doc::images(layer.mirrors);
-            let faces = Path::new(|p| {
-                for image in &images {
-                    for t in document.triangles() {
-                        let [a, b, c] = t.map(|q| camera.to_screen(image.apply(q)));
-                        p.move_to(a);
-                        p.line_to(b);
-                        p.line_to(c);
-                        p.close();
-                    }
-                }
-            });
-            // Lightly: they're shown as they look underneath.
-            frame.fill(&faces, Color { a: 0.06, ..HOVER });
-            let outline = Path::new(|p| {
-                for image in &images {
-                    for (a, b) in outline(document) {
-                        p.move_to(camera.to_screen(image.apply(document.vertex(a))));
-                        p.line_to(camera.to_screen(image.apply(document.vertex(b))));
-                    }
-                }
-            });
-            frame.stroke(&outline, stroke(BACKGROUND, 4.0));
-            frame.stroke(&outline, stroke(HOVER, 2.0));
-        }
-    }
-
     /// Stripes across `triangles` (world), on screen: one pattern over them
     /// all, so faces next to each other look one.
     fn hatch(&self, triangles: &[[Point; 3]]) -> Path {
@@ -1458,166 +1753,6 @@ impl Editor<'_> {
     /// A painted edge's width on screen: never too thin to see.
     pub(super) fn edge_width(&self, width: f32) -> f32 {
         (width * self.camera.zoom).max(1.0)
-    }
-
-    /// Highlights how the pending result differs from the current document:
-    /// added triangles in green; removed edges, and triangles squashed flat
-    /// (as the line they collapse into), in red; and in yellow where things
-    /// join up: vertices welded together, outline edges that become shared
-    /// (other than `source`) and outline edges cut where a vertex lands on
-    /// them.
-    pub(super) fn draw_changes(
-        &self,
-        frame: &mut Frame,
-        pending: &Pending,
-        source: Option<(VertexId, VertexId)>,
-    ) {
-        let Pending {
-            result, changes, ..
-        } = pending;
-        let before = self.document;
-        let screen = |v| self.camera.to_screen(result.vertex(v));
-        let segments = |edges: &[(VertexId, VertexId)]| {
-            Path::new(|p| {
-                for &(u, v) in edges {
-                    p.move_to(screen(u));
-                    p.line_to(screen(v));
-                }
-            })
-        };
-
-        let added = self.mesh(pending.added.iter().map(|t| t.map(|v| result.vertex(v))));
-        frame.fill(&added, Color { a: 0.2, ..ADDED });
-        frame.stroke(&added, stroke(ADDED, 1.5));
-
-        frame.stroke(
-            &segments(&removed_edges(before, pending)),
-            stroke(REMOVED, 2.0),
-        );
-
-        let squashed = Path::new(|p| {
-            for t in &changes.squashed {
-                let (from, to) = longest_edge(t.map(screen));
-                p.move_to(from);
-                p.line_to(to);
-            }
-        });
-        frame.stroke(&squashed, stroke(REMOVED, 3.0));
-
-        let (joined, rings) = self.joins(pending, source);
-        frame.stroke(&segments(&joined), stroke(JOINED, 4.0));
-        for v in rings {
-            frame.stroke(&Path::circle(screen(v), 10.0), stroke(JOINED, 2.5));
-        }
-    }
-
-    /// The shape `start` belongs to, to highlight.
-    pub(super) fn highlight(&self, start: VertexId) -> Highlight {
-        let mut triangles = self.document.connected(start);
-        for t in &mut triangles {
-            t.sort_unstable();
-        }
-        triangles.sort_unstable();
-        Highlight {
-            revision: self.document.revision(),
-            start,
-            outline: outline_of(&triangles),
-            triangles,
-        }
-    }
-
-    /// Highlights a `shape` (with its vertices where `document` has them):
-    /// a faint tint, and its outline with a soft glow. `strength` (0 to 1)
-    /// fades it.
-    pub(super) fn draw_shape(
-        &self,
-        frame: &mut Frame,
-        document: &Document,
-        shape: &Highlight,
-        strength: f32,
-    ) {
-        if strength <= 0.0 {
-            return;
-        }
-        let screen = |v| self.camera.to_screen(document.vertex(v));
-        let edges = Path::new(|p| {
-            for &(u, v) in &shape.outline {
-                p.move_to(screen(u));
-                p.line_to(screen(v));
-            }
-        });
-        let tint = self.mesh(
-            shape
-                .triangles
-                .iter()
-                .map(|t| t.map(|v| document.vertex(v))),
-        );
-        let faded = |a: f32| Color {
-            a: a * strength,
-            ..HOVER
-        };
-
-        frame.fill(&tint, faded(0.08));
-        frame.stroke(&edges, stroke(faded(0.2), 8.0));
-        frame.stroke(&edges, stroke(faded(1.0), 2.0));
-    }
-
-    /// Where the pending result joins things up: outline edges that become
-    /// shared (other than `source`) or are cut where a vertex lands on
-    /// them, and the vertices that join, as ids after it.
-    pub(super) fn joins(
-        &self,
-        pending: &Pending,
-        source: Option<(VertexId, VertexId)>,
-    ) -> (Vec<(VertexId, VertexId)>, Vec<VertexId>) {
-        let Pending {
-            result, changes, ..
-        } = pending;
-        let before = self.document;
-        let kept = |v| changes.kept(v);
-        let key = |(u, v): (VertexId, VertexId)| {
-            let (u, v) = (kept(u), kept(v));
-            (u.min(v), u.max(v))
-        };
-
-        let outline_before: Vec<_> = outline(before).into_iter().map(key).collect();
-        let interior_before: Vec<_> = interior(before).into_iter().map(key).collect();
-        let source = source.map(key);
-        let mut joined: Vec<_> = interior(result)
-            .into_iter()
-            .filter(|&e| Some(e) != source)
-            .filter(|e| outline_before.contains(e) && !interior_before.contains(e))
-            .collect();
-        let mut rings: Vec<VertexId> = joined.iter().flat_map(|&(u, v)| [u, v]).collect();
-        rings.extend(changes.welded.iter().map(|&(_, k)| kept(k)));
-        // Where added triangles attach to existing vertices; the ends of the
-        // source edge are no news.
-        rings.extend(
-            changes
-                .attached
-                .iter()
-                .map(|&v| kept(v))
-                .filter(|&v| source.is_none_or(|(a, b)| v != a && v != b)),
-        );
-
-        // A vertex landing on an outline edge it wasn't connected to.
-        let connected = |w, x| {
-            before
-                .triangle_ids()
-                .iter()
-                .any(|t| t.iter().any(|&v| kept(v) == w) && t.iter().any(|&v| kept(v) == x))
-        };
-        for &(a, b, w) in &changes.cut {
-            let edge = (a.min(b), a.max(b));
-            if outline_before.contains(&edge) && !connected(w, a) && !connected(w, b) {
-                joined.extend([(a, w), (w, b)]);
-                rings.push(w);
-            }
-        }
-        rings.sort_unstable();
-        rings.dedup();
-
-        (joined, rings)
     }
 
     pub(super) fn mesh(&self, triangles: impl Iterator<Item = [Point; 3]>) -> Path {
@@ -1683,9 +1818,9 @@ mod tests {
             .collect();
         assert_eq!(all, (5..=10).collect::<Vec<_>>());
         // By going through them all, then (drawn again) by place: the same.
-        derived.uses.set(1);
+        derived.uses.store(1, Ordering::Relaxed);
         assert_eq!(derived.visible(&document, &seen), all);
-        derived.uses.set(2);
+        derived.uses.store(2, Ordering::Relaxed);
         assert_eq!(derived.visible(&document, &seen), all);
         assert!(derived.index.get().is_some_and(Option::is_some));
     }

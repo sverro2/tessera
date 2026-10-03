@@ -792,8 +792,8 @@ fn bench_face_meshes() {
         for doc in &docs {
             let mut editor = super::tests::editor(doc, &cache);
             editor.camera = camera;
-            let seen = editor.view(&frame, 0.0);
-            let derived = editor.derived(doc);
+            let seen = editor.painter().view(&frame, 0.0);
+            let derived = editor.painter().derived(doc);
             let visible = derived.visible(doc, &seen);
             for (color, triangles) in painted_faces(doc, &visible, derived.colors(doc)) {
                 frame.fill(&editor.mesh(triangles.into_iter()), color);
