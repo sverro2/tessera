@@ -58,7 +58,7 @@ pub fn edge_fades(
         .collect()
 }
 
-fn average(colors: &[Color]) -> Color {
+pub(crate) fn average(colors: &[Color]) -> Color {
     let n = colors.len() as f32;
     let sum = |f: fn(&Color) -> f32| colors.iter().map(f).sum::<f32>() / n;
     Color::from_rgba(sum(|c| c.r), sum(|c| c.g), sum(|c| c.b), sum(|c| c.a))

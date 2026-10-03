@@ -283,10 +283,12 @@ impl Editor<'_> {
             .find_map(|at| Some((at, attempt(at)?)));
 
         // Those that would do (where they come closest), nearest first.
+        // Only as many as are shown: trying each takes a while.
         let fine: Vec<Guide> = near
             .iter()
             .filter(|&&(_, closest)| attempt(closest).is_some())
             .map(|&(guide, _)| guide)
+            .take(GUIDES_SHOWN)
             .collect();
         Some((fine, all_near, found))
     }
@@ -368,6 +370,8 @@ impl Editor<'_> {
                     .filter(|&&(_, closest)| attempt(self.dragged_corner(from, closest)).is_some()),
             )
             .map(|&(guide, _)| guide)
+            // Only as many as are shown: trying each takes a while.
+            .take(GUIDES_SHOWN)
             .collect();
         (fine, all_near, found)
     }
@@ -438,10 +442,12 @@ impl Editor<'_> {
         let found = candidates
             .into_iter()
             .find_map(|by| Some((from + by, attempt(by)?)));
+        // Only as many as are shown: trying each takes a while.
         let fine = near
             .into_iter()
             .filter(|&(_, by)| attempt(by).is_some())
             .map(|(guide, _)| guide)
+            .take(GUIDES_SHOWN)
             .collect();
         (fine, all_near, found)
     }

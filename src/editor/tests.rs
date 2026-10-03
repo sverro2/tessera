@@ -1752,6 +1752,54 @@ fn the_hovered_shape_stays_until_another_is_hovered() {
 }
 
 #[test]
+fn a_highlight_from_another_drawing_is_dropped() {
+    let doc = two_apart();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+    let mut state = State::default();
+    let cursor = |x, y| mouse::Cursor::Available(Point::new(x, y));
+    // The right triangle (vertices 3–5) highlighted, the left fading out.
+    editor.update(
+        &mut state,
+        &Event::Mouse(MOVE),
+        bounds,
+        cursor(150.0, 270.0),
+    );
+    editor.update(
+        &mut state,
+        &Event::Mouse(MOVE),
+        bounds,
+        cursor(300.0, 270.0),
+    );
+    assert!(matches!(state.fading, Some((Some(_), _))));
+
+    // Another drawing (opened, or another layer) with fewer vertices: no
+    // shape to find from vertex 3, so no highlight (not a panic).
+    let mut smaller = Document::default();
+    smaller.apply(Edit::AddTriangle {
+        corners: [
+            Point::new(500.0, 500.0),
+            Point::new(560.0, 500.0),
+            Point::new(530.0, 450.0),
+        ],
+        snap: 0.0,
+    });
+    let editor = super::tests::editor(&smaller, &cache);
+    editor.update(
+        &mut state,
+        &Event::Mouse(MOVE),
+        bounds,
+        cursor(700.0, 100.0),
+    );
+    assert!(state.shape.is_none());
+    assert!(
+        matches!(state.fading, Some((Some(_), _))),
+        "vertex 0 is there"
+    );
+}
+
+#[test]
 fn a_shape_is_everything_connected_through_vertices() {
     let mut doc = two_apart();
     assert_eq!(doc.connected(0).len(), 1);
@@ -2340,7 +2388,7 @@ fn with_ctrl_a_dragged_point_lands_on_the_grid() {
 
     let doc = one();
     let cache = Caches::default();
-    let mut editor = editor(&doc, &cache);
+    let editor = editor(&doc, &cache);
     // A new triangle's corner.
     let Interaction::Creating { to, .. } = drag_to(&editor, (500.0, 400.0), (533.0, 417.0), ctrl)
     else {

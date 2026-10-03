@@ -19,15 +19,20 @@
 //! pieces of a split face keep its colour. Likewise an edge keeps its style
 //! while it keeps its ends, and pieces of a styled edge (cut, say) keep it.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use iced::{Color, Point};
+use iced::{Color, Point, Vector};
 
 use crate::geometry::{Affine, area2, min_height, overlap};
 
+mod cells;
 mod fill;
+mod quick;
+
+use cells::Cells;
+use quick::QuickSet;
 
 /// Index of a vertex in [`Document::vertices`].
 pub type VertexId = usize;
@@ -330,21 +335,39 @@ impl Document {
     /// The triangles of the shape `vertex` belongs to: all those reachable
     /// through shared vertices.
     pub fn connected(&self, vertex: VertexId) -> Vec<[VertexId; 3]> {
-        let mut reached = vec![vertex];
-        let mut shape: Vec<[VertexId; 3]> = Vec::new();
-        let mut grew = true;
-
-        while grew {
-            grew = false;
-            for t in &self.triangles {
-                if !shape.contains(t) && t.iter().any(|v| reached.contains(v)) {
-                    shape.push(*t);
-                    reached.extend(t);
-                    grew = true;
+        // One there isn't (of another drawing, say) is in no shape.
+        if vertex >= self.vertices.len() {
+            return Vec::new();
+        }
+        // Each vertex's triangles, then out from `vertex` through them.
+        let mut around: Vec<Vec<TriangleId>> = vec![Vec::new(); self.vertices.len()];
+        for (i, t) in self.triangles.iter().enumerate() {
+            for &v in t {
+                around[v].push(i);
+            }
+        }
+        let mut reached = vec![false; self.vertices.len()];
+        let mut in_shape = vec![false; self.triangles.len()];
+        let mut next = vec![vertex];
+        reached[vertex] = true;
+        while let Some(v) = next.pop() {
+            for &i in &around[v] {
+                if std::mem::replace(&mut in_shape[i], true) {
+                    continue;
+                }
+                for &w in &self.triangles[i] {
+                    if !std::mem::replace(&mut reached[w], true) {
+                        next.push(w);
+                    }
                 }
             }
         }
-        shape
+        // In the order they're in.
+        self.triangles
+            .iter()
+            .zip(in_shape)
+            .filter_map(|(&t, inside)| inside.then_some(t))
+            .collect()
     }
 
     /// All edges, as vertex id pairs. Shared edges appear once per triangle.
@@ -364,10 +387,16 @@ impl Document {
 
     /// Vertices used by triangles, each once, sorted.
     pub fn unique_vertices(&self) -> Vec<VertexId> {
-        let mut used: Vec<_> = self.used_vertices().collect();
-        used.sort_unstable();
-        used.dedup();
-        used
+        // Marked, then gathered in order: quicker than sorting them all.
+        let mut marked = vec![false; self.vertices.len()];
+        for v in self.used_vertices() {
+            marked[v] = true;
+        }
+        marked
+            .iter()
+            .enumerate()
+            .filter_map(|(v, &used)| used.then_some(v))
+            .collect()
     }
 
     /// The number of vertices used by triangles.
@@ -446,24 +475,43 @@ impl Document {
             return false;
         }
 
-        let existed: HashSet<[VertexId; 3]> = before.triangles.iter().map(|&t| key(t)).collect();
+        // The same faces as before (moved, say): none new.
+        let existed: Option<QuickSet<[VertexId; 3]>> = (self.triangles != before.triangles)
+            .then(|| before.triangles.iter().map(|&t| key(t)).collect());
         let changed = |t: &[VertexId; 3]| {
-            !existed.contains(&key(*t))
-                || t.iter()
-                    .any(|&v| before.vertices.get(v) != Some(&self.vertices[v]))
+            t.iter()
+                .any(|&v| before.vertices.get(v) != Some(&self.vertices[v]))
+                || existed
+                    .as_ref()
+                    .is_some_and(|existed| !existed.contains(&key(*t)))
         };
 
-        self.triangle_ids()
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| changed(t))
-            .all(|(i, t)| {
-                let points = t.map(|v| self.vertices[v]);
-                self.triangle_ids()
-                    .iter()
-                    .enumerate()
-                    .all(|(j, u)| i == j || !overlap(points, u.map(|v| self.vertices[v])))
-            })
+        let changed: Vec<usize> = (0..self.triangles.len())
+            .filter(|&i| changed(&self.triangles[i]))
+            .collect();
+        let corners = |i: usize| self.triangles[i].map(|v| self.vertices[v]);
+        // Each against those it may reach: with many, those in the cells it
+        // touches; with a few, all of them.
+        let faces = (changed.len() > FEW).then(|| Cells::of_shapes(self.triangles()));
+        changed.into_iter().all(|i| {
+            let points = corners(i);
+            let (min, max) = cells::bounds(points.into_iter());
+            // Quickly apart by their bounds, else not overlapping.
+            let clear = |j: usize| {
+                let other = corners(j);
+                let (umin, umax) = cells::bounds(other.into_iter());
+                i == j
+                    || umax.x < min.x
+                    || max.x < umin.x
+                    || umax.y < min.y
+                    || max.y < umin.y
+                    || !overlap(points, other)
+            };
+            match &faces {
+                Some(faces) => faces.within(min, max).all(clear),
+                None => (0..self.triangles.len()).all(clear),
+            }
+        })
     }
 
     /// Applies several edits as one: all of them, or none if any is rejected.
@@ -527,22 +575,7 @@ impl Document {
                 return None;
             }
             if paint {
-                // A mirror image takes its paint from what it mirrors; a
-                // pasted piece brings its own.
-                let added;
-                let source = match edit {
-                    Edit::Mirror { mirror } => {
-                        added = document.with_reflection(*mirror);
-                        &added
-                    }
-                    Edit::Paste { piece } => {
-                        added = document.with_piece(piece);
-                        &added
-                    }
-                    _ => &document,
-                };
-                next.inherit_colors(source);
-                next.inherit_edge_styles(source);
+                document.paint_after(edit, &mut next);
             }
             document = next;
         }
@@ -550,10 +583,35 @@ impl Document {
         Some((document, changes))
     }
 
+    /// Paints `shaped`, what `edit` made of this document (shape only, as
+    /// [`Self::preview_shape_until`] leaves it), as [`Self::preview`] would.
+    pub fn paint_after(&self, edit: &Edit, shaped: &mut Document) {
+        // The same faces (moved, say): the same paint, as it came along.
+        if shaped.triangles == self.triangles {
+            return;
+        }
+        // A mirror image takes its paint from what it mirrors; a pasted
+        // piece brings its own.
+        let added;
+        let source = match edit {
+            Edit::Mirror { mirror } => {
+                added = self.with_reflection(*mirror);
+                &added
+            }
+            Edit::Paste { piece } => {
+                added = self.with_piece(piece);
+                &added
+            }
+            _ => self,
+        };
+        shaped.inherit_colors(source);
+        shaped.inherit_edge_styles(source);
+    }
+
     /// The faces with all their corners among `vertices`, as a piece
     /// apart, painted alike (edges both of whose ends are in it too).
     pub fn piece(&self, vertices: &[VertexId]) -> Piece {
-        let inside: HashSet<VertexId> = vertices.iter().copied().collect();
+        let inside: QuickSet<VertexId> = vertices.iter().copied().collect();
         let mut index: BTreeMap<VertexId, usize> = BTreeMap::new();
         let mut piece = Piece::default();
         for &t in &self.triangles {
@@ -742,10 +800,13 @@ impl Document {
                 // A face landing right on one there is would be welded onto
                 // it, and dropped as the same: it lies over it all the same.
                 let same = |p: Point, q: Point| p.distance(q) <= tolerance(0.0);
+                let faces = Cells::of_shapes(self.triangles());
                 let on_one = piece.triangles.iter().any(|t| {
                     let corners = t.map(|v| piece.vertices[v]);
-                    self.triangles()
-                        .any(|u| corners.iter().all(|&p| u.iter().any(|&q| same(p, q))))
+                    faces.around(corners[0], tolerance(0.0)).any(|u| {
+                        let u = self.triangles[u].map(|v| self.vertices[v]);
+                        corners.iter().all(|&p| u.iter().any(|&q| same(p, q)))
+                    })
                 });
                 fine && !on_one && {
                     *self = self.with_piece(&piece);
@@ -814,21 +875,41 @@ impl Document {
         let on = |p: Point, a: Point, b: Point| {
             crate::geometry::closest_on_segment(p, a, b).1 <= tolerance(a.distance(b))
         };
+        // To find those new edges lie along: with many new ones, sorted into
+        // cells first.
+        let edges = self.unique_edges();
+        let new = edges
+            .iter()
+            .filter(|edge| existed.binary_search(edge).is_err())
+            .count();
+        let near = (new > FEW).then(|| {
+            Cells::of_shapes(
+                existed
+                    .iter()
+                    .map(|&(a, b)| [before.vertices[a], before.vertices[b]]),
+            )
+        });
 
-        self.edge_styles = self
-            .unique_edges()
+        self.edge_styles = edges
             .into_iter()
             .filter_map(|edge| {
                 let style = if existed.binary_search(&edge).is_ok() {
                     self.edge_styles.get(&edge).copied()
                 } else {
                     let (p, q) = (self.vertices[edge.0], self.vertices[edge.1]);
-                    let along = existed.iter().find(|&&(a, b)| {
+                    let lies_along = |&(a, b): &(VertexId, VertexId)| {
                         let (a, b) = (before.vertices[a], before.vertices[b]);
                         on(p, a, b) && on(q, a, b)
-                    });
+                    };
+                    let along = match &near {
+                        Some(near) => near
+                            .around(p, tolerance(p.distance(q)))
+                            .map(|i| existed[i])
+                            .find(lies_along),
+                        None => existed.iter().copied().find(lies_along),
+                    };
                     match along {
-                        Some(&(a, b)) => before.edge_style(a, b),
+                        Some((a, b)) => before.edge_style(a, b),
                         None => Some(DEFAULT_EDGE),
                     }
                 };
@@ -842,7 +923,15 @@ impl Document {
     /// their centre; none, if erased); new faces in empty space, the
     /// default. Colours of faces gone are dropped.
     fn inherit_colors(&mut self, before: &Document) {
-        let existed: BTreeSet<_> = before.triangles.iter().map(|&t| key(t)).collect();
+        let existed: QuickSet<_> = before.triangles.iter().map(|&t| key(t)).collect();
+        // To find the face a new one lay in: with many new ones, sorted into
+        // cells first.
+        let new = self
+            .triangles
+            .iter()
+            .filter(|&&t| !existed.contains(&key(t)))
+            .count();
+        let faces = (new > FEW).then(|| Cells::of_shapes(before.triangles()));
 
         self.colors = self
             .triangles
@@ -854,7 +943,17 @@ impl Document {
                 } else {
                     let [a, b, c] = t.map(|v| self.vertices[v]);
                     let centre = Point::new((a.x + b.x + c.x) / 3.0, (a.y + b.y + c.y) / 3.0);
-                    match before.triangle_at(centre) {
+                    // The first containing it, as `triangle_at` finds.
+                    let lay_in = match &faces {
+                        Some(faces) => faces
+                            .around(centre, 0.0)
+                            .filter(|&u| {
+                                contains(before.triangles[u].map(|v| before.vertices[v]), centre)
+                            })
+                            .min(),
+                        None => before.triangle_at(centre),
+                    };
+                    match lay_in {
                         Some(u) => before.color(u),
                         None => Some(DEFAULT_FACE),
                     }
@@ -1002,9 +1101,16 @@ impl Document {
     fn normalize(&mut self, moved: &[VertexId], changes: &mut Changes, before: &Document) -> bool {
         let used = self.unique_vertices();
         let changed = Changed::since(self, before);
+        // Sorted into cells only when many changed: for a few, going
+        // through them all is quicker.
+        let near = (changed.vertices.len() > MANY).then(|| Cells::of_points(&self.vertices, &used));
 
         for &u in &changed.vertices {
-            for &v in &used {
+            let candidates: Vec<VertexId> = match &near {
+                Some(near) => near.around(self.vertices[u], tolerance(0.0)).collect(),
+                None => used.clone(),
+            };
+            for v in candidates {
                 if u == v || self.vertices[u].distance(self.vertices[v]) > tolerance(0.0) {
                     continue;
                 }
@@ -1030,7 +1136,7 @@ impl Document {
 
         // Welding squashes the triangles that had both, and may leave
         // duplicates (two triangles folded onto each other).
-        let mut seen: HashSet<[VertexId; 3]> = HashSet::new();
+        let mut seen: QuickSet<[VertexId; 3]> = QuickSet::default();
         let mut squashed = Vec::new();
         self.triangles.retain(|&t| {
             let key = key(t);
@@ -1065,8 +1171,14 @@ impl Document {
     ) -> bool {
         let limit = 4 * (self.triangles.len() + self.vertices.len());
 
+        // Splitting adds no vertices: what's used (and where) only changes
+        // when flat triangles go.
+        let mut used = Vec::new();
+        let mut near = None;
+        let mut stale = true;
         for _ in 0..limit {
             let vertices = &self.vertices;
+            let count = self.triangles.len();
             self.triangles.retain(|&t| {
                 let flat = is_flat(t.map(|v| vertices[v]));
                 if flat {
@@ -1074,25 +1186,51 @@ impl Document {
                 }
                 !flat
             });
-
-            let used = self.unique_vertices();
+            if stale || self.triangles.len() != count {
+                used = self.unique_vertices();
+                // Sorted into cells only when many changed (or all count):
+                // for a few, going through them is quicker.
+                near = changed
+                    .is_none_or(|changed| changed.vertices.len() > MANY)
+                    .then(|| Cells::of_points(&self.vertices, &used));
+                stale = false;
+            }
             let vertices = &self.vertices;
             let junction = self.triangles.iter().enumerate().find_map(|(i, &t)| {
                 // An unchanged triangle can only have gained a changed
                 // vertex on its edges.
-                let candidates: &[VertexId] = match changed {
-                    Some(changed) if !changed.triangle(t) => &changed.vertices,
-                    _ => &used,
-                };
+                let only_changed = changed.filter(|changed| !changed.triangle(t));
                 (0..3).find_map(|k| {
                     let (u, v, x) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
+                    let (a, b) = (vertices[u], vertices[v]);
+                    let candidates: Box<dyn Iterator<Item = VertexId>> = match (&near, only_changed)
+                    {
+                        (Some(near), _) => {
+                            let reach = tolerance(a.distance(b));
+                            let reach = Vector::new(reach, reach);
+                            let min = Point::new(a.x.min(b.x), a.y.min(b.y)) - reach;
+                            let max = Point::new(a.x.max(b.x), a.y.max(b.y)) + reach;
+                            Box::new(near.within(min, max).filter(move |&w| {
+                                only_changed.is_none_or(|changed| changed.vertex(w))
+                            }))
+                        }
+                        (None, Some(changed)) => Box::new(changed.vertices.iter().copied()),
+                        (None, None) => Box::new(used.iter().copied()),
+                    };
+                    // Quickly out of its bounds, then really on it.
+                    let reach = tolerance(a.distance(b));
+                    let (min, max) = (
+                        Point::new(a.x.min(b.x) - reach, a.y.min(b.y) - reach),
+                        Point::new(a.x.max(b.x) + reach, a.y.max(b.y) + reach),
+                    );
                     candidates
-                        .iter()
-                        .copied()
-                        .find(|&w| {
-                            !t.contains(&w)
-                                && is_inside_segment(vertices[w], vertices[u], vertices[v])
+                        .filter(|&w| {
+                            let p = vertices[w];
+                            min.x <= p.x && p.x <= max.x && min.y <= p.y && p.y <= max.y
                         })
+                        .filter(|&w| !t.contains(&w) && is_inside_segment(vertices[w], a, b))
+                        // The lowest, as going through them in order would.
+                        .min()
                         .map(|w| (i, (u, v, w), [u, w, x], [w, v, x]))
                 })
             });
@@ -1123,12 +1261,7 @@ impl Document {
 
     /// The triangle containing `point` (on its boundary counts), if any.
     pub fn triangle_at(&self, point: Point) -> Option<TriangleId> {
-        self.triangles().position(|[a, b, c]| {
-            // Triangles are wound positively, so inside is left of each edge.
-            [(a, b), (b, c), (c, a)]
-                .into_iter()
-                .all(|(u, v)| area2(u, v, point) >= 0.0)
-        })
+        self.triangles().position(|t| contains(t, point))
     }
 
     /// Finds a triangle with these corners, in any order.
@@ -1146,8 +1279,11 @@ impl Document {
 /// What changed in a document since `before`: the vertices that are new or
 /// moved, and (to tell the triangles that are new) the triangles before.
 pub(super) struct Changed {
+    /// Sorted.
     vertices: Vec<VertexId>,
-    before: HashSet<[VertexId; 3]>,
+    /// The triangles before (sorted corners); `None` if they're the same as
+    /// now (nothing new: only moved, say).
+    before: Option<QuickSet<[VertexId; 3]>>,
 }
 
 impl Changed {
@@ -1157,16 +1293,45 @@ impl Changed {
             .into_iter()
             .filter(|&v| before.vertices.get(v) != Some(&document.vertices[v]))
             .collect();
+        let same = document.triangles == before.triangles;
         Changed {
             vertices,
-            before: before.triangles.iter().map(|&t| key(t)).collect(),
+            before: (!same).then(|| before.triangles.iter().map(|&t| key(t)).collect()),
         }
+    }
+
+    /// Whether triangle `t` is new: it wasn't there before.
+    fn is_new(&self, t: [VertexId; 3]) -> bool {
+        self.before
+            .as_ref()
+            .is_some_and(|before| !before.contains(&key(t)))
+    }
+
+    /// Whether vertex `v` is new, or moved.
+    fn vertex(&self, v: VertexId) -> bool {
+        self.vertices.binary_search(&v).is_ok()
     }
 
     /// Whether triangle `t` is new, or has a changed corner.
     fn triangle(&self, t: [VertexId; 3]) -> bool {
-        !self.before.contains(&key(t)) || t.iter().any(|v| self.vertices.contains(v))
+        t.iter().any(|&v| self.vertex(v)) || self.is_new(t)
     }
+}
+
+/// How many changed vertices make sorting all of them into [`Cells`] worth
+/// it, rather than going through them all for each.
+const MANY: usize = 64;
+
+/// How many new faces (or edges) make sorting those from before into
+/// [`Cells`] worth it, to find the one each lay in (or along).
+const FEW: usize = 16;
+
+/// Whether the positively wound triangle `t` contains `point` (on its
+/// boundary counts): it's left of each edge.
+fn contains([a, b, c]: [Point; 3], point: Point) -> bool {
+    [(a, b), (b, c), (c, a)]
+        .into_iter()
+        .all(|(u, v)| area2(u, v, point) >= 0.0)
 }
 
 /// A face's corners in a fixed order, to tell it by whichever corner comes

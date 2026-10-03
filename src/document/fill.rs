@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use iced::Point;
 
-use super::{Changes, Document, VertexId, is_flat};
+use super::{Changed, Changes, Document, VertexId, is_flat};
 use crate::geometry::{area2, closest_on_segment, min_height};
 
 /// Distance (world units) within which points count as coinciding, or as
@@ -105,17 +105,20 @@ impl Document {
     /// `outline` doesn't pass through yet: bending it through there avoids
     /// that piece.
     fn thin_piece(&self, before: &Document, snap: f32, outline: &[Point]) -> Option<VertexId> {
+        // Only what the fill changed can have T-junctions (`before` has
+        // none), and only its new triangles can be thin.
+        let changed = Changed::since(self, before);
         let mut after = self.clone();
-        after.split_t_junctions(&mut Default::default(), None);
+        after.split_t_junctions(&mut Default::default(), Some(&changed));
         let used = before.unique_vertices();
 
         after
             .triangle_ids()
             .iter()
-            .filter(|&&t| before.find_triangle(t).is_none())
+            .filter(|&&t| changed.is_new(t))
             .filter(|t| min_height(t.map(|v| after.vertices[v])) < snap)
             .flat_map(|t| t.iter().copied())
-            .find(|v| used.contains(v) && !outline.contains(&after.vertices[*v]))
+            .find(|v| used.binary_search(v).is_ok() && !outline.contains(&after.vertices[*v]))
     }
 
     /// Covers the part of the polygon `outline` that no triangle covers yet;

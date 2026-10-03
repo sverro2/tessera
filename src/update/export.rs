@@ -60,11 +60,13 @@ impl Tessera {
             }
             ExportMessage::ExportPng => {
                 self.export_open = None;
-                let svg = svg::export(&self.layers, self.export_page());
-                Task::perform(
-                    save_png(svg, self.png_scale.max(0.1), self.png_backdrop),
-                    |value| Message::Export(ExportMessage::Exported(value)),
-                )
+                let scale = self.png_scale.max(0.1);
+                // Seals as wide in the image whatever its scale.
+                let seal = svg::SEAL_PIXELS / scale;
+                let svg = svg::export_sealed(&self.layers, self.export_page(), seal);
+                Task::perform(save_png(svg, scale, self.png_backdrop), |value| {
+                    Message::Export(ExportMessage::Exported(value))
+                })
             }
             ExportMessage::Exported(result) => {
                 match result {

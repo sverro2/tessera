@@ -849,15 +849,21 @@ impl Editor<'_> {
     /// changed, the selection (only the shape mode's, of vertices still
     /// there).
     fn keep_up(&self, state: &mut State) {
-        // After an edit, the highlighted shapes may have grown or shrunk.
+        // After an edit, the highlighted shapes may have grown or shrunk;
+        // gone, if what they were found from is (undone, say, or another
+        // layer or drawing now).
         let revision = self.document.revision();
-        let previous = state
-            .fading
-            .as_mut()
-            .and_then(|(previous, _)| previous.as_mut());
-        for shape in state.shape.iter_mut().chain(previous) {
-            if shape.revision != revision {
-                *shape = self.highlight(shape.start);
+        let mut used = None;
+        let previous = state.fading.as_mut().map(|(previous, _)| previous);
+        for slot in std::iter::once(&mut state.shape).chain(previous) {
+            if let Some(shape) = slot.as_ref()
+                && shape.revision != revision
+            {
+                let used = used.get_or_insert_with(|| self.document.unique_vertices());
+                *slot = used
+                    .binary_search(&shape.start)
+                    .is_ok()
+                    .then(|| self.highlight(shape.start));
             }
         }
         // Proportional editing changed (reaching further, say, or zoomed):
@@ -2143,7 +2149,7 @@ impl Editor<'_> {
             return None;
         }
         // The shape first: the paint only once it's taken (see below).
-        let (result, _) = self
+        let (result, changes) = self
             .document
             .preview_shape_until(&edits, self.deadline.get())?;
 
@@ -2172,8 +2178,16 @@ impl Editor<'_> {
                 return None;
             }
         }
-        // Taken: now with its paint (the same again, so it works out).
-        let (result, changes) = self.document.preview_until(&edits, None)?;
+        // Taken: now with its paint. One edit's is worked out on its shape;
+        // several are made again, each painted after the one before.
+        let (result, changes) = match &edits[..] {
+            [edit] => {
+                let mut result = result;
+                self.document.paint_after(edit, &mut result);
+                (result, changes)
+            }
+            _ => self.document.preview_until(&edits, None)?,
+        };
         let added = new_triangles(self.document, &result, &|v| changes.kept(v)).collect();
         Some(Pending {
             edits,
@@ -2670,7 +2684,7 @@ fn new_triangles<'a>(
         t.sort_unstable();
         t
     };
-    let existing: Vec<_> = before.triangle_ids().iter().map(key).collect();
+    let existing: std::collections::HashSet<_> = before.triangle_ids().iter().map(key).collect();
 
     after
         .triangle_ids()

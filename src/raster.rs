@@ -135,6 +135,43 @@ mod tests {
             document
         });
 
+        // Two faces sharing an edge, nothing behind: where they meet, the
+        // seal leaves no see-through line (unsealed, there is one).
+        let mut square = Document::default();
+        for corners in [
+            [
+                Point::new(0.0, 0.0),
+                Point::new(40.0, 0.0),
+                Point::new(40.0, 40.0),
+            ],
+            [
+                Point::new(0.0, 0.0),
+                Point::new(40.0, 40.0),
+                Point::new(0.0, 40.0),
+            ],
+        ] {
+            square.apply(Edit::AddTriangle { corners, snap: 0.0 });
+        }
+        square.apply(Edit::PaintAll {
+            color: Some(Color::from_rgb8(255, 0, 0)),
+        });
+        square.apply(Edit::PaintAllEdges { style: None });
+        let mut two = Layers::default();
+        let only = two.first_layer();
+        two.layer_mut(only).unwrap().document = std::sync::Arc::new(square);
+        let on_the_seam = |seal: f32| {
+            let svg = crate::svg::export_sealed(&two, None, seal);
+            let png = super::png(&svg, 1.0, Backdrop::Transparent).unwrap();
+            let image = image::load_from_memory(&png).unwrap().to_rgba8();
+            // (Ten pixels of room all round.)
+            (5..35)
+                .map(|i| image.get_pixel(10 + i, 10 + i).0[3])
+                .min()
+                .unwrap()
+        };
+        assert!(on_the_seam(0.0) < 250, "unsealed, see-through");
+        assert_eq!(on_the_seam(crate::svg::SEAL_PIXELS), 255);
+
         // A hidden layer isn't in it, as in the SVG.
         layers.set_visible(first, false);
         let png = super::png(&crate::svg::export(&layers, None), 2.0, Backdrop::White).unwrap();
