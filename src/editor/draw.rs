@@ -108,6 +108,24 @@ pub(super) fn draw_grid(frame: &mut Frame, camera: Camera, grid: Grid) {
     frame.fill(&dots, GRID_DOT);
 }
 
+/// The dashes of a line from `a` to `b`: `on` long, `off` apart, from `a`.
+/// Drawn ourselves, as a dashed stroke dashes a path as one line: from the
+/// end of one of its pieces right on to the start of the next.
+pub(super) fn dashes(a: Point, b: Point, on: f32, off: f32) -> Vec<(Point, Point)> {
+    let length = a.distance(b);
+    if length == 0.0 {
+        return Vec::new();
+    }
+    let along = (b - a) * (1.0 / length);
+    let mut dashes = Vec::new();
+    let mut at = 0.0;
+    while at < length {
+        dashes.push((a + along * at, a + along * (at + on).min(length)));
+        at += on + off;
+    }
+    dashes
+}
+
 /// The painted faces `seen` says, by colour.
 pub(super) fn painted_faces(
     document: &Document,
@@ -723,23 +741,19 @@ impl Editor<'_> {
             return;
         }
 
-        // Unpainted edges dashed, thin: not exported either.
-        let dashed = Stroke {
-            line_dash: LineDash {
-                segments: &[4.0, 4.0],
-                offset: 0,
-            },
-            ..stroke(Color { a: 0.5, ..EDGE }, 1.0)
-        };
+        // Unpainted edges dashed, thin: not exported either. Each edge's
+        // dashes its own (see `dashes`).
         let unpainted = Path::new(|p| {
             for (a, b) in document.unique_edges() {
                 if document.edge_style(a, b).is_none() && shows(a, b) {
-                    p.move_to(screen(a));
-                    p.line_to(screen(b));
+                    for (from, to) in dashes(screen(a), screen(b), 4.0, 4.0) {
+                        p.move_to(from);
+                        p.line_to(to);
+                    }
                 }
             }
         });
-        frame.stroke(&unpainted, dashed);
+        frame.stroke(&unpainted, stroke(Color { a: 0.5, ..EDGE }, 1.0));
 
         // The painted edges, each its own outline, so edges of different
         // widths meet without lying over each other.
