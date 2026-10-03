@@ -132,192 +132,128 @@ impl Editor<'_> {
         inside: Option<Point>,
         screen: Option<Point>,
     ) -> Option<canvas::Action<Message>> {
-        // What a key pressed does here, as the user has it.
-        let pressed = match event {
+        match event {
+            keyboard::Event::ModifiersChanged(modifiers) => {
+                self.on_modifiers(state, *modifiers, screen)
+            }
+            keyboard::Event::KeyReleased {
+                key, physical_key, ..
+            } => self.on_key_released(state, key, *physical_key, screen),
             keyboard::Event::KeyPressed {
                 key,
                 physical_key,
                 modifiers,
+                repeat,
                 ..
-            } => self.pressed(key, *physical_key, *modifiers),
-            _ => None,
-        };
-
-        match event {
-            keyboard::Event::ModifiersChanged(modifiers) => {
-                state.modifiers = *modifiers;
-                if self.tool == Tool::Shape {
-                    // Shift or Ctrl down or up mid-drag: guides or the grid on
-                    // or off.
-                    if matches!(
-                        state.interaction,
-                        Interaction::Creating { .. }
-                            | Interaction::MovingVertex { .. }
-                            | Interaction::Extending { .. }
-                            | Interaction::LeavingFace { .. }
-                            | Interaction::Extruding { .. }
-                            | Interaction::MovingSelection { .. }
-                            | Interaction::Pasting { .. }
-                    ) && state.tweaking.is_none()
-                        && let Some(pos) = screen
-                    {
-                        state.aim = Some(self.camera.to_world(pos));
-                    }
-                    return Some(canvas::Action::request_redraw());
-                }
-                // Holding Ctrl turns the brush into the pipette.
-                matches!(self.tool, Tool::Paint { .. }).then(canvas::Action::request_redraw)
-            }
-            // Holding the reach key (Shift+O) editing proportionally tweaks
-            // how far that reaches; what's being moved stays meanwhile.
-            keyboard::Event::KeyPressed { repeat, .. }
-                if pressed == Some(Action::Reach)
-                    && self.tool == Tool::Shape
-                    && self.proportional.is_some() =>
-            {
-                if !repeat && state.tweaking.is_none() {
-                    let at = screen?;
-                    state.tweaking = Some(Tweak {
-                        what: Tweaking::Reach,
-                        at,
-                        last: at,
-                    });
-                }
-                Some(canvas::Action::request_redraw().and_capture())
-            }
-            // Holding the lightness key (C) while painting (with a colour)
-            // tweaks how light it is; holding the width key (W) while
-            // painting edges, how wide. The face or edge previewed stays
-            // meanwhile.
-            keyboard::Event::KeyPressed { repeat, .. }
-                if (pressed == Some(Action::Lightness)
-                    && matches!(
-                        self.tool,
-                        Tool::Paint {
-                            brush: Brush::Color(_),
-                            ..
-                        }
-                    ))
-                    || (pressed == Some(Action::Width) && self.paints_edges()) =>
-            {
-                if !repeat && state.tweaking.is_none() {
-                    let what = if pressed == Some(Action::Width) {
-                        Tweaking::Width
-                    } else {
-                        Tweaking::Lightness
-                    };
-                    state.tweaking = Some(Tweak {
-                        what,
-                        at: inside?,
-                        last: inside?,
-                    });
-                }
-                Some(canvas::Action::request_redraw().and_capture())
-            }
-            keyboard::Event::KeyReleased {
-                key, physical_key, ..
-            } if state.tweaking.is_some_and(|tweak| {
-                let action = match tweak.what {
-                    Tweaking::Lightness => Action::Lightness,
-                    Tweaking::Width => Action::Width,
-                    Tweaking::Reach => Action::Reach,
-                };
-                self.keys.is_some_and(|keys| {
-                    Chord::pressed(key, *physical_key, keyboard::Modifiers::empty())
-                        .is_some_and(|chord| keys.releases(&chord, action))
-                })
-            }) =>
-            {
-                // Done reaching: what's being moved goes on from where the
-                // cursor is.
-                if state
-                    .tweaking
-                    .take()
-                    .is_some_and(|tweak| tweak.what == Tweaking::Reach)
-                    && let Some(pos) = screen
+            } => {
+                if *key == keyboard::Key::Named(keyboard::key::Named::Escape)
+                    && let Some(action) = self.on_escape(state)
                 {
-                    rebase(&mut state.interaction, self.camera.to_world(pos));
+                    return Some(action);
                 }
-                Some(canvas::Action::request_redraw().and_capture())
+                // What it does here, as the user has it.
+                let action = self.pressed(key, *physical_key, *modifiers)?;
+                self.on_action(state, action, *repeat, inside, screen)
             }
-            // Copy (Ctrl+C) copies the selected faces, cut (Ctrl+X) cuts
-            // them; paste (Ctrl+V) picks up a copy of what was copied, to put
-            // down with a click.
-            keyboard::Event::KeyPressed { .. }
-                if self.tool == Tool::Shape
-                    && self.shown
-                    && matches!(state.interaction, Interaction::Idle)
-                    && matches!(
-                        pressed,
-                        Some(Action::Copy | Action::CutFaces | Action::Paste)
-                    ) =>
+        }
+    }
+
+    /// The modifiers held changed: in the shape mode mid-drag, Shift or
+    /// Ctrl down or up turns guides or the grid on or off; painting, Ctrl
+    /// turns the brush into the pipette.
+    fn on_modifiers(
+        &self,
+        state: &mut State,
+        modifiers: keyboard::Modifiers,
+        screen: Option<Point>,
+    ) -> Option<canvas::Action<Message>> {
+        state.modifiers = modifiers;
+        if self.tool == Tool::Shape {
+            if matches!(
+                state.interaction,
+                Interaction::Creating { .. }
+                    | Interaction::MovingVertex { .. }
+                    | Interaction::Extending { .. }
+                    | Interaction::LeavingFace { .. }
+                    | Interaction::Extruding { .. }
+                    | Interaction::MovingSelection { .. }
+                    | Interaction::Pasting { .. }
+            ) && state.tweaking.is_none()
+                && let Some(pos) = screen
             {
-                if pressed == Some(Action::Copy) {
-                    let piece = self.document.piece(&state.selection);
-                    return (!piece.is_empty())
-                        .then(|| canvas::Action::publish(Message::Copy(piece)).and_capture());
-                }
-                if pressed == Some(Action::CutFaces) {
-                    let piece = self.document.piece(&state.selection);
-                    if piece.is_empty() {
-                        return None;
-                    }
-                    // The faces copied: those with all corners selected
-                    // (last first, so the others keep their places).
-                    let edits = self
-                        .document
-                        .triangle_ids()
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .filter(|(_, t)| t.iter().all(|v| state.selection.contains(v)))
-                        .map(|(triangle, _)| Edit::RemoveTriangle { triangle })
-                        .collect();
-                    let revision = self.document.revision();
-                    return Some(
-                        canvas::Action::publish(Message::Cut {
-                            piece,
-                            edits,
-                            revision,
-                        })
-                        .and_capture(),
-                    );
-                }
-                let piece = self.clipboard.filter(|piece| !piece.is_empty())?;
-                let at = self.camera.to_world(inside?);
-                // Right where it was copied from, if it fits there (on
-                // another layer, say); else in the middle of the cursor.
-                let paste = |by: Vector| {
-                    self.check(
-                        vec![Edit::Paste {
-                            piece: piece.moved(by),
-                        }],
-                        at,
-                    )
-                };
-                let (base, pending) = match paste(Vector::ZERO) {
-                    Some(pending) => (Vector::ZERO, Some(pending)),
-                    None => {
-                        let base = at - piece.centre();
-                        (base, paste(base))
-                    }
-                };
-                state.selection.clear();
-                state.interaction = Interaction::Pasting {
-                    base,
-                    from: at,
-                    to: at,
-                };
-                state.pending = pending;
-                Some(canvas::Action::request_redraw().and_capture())
+                state.aim = Some(self.camera.to_world(pos));
             }
-            // Framing (/): the shape, as seen (mirrored too), in view; one
-            // of another layer pointed at (even with this one hidden),
-            // switching to that layer.
-            keyboard::Event::KeyPressed { .. }
-                if pressed == Some(Action::FrameShape)
-                    && matches!(state.interaction, Interaction::Idle) =>
-            {
+            return Some(canvas::Action::request_redraw());
+        }
+        matches!(self.tool, Tool::Paint { .. }).then(canvas::Action::request_redraw)
+    }
+
+    /// A key let go: the one held to tweak something (see `tweak`), done.
+    fn on_key_released(
+        &self,
+        state: &mut State,
+        key: &keyboard::Key,
+        physical_key: keyboard::key::Physical,
+        screen: Option<Point>,
+    ) -> Option<canvas::Action<Message>> {
+        let tweak = state.tweaking?;
+        let action = match tweak.what {
+            Tweaking::Lightness => Action::Lightness,
+            Tweaking::Width => Action::Width,
+            Tweaking::Reach => Action::Reach,
+        };
+        let chord = Chord::pressed(key, physical_key, keyboard::Modifiers::empty())?;
+        if !self.keys?.releases(&chord, action) {
+            return None;
+        }
+        state.tweaking = None;
+        // Done reaching: what's being moved goes on from where the cursor
+        // is.
+        if tweak.what == Tweaking::Reach
+            && let Some(pos) = screen
+        {
+            rebase(&mut state.interaction, self.camera.to_world(pos));
+        }
+        Some(canvas::Action::request_redraw().and_capture())
+    }
+
+    /// Esc lets go of what's going on with the selection (grabbing,
+    /// rotating... or pasting); else of the lasso made ready; else of the
+    /// selection. Nothing to let go of: nothing.
+    fn on_escape(&self, state: &mut State) -> Option<canvas::Action<Message>> {
+        let pasting = matches!(state.interaction, Interaction::Pasting { .. });
+        if state.selection.is_empty() && !state.lasso_armed && !pasting {
+            return None;
+        }
+        match state.interaction {
+            Interaction::Idle if state.lasso_armed => state.lasso_armed = false,
+            Interaction::Idle => state.selection.clear(),
+            _ => {
+                state.interaction = Interaction::Idle;
+                state.pending = None;
+                state.aim = None;
+            }
+        }
+        Some(canvas::Action::request_redraw().and_capture())
+    }
+
+    /// What a key does here (`repeat`: held, coming again).
+    fn on_action(
+        &self,
+        state: &mut State,
+        action: Action,
+        repeat: bool,
+        inside: Option<Point>,
+        screen: Option<Point>,
+    ) -> Option<canvas::Action<Message>> {
+        match action {
+            Action::Reach | Action::Lightness | Action::Width => {
+                self.tweak(state, action, repeat, inside, screen)
+            }
+            Action::Copy | Action::CutFaces | Action::Paste if self.shaping(state) => {
+                self.clipboard_key(state, action, inside)
+            }
+            Action::FrameShape if matches!(state.interaction, Interaction::Idle) => {
                 let (points, layer) = self.shape_to_frame(state, inside);
                 (!points.is_empty() && (self.shown || layer.is_some())).then(|| {
                     canvas::Action::publish(Message::Frame { points, layer }).and_capture()
@@ -325,172 +261,273 @@ impl Editor<'_> {
             }
             // Lasso (Q, or Shift+Q to take out of the selection): the next
             // drag draws one (the same again: not).
-            keyboard::Event::KeyPressed { repeat: false, .. }
-                if matches!(pressed, Some(Action::Lasso | Action::LassoRemove))
-                    && self.tool == Tool::Shape
-                    && self.shown
-                    && matches!(state.interaction, Interaction::Idle) =>
-            {
-                let removes = pressed == Some(Action::LassoRemove);
+            Action::Lasso | Action::LassoRemove if !repeat && self.shaping(state) => {
+                let removes = action == Action::LassoRemove;
                 state.lasso_armed = !(state.lasso_armed && state.lasso_removes == removes);
                 state.lasso_removes = removes;
                 Some(canvas::Action::request_redraw().and_capture())
             }
             // Select all (Ctrl+A): every vertex of the layer.
-            keyboard::Event::KeyPressed { .. }
-                if pressed == Some(Action::SelectAll)
-                    && self.tool == Tool::Shape
-                    && self.shown
-                    && matches!(state.interaction, Interaction::Idle) =>
-            {
+            Action::SelectAll if self.shaping(state) => {
                 state.selection = self.document.unique_vertices();
                 state.selected_in = self.document.revision();
                 Some(canvas::Action::request_redraw().and_capture())
             }
-            // Select shape (Ctrl+L) selects the whole shape under the
-            // cursor; off the drawing, the whole shapes the selection is in.
-            keyboard::Event::KeyPressed { .. }
-                if pressed == Some(Action::SelectShape)
-                    && self.tool == Tool::Shape
-                    && self.shown
-                    && matches!(state.interaction, Interaction::Idle) =>
-            {
-                let hovered = inside
-                    .and_then(|pos| self.hit_test(pos))
-                    .map(|hover| vec![self.hover_vertex(hover)]);
-                let from = hovered.unwrap_or_else(|| state.selection.clone());
-                let mut linked = Vec::new();
-                for v in from {
-                    if !linked.contains(&v) {
-                        linked.extend(self.document.connected(v).into_iter().flatten());
-                        linked.sort_unstable();
-                        linked.dedup();
-                    }
-                }
-                for v in linked {
-                    if !state.selection.contains(&v) {
-                        state.selection.push(v);
-                    }
-                }
-                state.selected_in = self.document.revision();
-                Some(canvas::Action::request_redraw().and_capture())
-            }
-            // Without a selection, extrude (E) over an outer edge extrudes
-            // it, as if its ends were selected.
-            keyboard::Event::KeyPressed { .. }
-                if pressed == Some(Action::Extrude)
-                    && state.selection.is_empty()
-                    && self.tool == Tool::Shape
-                    && self.shown
-                    && matches!(state.interaction, Interaction::Idle) =>
-            {
-                let pos = inside?;
-                let Hover::Edge { a, b, .. } = self.hit_test(pos)? else {
-                    return None;
-                };
-                if self.extruded_ends(&[a, b]).is_empty() {
+            Action::SelectShape if self.shaping(state) => self.select_shape(state, inside),
+            Action::Extrude if state.selection.is_empty() => {
+                if !self.shaping(state) {
                     return None;
                 }
-                let at = self.camera.to_world(pos);
-                state.selection = vec![a, b];
-                state.selected_in = self.document.revision();
-                state.interaction = Interaction::Extruding { from: at, to: at };
-                state.pending = None;
-                Some(canvas::Action::request_redraw().and_capture())
+                self.extrude_edge(state, inside?)
             }
-            // With a selection: grab (G), rotate (R), scale (T), extrude (E);
-            // Esc lets go of that, or else of the selection.
-            keyboard::Event::KeyPressed { key, .. }
-                if (*key == keyboard::Key::Named(keyboard::key::Named::Escape)
-                    && (!state.selection.is_empty()
-                        || state.lasso_armed
-                        || matches!(state.interaction, Interaction::Pasting { .. })))
-                    || (!state.selection.is_empty()
-                        && self.tool == Tool::Shape
-                        && matches!(
-                            pressed,
-                            Some(Action::Grab | Action::Rotate | Action::Scale | Action::Extrude)
-                        )) =>
+            Action::Grab | Action::Rotate | Action::Scale | Action::Extrude
+                if !state.selection.is_empty() && self.tool == Tool::Shape =>
             {
-                let escape = *key == keyboard::Key::Named(keyboard::key::Named::Escape);
-                match (escape, state.interaction) {
-                    (false, Interaction::Idle) => {
-                        let at = self.camera.to_world(inside?);
-                        let center = self.centre(&state.selection);
-                        let pivot = |pivot| Interaction::PivotingSelection {
-                            pivot,
-                            center,
-                            from: at,
-                            to: at,
-                        };
-                        state.interaction = match pressed {
-                            Some(Action::Grab) => Interaction::MovingSelection {
-                                from: at,
-                                to: at,
-                                held: false,
-                            },
-                            Some(Action::Rotate) => pivot(Pivot::Rotate),
-                            Some(Action::Extrude) => Interaction::Extruding { from: at, to: at },
-                            _ => pivot(Pivot::Scale),
-                        };
-                        state.pending = None;
-                    }
-                    (false, _) => return None,
-                    // The lasso made ready first, then the selection.
-                    (true, Interaction::Idle) if state.lasso_armed => state.lasso_armed = false,
-                    (true, Interaction::Idle) => state.selection.clear(),
-                    (true, _) => {
-                        state.interaction = Interaction::Idle;
-                        state.pending = None;
-                        state.aim = None;
-                    }
-                }
-                Some(canvas::Action::request_redraw().and_capture())
+                self.transform_key(state, action, inside)
             }
-            keyboard::Event::KeyPressed { .. }
-                if matches!(pressed, Some(Action::CutEdge | Action::Delete))
-                    && self.tool == Tool::Shape
-                    && self.shown
-                    && matches!(state.interaction, Interaction::Idle) =>
-            {
-                let pos = inside?;
-
-                let edits = match pressed? {
-                    // Cutting (C) cuts the hovered edge where the cursor is.
-                    Action::CutEdge => match self.hit_test(pos)? {
-                        Hover::Edge { at, .. } => vec![Edit::InsertVertex { at }],
-                        Hover::Vertex(_) | Hover::Face(_) => return None,
-                    },
-                    // Deleting (D) removes the selected vertices: every
-                    // triangle using one (last first, so the others keep
-                    // their places).
-                    _ if !state.selection.is_empty() => {
-                        let edits: Vec<_> = self
-                            .document
-                            .triangle_ids()
-                            .iter()
-                            .enumerate()
-                            .rev()
-                            .filter(|(_, t)| t.iter().any(|v| state.selection.contains(v)))
-                            .map(|(triangle, _)| Edit::RemoveTriangle { triangle })
-                            .collect();
-                        if edits.is_empty() {
-                            return None;
-                        }
-                        edits
-                    }
-                    // Else the triangle under the cursor.
-                    _ => vec![Edit::RemoveTriangle {
-                        triangle: self.document.triangle_at(self.camera.to_world(pos))?,
-                    }],
-                };
-                let edits = self.check(edits, self.camera.to_world(pos))?.edits;
-
-                let revision = self.document.revision();
-                Some(canvas::Action::publish(Message::Edit { edits, revision }).and_capture())
+            Action::CutEdge | Action::Delete if self.shaping(state) => {
+                self.remove_key(state, action, inside?)
             }
             _ => None,
         }
+    }
+
+    /// Whether the shape mode's keys work now: shaping a layer that's
+    /// shown, nothing going on.
+    fn shaping(&self, state: &State) -> bool {
+        self.tool == Tool::Shape && self.shown && matches!(state.interaction, Interaction::Idle)
+    }
+
+    /// Holding a key tweaks something by moving the mouse: editing
+    /// proportionally, the reach key (Shift+O) how far that reaches (what's
+    /// being moved stays meanwhile); painting with a colour, the lightness
+    /// key (C) how light it is; painting edges, the width key (W) how wide
+    /// (the face or edge previewed stays meanwhile).
+    fn tweak(
+        &self,
+        state: &mut State,
+        action: Action,
+        repeat: bool,
+        inside: Option<Point>,
+        screen: Option<Point>,
+    ) -> Option<canvas::Action<Message>> {
+        let (what, at) = match action {
+            Action::Reach if self.tool == Tool::Shape && self.proportional.is_some() => {
+                (Tweaking::Reach, screen)
+            }
+            Action::Lightness
+                if matches!(
+                    self.tool,
+                    Tool::Paint {
+                        brush: Brush::Color(_),
+                        ..
+                    }
+                ) =>
+            {
+                (Tweaking::Lightness, inside)
+            }
+            Action::Width if self.paints_edges() => (Tweaking::Width, inside),
+            _ => return None,
+        };
+        if !repeat && state.tweaking.is_none() {
+            let at = at?;
+            state.tweaking = Some(Tweak { what, at, last: at });
+        }
+        Some(canvas::Action::request_redraw().and_capture())
+    }
+
+    /// Copy (Ctrl+C) copies the selected faces, cut (Ctrl+X) cuts them;
+    /// paste (Ctrl+V) picks up a copy of what was copied, to put down with
+    /// a click.
+    fn clipboard_key(
+        &self,
+        state: &mut State,
+        action: Action,
+        inside: Option<Point>,
+    ) -> Option<canvas::Action<Message>> {
+        match action {
+            Action::Copy => {
+                let piece = self.document.piece(&state.selection);
+                (!piece.is_empty())
+                    .then(|| canvas::Action::publish(Message::Copy(piece)).and_capture())
+            }
+            Action::CutFaces => {
+                let piece = self.document.piece(&state.selection);
+                if piece.is_empty() {
+                    return None;
+                }
+                // The faces copied: those with all corners selected (last
+                // first, so the others keep their places).
+                let edits = self
+                    .document
+                    .triangle_ids()
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter(|(_, t)| t.iter().all(|v| state.selection.contains(v)))
+                    .map(|(triangle, _)| Edit::RemoveTriangle { triangle })
+                    .collect();
+                let revision = self.document.revision();
+                Some(
+                    canvas::Action::publish(Message::Cut {
+                        piece,
+                        edits,
+                        revision,
+                    })
+                    .and_capture(),
+                )
+            }
+            _ => self.paste(state, inside?),
+        }
+    }
+
+    /// Picks up a copy of what was copied, the cursor at `inside`: right
+    /// where it was copied from, if it fits there (on another layer, say);
+    /// else in the middle of the cursor.
+    fn paste(&self, state: &mut State, inside: Point) -> Option<canvas::Action<Message>> {
+        let piece = self.clipboard.filter(|piece| !piece.is_empty())?;
+        let at = self.camera.to_world(inside);
+        let paste = |by: Vector| {
+            self.check(
+                vec![Edit::Paste {
+                    piece: piece.moved(by),
+                }],
+                at,
+            )
+        };
+        let (base, pending) = match paste(Vector::ZERO) {
+            Some(pending) => (Vector::ZERO, Some(pending)),
+            None => {
+                let base = at - piece.centre();
+                (base, paste(base))
+            }
+        };
+        state.selection.clear();
+        state.interaction = Interaction::Pasting {
+            base,
+            from: at,
+            to: at,
+        };
+        state.pending = pending;
+        Some(canvas::Action::request_redraw().and_capture())
+    }
+
+    /// Select shape (Ctrl+L) selects the whole shape under the cursor; off
+    /// the drawing, the whole shapes the selection is in.
+    fn select_shape(
+        &self,
+        state: &mut State,
+        inside: Option<Point>,
+    ) -> Option<canvas::Action<Message>> {
+        let hovered = inside
+            .and_then(|pos| self.hit_test(pos))
+            .map(|hover| vec![self.hover_vertex(hover)]);
+        let from = hovered.unwrap_or_else(|| state.selection.clone());
+        let mut linked = Vec::new();
+        for v in from {
+            if !linked.contains(&v) {
+                linked.extend(self.document.connected(v).into_iter().flatten());
+                linked.sort_unstable();
+                linked.dedup();
+            }
+        }
+        for v in linked {
+            if !state.selection.contains(&v) {
+                state.selection.push(v);
+            }
+        }
+        state.selected_in = self.document.revision();
+        Some(canvas::Action::request_redraw().and_capture())
+    }
+
+    /// Without a selection, extrude (E) over an outer edge extrudes it, as
+    /// if its ends were selected.
+    fn extrude_edge(&self, state: &mut State, inside: Point) -> Option<canvas::Action<Message>> {
+        let Hover::Edge { a, b, .. } = self.hit_test(inside)? else {
+            return None;
+        };
+        if self.extruded_ends(&[a, b]).is_empty() {
+            return None;
+        }
+        let at = self.camera.to_world(inside);
+        state.selection = vec![a, b];
+        state.selected_in = self.document.revision();
+        state.interaction = Interaction::Extruding { from: at, to: at };
+        state.pending = None;
+        Some(canvas::Action::request_redraw().and_capture())
+    }
+
+    /// With a selection: grab (G), rotate (R), scale (T) or extrude (E) it,
+    /// following the cursor from `inside`. Not while something else is
+    /// going on.
+    fn transform_key(
+        &self,
+        state: &mut State,
+        action: Action,
+        inside: Option<Point>,
+    ) -> Option<canvas::Action<Message>> {
+        if !matches!(state.interaction, Interaction::Idle) {
+            return None;
+        }
+        let at = self.camera.to_world(inside?);
+        let center = self.centre(&state.selection);
+        let pivot = |pivot| Interaction::PivotingSelection {
+            pivot,
+            center,
+            from: at,
+            to: at,
+        };
+        state.interaction = match action {
+            Action::Grab => Interaction::MovingSelection {
+                from: at,
+                to: at,
+                held: false,
+            },
+            Action::Rotate => pivot(Pivot::Rotate),
+            Action::Extrude => Interaction::Extruding { from: at, to: at },
+            _ => pivot(Pivot::Scale),
+        };
+        state.pending = None;
+        Some(canvas::Action::request_redraw().and_capture())
+    }
+
+    /// Cutting (C) cuts the edge under the cursor (at `inside`) where it
+    /// is. Deleting (D) removes the selected vertices: every triangle using
+    /// one; else the triangle under the cursor.
+    fn remove_key(
+        &self,
+        state: &mut State,
+        action: Action,
+        inside: Point,
+    ) -> Option<canvas::Action<Message>> {
+        let edits = match action {
+            Action::CutEdge => match self.hit_test(inside)? {
+                Hover::Edge { at, .. } => vec![Edit::InsertVertex { at }],
+                Hover::Vertex(_) | Hover::Face(_) => return None,
+            },
+            // Last first, so the others keep their places.
+            _ if !state.selection.is_empty() => {
+                let edits: Vec<_> = self
+                    .document
+                    .triangle_ids()
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter(|(_, t)| t.iter().any(|v| state.selection.contains(v)))
+                    .map(|(triangle, _)| Edit::RemoveTriangle { triangle })
+                    .collect();
+                if edits.is_empty() {
+                    return None;
+                }
+                edits
+            }
+            _ => vec![Edit::RemoveTriangle {
+                triangle: self.document.triangle_at(self.camera.to_world(inside))?,
+            }],
+        };
+        let edits = self.check(edits, self.camera.to_world(inside))?.edits;
+        let revision = self.document.revision();
+        Some(canvas::Action::publish(Message::Edit { edits, revision }).and_capture())
     }
 
     /// A mouse button pressed, the cursor at `pos` (screen).
