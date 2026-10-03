@@ -56,7 +56,8 @@ use paint::{Brush, Hsv, Target};
 use panels::{joined, tip};
 use update::{
     BackgroundMessage, ExportMessage, ExportSettings, FileMessage, Format, KeysMessage,
-    LayerAction, MenuMessage, PageDialog, PageMessage, PaintMessage, ShapeMessage, SnapMessage,
+    LayerAction, MenuMessage, PageDialog, PageMessage, PaintMessage, Painting, ShapeMessage,
+    SnapMessage,
 };
 
 pub fn main() -> iced::Result {
@@ -148,32 +149,15 @@ struct Tessera {
     fields: Fields,
     /// What dragging on the canvas does.
     mode: Mode,
-    /// What painting a face does, in the paint mode.
-    brush: Brush,
     /// Files opened or saved lately, most recent first.
     recent_files: recent::Recent,
     /// Where the user left off in each file lately.
     places: places::Places,
-    /// Colours painted with lately, most recent first.
-    recent: Vec<Color>,
-    /// The paint panel's colour field: as typed, or the colour picked.
-    hex: String,
-    /// The brush's colour on the colour wheel (keeping the hue of greys).
-    hsv: Hsv,
-    /// Whether painting paints faces or edges.
-    target: Target,
-    /// How wide painted edges are (world units).
-    edge_width: f32,
     /// Proportional editing (shape mode): moving vertices takes those within
     /// `reach` (screen px, so zoomed out it reaches further) along, the less
     /// the further.
     proportional: bool,
     reach: f32,
-    /// The layers before the fade width slider was dragged: the drag is one
-    /// undo step.
-    fading_from: Option<Layers>,
-    /// Whether the next click on the canvas picks up a brush (the pipette).
-    picking: bool,
     /// Placing a mirror on the current layer (Ctrl+M).
     placing_mirror: bool,
     /// A file dragged over the window: what dropping it would do is shown.
@@ -196,6 +180,8 @@ struct Tessera {
     dialogs: Dialogs,
     /// How to export, as last chosen in the export dialog.
     export: ExportSettings,
+    /// The brush and painting with it.
+    paint: Painting,
 }
 
 /// The background panel's number fields, as typed (so half-typed numbers
@@ -393,14 +379,14 @@ impl Tessera {
     /// Paints every face (or edge) of the current layer, or of all layers,
     /// with the brush; one undo step.
     fn paint_everything(&mut self, all_layers: bool) {
-        let edit = match self.target {
+        let edit = match self.paint.target {
             Target::Faces => Edit::PaintAll {
-                color: self.brush.color(),
+                color: self.paint.brush.color(),
             },
             Target::Edges => Edit::PaintAllEdges {
-                style: self.brush.color().map(|color| document::EdgeStyle {
+                style: self.paint.brush.color().map(|color| document::EdgeStyle {
                     color,
-                    width: self.edge_width,
+                    width: self.paint.edge_width,
                 }),
             },
         };
@@ -414,18 +400,18 @@ impl Tessera {
             let layer = self.layers.layer_mut(id).expect("layer");
             Arc::make_mut(&mut layer.document).apply(edit.clone());
         }
-        if let Some(color) = self.brush.color() {
-            paint::remember(&mut self.recent, color);
+        if let Some(color) = self.paint.brush.color() {
+            paint::remember(&mut self.paint.recent, color);
         }
         self.push_undo(before);
     }
 
     /// Paints with `brush` from now on; the colour controls follow.
     fn set_brush(&mut self, brush: Brush) {
-        self.brush = brush;
+        self.paint.brush = brush;
         if let Brush::Color(color) = brush {
-            self.hsv = Hsv::from_color(color, self.hsv.hue);
-            self.hex = paint::to_hex(color);
+            self.paint.hsv = Hsv::from_color(color, self.paint.hsv.hue);
+            self.paint.hex = paint::to_hex(color);
         }
     }
 
@@ -481,16 +467,10 @@ impl Tessera {
     }
 
     fn new() -> Self {
-        let brush = Brush::default();
-        let color = brush.color().unwrap_or(Color::WHITE);
         Tessera {
-            hex: paint::to_hex(color),
-            hsv: Hsv::from_color(color, 0.0),
-            edge_width: 2.0,
             reach: 100.0,
             keys: Keymap::load(),
             snap: snap::Snap::load(),
-            brush,
             recent_files: recent::Recent::load(),
             places: places::Places::load(),
             ..Tessera::default()
@@ -546,7 +526,7 @@ impl Tessera {
             }
             Message::SetMode(mode) => {
                 if mode == Mode::Shape {
-                    self.picking = false;
+                    self.paint.picking = false;
                 }
                 if mode != self.mode {
                     self.mode = mode;
@@ -630,7 +610,7 @@ impl Tessera {
         if escape {
             self.dialogs = Dialogs::default();
             self.editing_background = false;
-            self.picking = false;
+            self.paint.picking = false;
             self.placing_mirror = false;
             return Task::none();
         }
@@ -909,10 +889,10 @@ impl Tessera {
             _ if self.placing_mirror => Tool::Mirror,
             Mode::Shape => Tool::Shape,
             Mode::Paint => Tool::Paint {
-                target: self.target,
-                brush: self.brush,
-                width: self.edge_width,
-                picking: self.picking,
+                target: self.paint.target,
+                brush: self.paint.brush,
+                width: self.paint.edge_width,
+                picking: self.paint.picking,
             },
         }
     }

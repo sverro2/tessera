@@ -228,7 +228,7 @@ fn painting_a_whole_layer_or_all_layers() {
 
     let _ = app.update(Message::Paint(PaintMessage::PaintEverything(true)));
     assert_eq!(painted(&app), [true, true]);
-    assert_eq!(app.recent, vec![red]);
+    assert_eq!(app.paint.recent, vec![red]);
     // Edges too, the current layer only.
     let _ = app.update(Message::Paint(PaintMessage::SetTarget(Target::Edges)));
     let _ = app.update(Message::Paint(PaintMessage::PaintEverything(false)));
@@ -382,15 +382,15 @@ fn the_pipette_picks_up_a_brush() {
     let mut app = Tessera::default();
     let _ = app.update(Message::Paint(PaintMessage::TogglePicking));
     assert_eq!(app.mode, Mode::Paint);
-    assert!(app.picking);
+    assert!(app.paint.picking);
 
     let red = Color::from_rgb8(255, 0, 0);
     let pick = |app: &mut Tessera, picked| {
         let _ = app.update(Message::Editor(editor::Message::Pick(picked)));
     };
     pick(&mut app, editor::Picked::Face(Some(red)));
-    assert!(!app.picking);
-    assert_eq!(app.brush, Brush::Color(red));
+    assert!(!app.paint.picking);
+    assert_eq!(app.paint.brush, Brush::Color(red));
 
     pick(
         &mut app,
@@ -399,14 +399,14 @@ fn the_pipette_picks_up_a_brush() {
             width: 4.5,
         })),
     );
-    assert_eq!(app.edge_width, 4.5);
+    assert_eq!(app.paint.edge_width, 4.5);
     // Unpainted: the eraser, to paint it back like that.
     pick(&mut app, editor::Picked::Edge(None));
-    assert_eq!(app.brush, Brush::Eraser);
+    assert_eq!(app.paint.brush, Brush::Eraser);
 
     let _ = app.update(Message::Paint(PaintMessage::TogglePicking));
     let _ = app.update(Message::SetMode(Mode::Shape));
-    assert!(!app.picking);
+    assert!(!app.paint.picking);
 }
 
 #[test]
@@ -487,20 +487,17 @@ fn recent_files() {
 
 #[test]
 fn alt_and_moving_tweaks_the_edge_width() {
-    let mut app = Tessera {
-        edge_width: 2.0,
-        ..Tessera::default()
-    };
-    let start = app.edge_width;
+    let mut app = Tessera::default();
+    let start = app.paint.edge_width;
     let _ = app.update(Message::Editor(editor::Message::TweakWidth(100.0)));
-    assert!((app.edge_width - start * 1f32.exp()).abs() < 1e-4);
+    assert!((app.paint.edge_width - start * 1f32.exp()).abs() < 1e-4);
     let _ = app.update(Message::Editor(editor::Message::TweakWidth(-100.0)));
-    assert!((app.edge_width - start).abs() < 1e-4);
+    assert!((app.paint.edge_width - start).abs() < 1e-4);
     // Within the slider's range.
     let _ = app.update(Message::Editor(editor::Message::TweakWidth(10_000.0)));
-    assert_eq!(app.edge_width, 12.0);
+    assert_eq!(app.paint.edge_width, 12.0);
     let _ = app.update(Message::Editor(editor::Message::TweakWidth(-10_000.0)));
-    assert_eq!(app.edge_width, 0.5);
+    assert_eq!(app.paint.edge_width, 0.5);
 }
 
 #[test]
@@ -634,19 +631,19 @@ fn c_and_moving_tweaks_the_lightness() {
         value: 0.52,
     })));
     let _ = app.update(Message::Editor(editor::Message::TweakLightness(50.0)));
-    assert!((app.hsv.value - 0.72).abs() < 1e-5);
+    assert!((app.paint.hsv.value - 0.72).abs() < 1e-5);
     // Through black and back, and through white and back: the same
     // colour again.
-    let before = app.hex.clone();
+    let before = app.paint.hex.clone();
     let _ = app.update(Message::Editor(editor::Message::TweakLightness(-1000.0)));
-    assert_eq!(app.hex, "#000000");
+    assert_eq!(app.paint.hex, "#000000");
     let _ = app.update(Message::Editor(editor::Message::TweakLightness(180.0)));
-    assert_eq!(app.hex, before);
+    assert_eq!(app.paint.hex, before);
     let _ = app.update(Message::Editor(editor::Message::TweakLightness(1000.0)));
-    assert_eq!(app.hex, "#ffffff");
+    assert_eq!(app.paint.hex, "#ffffff");
     let _ = app.update(Message::Editor(editor::Message::TweakLightness(-320.0)));
-    assert_eq!(app.hex, before);
-    assert_eq!(app.brush, Brush::Color(app.hsv.to_color()));
+    assert_eq!(app.paint.hex, before);
+    assert_eq!(app.paint.brush, Brush::Color(app.paint.hsv.to_color()));
 }
 
 #[test]
@@ -804,7 +801,7 @@ fn painting_remembers_the_colour_and_undoes() {
     let _ = app.update(Message::SetMode(Mode::Paint));
     let _ = app.update(Message::Paint(PaintMessage::HexTyped("#ff0000".into())));
     let red = Color::from_rgb8(255, 0, 0);
-    assert_eq!(app.brush, Brush::Color(red));
+    assert_eq!(app.paint.brush, Brush::Color(red));
 
     let _ = app.update(Message::Editor(editor::Message::Edit {
         edits: vec![Edit::Paint {
@@ -814,7 +811,7 @@ fn painting_remembers_the_colour_and_undoes() {
         revision: app.document().revision(),
     }));
     assert_eq!(app.document().color(0), Some(red));
-    assert_eq!(app.recent, vec![red]);
+    assert_eq!(app.paint.recent, vec![red]);
 
     // Back to the colour it had: the default, as made.
     let _ = app.update(Message::Undo);

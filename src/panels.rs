@@ -150,7 +150,7 @@ impl Tessera {
         let gap = (INNER - 6.0 * SWATCH) / 5.0;
         let small = |label| text(label).size(13);
         let swatch = |color: Color| {
-            let picked = self.brush == Brush::Color(color);
+            let picked = self.paint.brush == Brush::Color(color);
             button(space().width(SWATCH).height(SWATCH))
                 .padding(0)
                 .style(move |theme: &Theme, status| button::Style {
@@ -173,7 +173,7 @@ impl Tessera {
         let swatches =
             |colors: &[Color]| row(colors.iter().map(|&color| swatch(color).into())).spacing(gap);
 
-        let current: Element<'_, Message> = match self.brush {
+        let current: Element<'_, Message> = match self.paint.brush {
             Brush::Color(color) => container(space().width(24).height(24))
                 .style(move |_| container::Style {
                     background: Some(color.into()),
@@ -188,7 +188,7 @@ impl Tessera {
                 .center_x(24)
                 .into(),
         };
-        let eraser_style = if self.brush == Brush::Eraser {
+        let eraser_style = if self.paint.brush == Brush::Eraser {
             button::primary
         } else {
             button::secondary
@@ -197,7 +197,7 @@ impl Tessera {
             .padding([4, 6])
             .style(eraser_style)
             .on_press(Message::Paint(PaintMessage::PickBrush(Brush::Eraser)));
-        let pipette_style = if self.picking {
+        let pipette_style = if self.paint.picking {
             button::primary
         } else {
             button::secondary
@@ -211,17 +211,17 @@ impl Tessera {
             tooltip::Position::Bottom,
         );
 
-        let hsv = self.hsv;
+        let hsv = self.paint.hsv;
         let mut body = column![
             joined(vec![
                 (
                     "Faces",
-                    self.target == Target::Faces,
+                    self.paint.target == Target::Faces,
                     Message::Paint(PaintMessage::SetTarget(Target::Faces))
                 ),
                 (
                     "Edges",
-                    self.target == Target::Edges,
+                    self.paint.target == Target::Edges,
                     Message::Paint(PaintMessage::SetTarget(Target::Edges))
                 ),
             ]),
@@ -241,7 +241,7 @@ impl Tessera {
                 // Painting edges: whether they fade into each other at their
                 // ends, and how far.
                 let crossfade = layer.crossfade;
-                if self.target == Target::Edges {
+                if self.paint.target == Target::Edges {
                     options = options.push(tooltip(
                         checkbox(crossfade.edges)
                             .label("Crossfade")
@@ -271,7 +271,7 @@ impl Tessera {
             },
             row![
                 current,
-                text_input("#rrggbb", &self.hex)
+                text_input("#rrggbb", &self.paint.hex)
                     .size(13)
                     .padding([3, 6])
                     .on_input(|value| Message::Paint(PaintMessage::HexTyped(value))),
@@ -297,15 +297,17 @@ impl Tessera {
             .align_y(Center),
         ]
         .spacing(8);
-        if self.target == Target::Edges {
+        if self.paint.target == Target::Edges {
             body = body.push(
                 row![
                     small("Width").width(44),
-                    slider(0.5..=12.0, self.edge_width, |value| Message::Paint(
+                    slider(0.5..=12.0, self.paint.edge_width, |value| Message::Paint(
                         PaintMessage::EdgeWidth(value)
                     ))
                     .step(0.5),
-                    text(format!("{:.1}", self.edge_width)).size(13).width(28),
+                    text(format!("{:.1}", self.paint.edge_width))
+                        .size(13)
+                        .width(28),
                 ]
                 .spacing(8)
                 .align_y(Center),
@@ -313,7 +315,7 @@ impl Tessera {
         }
         // Everything at once; holding Shift, on every layer.
         let all_layers = self.modifiers.shift();
-        let everything = match (self.target, all_layers) {
+        let everything = match (self.paint.target, all_layers) {
             (Target::Faces, false) => "Paint all faces of the layer",
             (Target::Edges, false) => "Paint all edges of the layer",
             (Target::Faces, true) => "Paint all faces, all layers",
@@ -331,9 +333,9 @@ impl Tessera {
         body = body
             .push(swatches(&paint::PALETTE[..6]))
             .push(swatches(&paint::PALETTE[6..]));
-        if !self.recent.is_empty() {
+        if !self.paint.recent.is_empty() {
             body = body.push(text("Recent").size(11).style(text::secondary));
-            for chunk in self.recent.chunks(6) {
+            for chunk in self.paint.recent.chunks(6) {
                 body = body.push(swatches(chunk));
             }
         }

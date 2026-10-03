@@ -23,7 +23,7 @@ impl Tessera {
                             _ => None,
                         };
                         if let Some(color) = color {
-                            paint::remember(&mut self.recent, color);
+                            paint::remember(&mut self.paint.recent, color);
                         }
                     }
                     self.push_undo(before);
@@ -54,7 +54,8 @@ impl Tessera {
             }
             editor::Message::TweakWidth(across) => {
                 // In proportion: fine when thin, quicker when thick.
-                self.edge_width = (self.edge_width * (across * 0.01).exp()).clamp(0.5, 12.0);
+                self.paint.edge_width =
+                    (self.paint.edge_width * (across * 0.01).exp()).clamp(0.5, 12.0);
                 Task::none()
             }
             editor::Message::TweakReach(across) => {
@@ -64,11 +65,11 @@ impl Tessera {
             editor::Message::TweakLightness(across) => {
                 // On the colour's value itself: through black and back, its
                 // hue and saturation stay.
-                if let Brush::Color(_) = self.brush {
-                    self.hsv.value = (self.hsv.value + across * 0.004).clamp(0.0, 2.0);
-                    let color = self.hsv.to_color();
-                    self.brush = Brush::Color(color);
-                    self.hex = paint::to_hex(color);
+                if let Brush::Color(_) = self.paint.brush {
+                    self.paint.hsv.value = (self.paint.hsv.value + across * 0.004).clamp(0.0, 2.0);
+                    let color = self.paint.hsv.to_color();
+                    self.paint.brush = Brush::Color(color);
+                    self.paint.hex = paint::to_hex(color);
                 }
                 Task::none()
             }
@@ -78,12 +79,12 @@ impl Tessera {
                     editor::Picked::Face(color) => color,
                     editor::Picked::Edge(style) => {
                         if let Some(style) = style {
-                            self.edge_width = style.width;
+                            self.paint.edge_width = style.width;
                         }
                         style.map(|style| style.color)
                     }
                 };
-                self.picking = false;
+                self.paint.picking = false;
                 self.set_brush(match color {
                     Some(color) => Brush::Color(color),
                     None => Brush::Eraser,

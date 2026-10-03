@@ -125,7 +125,7 @@ impl Tessera {
                         .flat_map(|layer| layer.document.colors().flatten())
                         .collect();
                     for color in colors.into_iter().rev() {
-                        paint::remember(&mut self.recent, color);
+                        paint::remember(&mut self.paint.recent, color);
                     }
                     self.layers = contents.layers;
                     self.layers_replaced();

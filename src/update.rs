@@ -21,6 +21,6 @@ pub use keys::KeysMessage;
 pub use layers::LayerAction;
 pub use menu::MenuMessage;
 pub use page::{PageDialog, PageMessage};
-pub use paint::PaintMessage;
+pub use paint::{PaintMessage, Painting};
 pub use shape::ShapeMessage;
 pub use snap::SnapMessage;
