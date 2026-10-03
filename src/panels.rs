@@ -366,15 +366,15 @@ impl Tessera {
         let rows = self.layers.rows();
         let group_selected = rows
             .iter()
-            .any(|row| row.id == self.selected && row.group.is_some());
-        let (dragged, place) = match self.dragging {
+            .any(|row| row.id == self.layers_panel.selected && row.group.is_some());
+        let (dragged, place) = match self.layers_panel.dragging {
             Some((id, place)) => (Some(id), place),
             None => (None, None),
         };
 
         let lines = rows.into_iter().map(|row| {
             let id = row.id;
-            let selected = id == self.selected;
+            let selected = id == self.layers_panel.selected;
             let expander: Element<'_, Message> = match row.group {
                 Some(expanded) => button(small(if expanded { "▾" } else { "▸" }))
                     .padding([0, 4])
@@ -395,7 +395,7 @@ impl Tessera {
             .style(button::text)
             .on_press(Message::Layers(ToggleVisible(id)));
             // Faint until isolated, so the line stays quiet.
-            let isolated = self.isolated.contains(&id);
+            let isolated = self.layers_panel.isolated.contains(&id);
             let isolate = tooltip(
                 button(icon(
                     icons::FOCUS,
@@ -424,7 +424,7 @@ impl Tessera {
                 }),
                 tooltip::Position::Bottom,
             );
-            let name: Element<'_, Message> = if self.naming == Some(id) {
+            let name: Element<'_, Message> = if self.layers_panel.naming == Some(id) {
                 text_input("Name", row.name)
                     .id(NAME_FIELD)
                     .size(12)
@@ -435,7 +435,8 @@ impl Tessera {
             } else {
                 // Hidden (itself or by its group), out of view while others
                 // are isolated, or being dragged: dimmed.
-                let dim = !self.layers.in_view(id, &self.isolated) || dragged == Some(id);
+                let dim =
+                    !self.layers.in_view(id, &self.layers_panel.isolated) || dragged == Some(id);
                 text(row.name)
                     .size(12)
                     .style(move |theme: &Theme| {
@@ -464,7 +465,7 @@ impl Tessera {
             ]
             .spacing(2)
             .align_y(Center);
-            if empty && self.naming != Some(id) {
+            if empty && self.layers_panel.naming != Some(id) {
                 line = line
                     .push(space::horizontal())
                     .push(text("empty").size(11).style(text::secondary));

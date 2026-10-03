@@ -94,7 +94,7 @@ impl Tessera {
                 self.notice = None;
                 self.backgrounds.clear();
                 // Their ids start over.
-                self.isolated.clear();
+                self.layers_panel.isolated.clear();
                 self.editing_background = false;
                 self.saved_background = self.background_version;
                 self.view_changed()
@@ -133,11 +133,11 @@ impl Tessera {
                     self.camera = contents.camera;
                     if let Some(layer) = contents.current {
                         self.current = layer;
-                        self.selected = layer;
+                        self.layers_panel.selected = layer;
                     }
                     self.backgrounds = contents.backgrounds;
                     // Their ids start over.
-                    self.isolated.clear();
+                    self.layers_panel.isolated.clear();
                     self.editing_background = false;
                     self.background_version += 1;
                     self.saved_background = self.background_version;
@@ -149,7 +149,7 @@ impl Tessera {
                         }
                         if let Some(layer) = self.layers.layers().get(place.layer) {
                             self.current = layer.id;
-                            self.selected = layer.id;
+                            self.layers_panel.selected = layer.id;
                         }
                     }
                     self.recent_files.add(path.clone());

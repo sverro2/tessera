@@ -56,8 +56,8 @@ use paint::{Brush, Hsv, Target};
 use panels::{joined, tip};
 use update::{
     BackgroundMessage, ExportMessage, ExportSettings, FileMessage, Format, KeysMessage,
-    LayerAction, MenuMessage, PageDialog, PageMessage, PaintMessage, Painting, ShapeMessage,
-    SnapMessage,
+    LayerAction, LayersPanel, MenuMessage, PageDialog, PageMessage, PaintMessage, Painting,
+    ShapeMessage, SnapMessage,
 };
 
 pub fn main() -> iced::Result {
@@ -105,22 +105,6 @@ struct Tessera {
     layers: Layers,
     /// The layer being edited (see [`Self::current`]).
     current: NodeId,
-    /// The layer or group selected in the layers panel.
-    selected: NodeId,
-    /// The layer or group whose name is being typed: its renaming is one
-    /// undo step.
-    renaming: Option<NodeId>,
-    /// The layer or group whose name is shown as a field to type in.
-    naming: Option<NodeId>,
-    /// A layer or group being dragged in the layers panel, and where
-    /// dropping it would put it.
-    dragging: Option<(NodeId, Option<Place>)>,
-    /// The layer (or group) pointed at in the layers panel: lit up on the
-    /// canvas.
-    pointed_layer: Option<NodeId>,
-    /// The layers and groups isolated in the layers panel: while any are,
-    /// only they (and what's in them) are in view. Not part of the drawing.
-    isolated: HashSet<NodeId>,
     /// View state, independent of the data.
     camera: Camera,
     /// What's drawn on the canvas; see `editor::Caches` for when to clear
@@ -182,6 +166,8 @@ struct Tessera {
     export: ExportSettings,
     /// The brush and painting with it.
     paint: Painting,
+    /// The layers panel: what's selected, named, dragged, pointed at and isolated in it.
+    layers_panel: LayersPanel,
 }
 
 /// The background panel's number fields, as typed (so half-typed numbers
@@ -366,12 +352,12 @@ impl Tessera {
     /// and selected layer to ones that exist.
     fn layers_replaced(&mut self) {
         self.current = self.current();
-        if !self.layers.contains(self.selected) {
-            self.selected = self.current;
+        if !self.layers.contains(self.layers_panel.selected) {
+            self.layers_panel.selected = self.current;
         }
-        self.renaming = None;
-        self.naming = None;
-        self.dragging = None;
+        self.layers_panel.renaming = None;
+        self.layers_panel.naming = None;
+        self.layers_panel.dragging = None;
         // The document size may be another.
         self.caches.grid.clear();
     }
@@ -417,7 +403,7 @@ impl Tessera {
 
     /// Selects a line in the layers panel; a layer becomes the one edited.
     fn select_layer(&mut self, id: NodeId) {
-        self.selected = id;
+        self.layers_panel.selected = id;
         if self.layers.layer(id).is_some() && id != self.current() {
             self.current = id;
         }
@@ -448,7 +434,7 @@ impl Tessera {
                 _ => None,
             }),
             // Letting go of a dragged layer anywhere drops it.
-            if self.dragging.is_some() {
+            if self.layers_panel.dragging.is_some() {
                 iced::event::listen_with(|event, _, _| match event {
                     iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                         iced::mouse::Button::Left,
@@ -786,12 +772,12 @@ impl Tessera {
         let canvas = stack![
             {
                 let current = self.current();
-                let (below, above) = self.layers.around(current, &self.isolated);
+                let (below, above) = self.layers.around(current, &self.layers_panel.isolated);
                 let scene = editor::Scene {
                     current: editor::SceneLayer::of(
                         self.layers.layer(current).expect("current layer"),
                     ),
-                    shown: self.layers.in_view(current, &self.isolated),
+                    shown: self.layers.in_view(current, &self.layers_panel.isolated),
                     below: below.into_iter().map(editor::SceneLayer::of).collect(),
                     above: above.into_iter().map(editor::SceneLayer::of).collect(),
                 };
@@ -809,7 +795,8 @@ impl Tessera {
                         // Back to front; hidden ones not, though out of view
                         // while others are isolated.
                         lit: self
-                            .pointed_layer
+                            .layers_panel
+                            .pointed
                             .map(|id| self.layers.layers_of(id))
                             .unwrap_or_default()
                             .into_iter()

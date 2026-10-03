@@ -149,7 +149,7 @@ fn framing_a_shape_on_another_layer_switches_to_it() {
     let _ = app.update(frame(None));
     assert_eq!(app.current(), front);
     let _ = app.update(frame(Some(back)));
-    assert_eq!((app.current(), app.selected), (back, back));
+    assert_eq!((app.current(), app.layers_panel.selected), (back, back));
 }
 
 #[test]
@@ -170,16 +170,16 @@ fn dragging_a_layer_moves_it() {
     // Onto itself: nothing; then onto the lower half of the other.
     let _ = app.update(Message::Layers(LayerAction::Press(front)));
     let _ = app.update(Message::Layers(LayerAction::Hover(front, 0.9)));
-    assert_eq!(app.dragging, Some((front, None)));
+    assert_eq!(app.layers_panel.dragging, Some((front, None)));
     let _ = app.update(Message::Layers(LayerAction::Hover(back, 0.9)));
     let _ = app.update(Message::Layers(LayerAction::Drop));
     assert_eq!(names(&app), ["Layer 1", "Layer 2"]);
-    assert_eq!(app.dragging, None);
+    assert_eq!(app.layers_panel.dragging, None);
 
     // Into a group; out again to the very back.
     let _ = app.update(Message::Layers(LayerAction::Press(back)));
     let _ = app.update(Message::Layers(LayerAction::Group));
-    let group = app.selected;
+    let group = app.layers_panel.selected;
     let _ = app.update(Message::Layers(LayerAction::Press(front)));
     let _ = app.update(Message::Layers(LayerAction::Hover(group, 0.5)));
     let _ = app.update(Message::Layers(LayerAction::Drop));
@@ -274,13 +274,13 @@ fn pointing_at_a_layer_lights_it_up_until_off_it() {
     let before = app.layers.signature();
 
     let _ = app.update(Message::Layers(LayerAction::Point(back)));
-    assert_eq!(app.pointed_layer, Some(back));
+    assert_eq!(app.layers_panel.pointed, Some(back));
     // Onto the next line before off the last: the next one stays.
     let _ = app.update(Message::Layers(LayerAction::Point(front)));
     let _ = app.update(Message::Layers(LayerAction::Unpoint(back)));
-    assert_eq!(app.pointed_layer, Some(front));
+    assert_eq!(app.layers_panel.pointed, Some(front));
     let _ = app.update(Message::Layers(LayerAction::Unpoint(front)));
-    assert_eq!(app.pointed_layer, None);
+    assert_eq!(app.layers_panel.pointed, None);
     // Not a change (nothing to undo).
     assert_eq!(app.layers.signature(), before);
     assert_eq!(app.history.undo.len(), 1);
@@ -357,7 +357,7 @@ fn deleting_a_group_with_every_layer_in_it() {
     edit(&mut app, 0.0);
     // Both in one group, then that group in another.
     let _ = app.update(Message::Layers(LayerAction::Group));
-    let inner = app.selected;
+    let inner = app.layers_panel.selected;
     let back = app.layers.layers()[1].id;
     let _ = app.update(Message::Layers(LayerAction::Press(back)));
     let _ = app.update(Message::Layers(LayerAction::Hover(inner, 0.5)));
@@ -370,7 +370,7 @@ fn deleting_a_group_with_every_layer_in_it() {
     assert_eq!(app.layers.layers().len(), 1);
     assert!(app.document().is_empty());
     assert_eq!(app.current(), app.layers.first_layer());
-    assert_eq!(app.selected, app.current());
+    assert_eq!(app.layers_panel.selected, app.current());
 
     let _ = app.update(Message::Undo);
     assert_eq!(app.layers.layers().len(), 2);

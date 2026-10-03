@@ -43,36 +43,36 @@ impl Tessera {
     pub(crate) fn layer_action(&mut self, action: LayerAction) -> Task<Message> {
         let before = self.layers.clone();
         // None selected (yet, or any more): the current layer.
-        let selected = if self.layers.contains(self.selected) {
-            self.selected
+        let selected = if self.layers.contains(self.layers_panel.selected) {
+            self.layers_panel.selected
         } else {
             self.current()
         };
         if !matches!(action, LayerAction::Rename(_)) {
-            self.renaming = None;
+            self.layers_panel.renaming = None;
         }
         let changed = match action {
             LayerAction::Point(id) => {
-                self.pointed_layer = Some(id);
+                self.layers_panel.pointed = Some(id);
                 return Task::none();
             }
             // (Only if still on it: onto the next one may come first.)
             LayerAction::Unpoint(id) => {
-                if self.pointed_layer == Some(id) {
-                    self.pointed_layer = None;
+                if self.layers_panel.pointed == Some(id) {
+                    self.layers_panel.pointed = None;
                 }
                 return Task::none();
             }
             LayerAction::Press(id) => {
-                if self.naming != Some(id) {
-                    self.naming = None;
+                if self.layers_panel.naming != Some(id) {
+                    self.layers_panel.naming = None;
                 }
                 self.select_layer(id);
-                self.dragging = Some((id, None));
+                self.layers_panel.dragging = Some((id, None));
                 return Task::none();
             }
             LayerAction::Hover(id, y) => {
-                if let Some((dragged, place)) = &mut self.dragging {
+                if let Some((dragged, place)) = &mut self.layers_panel.dragging {
                     let group = self
                         .layers
                         .rows()
@@ -102,25 +102,25 @@ impl Tessera {
                 return Task::none();
             }
             LayerAction::HoverEnd => {
-                if let Some((_, place)) = &mut self.dragging {
+                if let Some((_, place)) = &mut self.layers_panel.dragging {
                     *place = Some(Place::Last);
                 }
                 return Task::none();
             }
             LayerAction::Leave => {
-                if let Some((_, place)) = &mut self.dragging {
+                if let Some((_, place)) = &mut self.layers_panel.dragging {
                     *place = None;
                 }
                 return Task::none();
             }
-            LayerAction::Drop => match self.dragging.take() {
+            LayerAction::Drop => match self.layers_panel.dragging.take() {
                 Some((id, Some(place))) => self.layers.move_to(id, place),
                 _ => return Task::none(),
             },
             // A way of looking, not a change to the drawing.
             LayerAction::ToggleIsolated(id) => {
-                if !self.isolated.remove(&id) {
-                    self.isolated.insert(id);
+                if !self.layers_panel.isolated.remove(&id) {
+                    self.layers_panel.isolated.insert(id);
                 }
                 return Task::none();
             }
@@ -129,23 +129,23 @@ impl Tessera {
                 return Task::none();
             }
             LayerAction::StartRename(id) => {
-                self.dragging = None;
+                self.layers_panel.dragging = None;
                 self.select_layer(id);
-                self.naming = Some(id);
+                self.layers_panel.naming = Some(id);
                 return Task::batch([
                     iced::widget::operation::focus(NAME_FIELD),
                     iced::widget::operation::select_all(NAME_FIELD),
                 ]);
             }
             LayerAction::EndRename => {
-                self.naming = None;
+                self.layers_panel.naming = None;
                 return Task::none();
             }
             LayerAction::Rename(name) => {
                 self.layers.rename(selected, name);
                 // Typing a name is one step.
-                if self.renaming != Some(selected) {
-                    self.renaming = Some(selected);
+                if self.layers_panel.renaming != Some(selected) {
+                    self.layers_panel.renaming = Some(selected);
                     self.push_undo(before);
                 }
                 return Task::none();
@@ -153,7 +153,7 @@ impl Tessera {
             LayerAction::Add => {
                 let id = self.layers.add_layer(selected);
                 self.current = id;
-                self.selected = id;
+                self.layers_panel.selected = id;
                 true
             }
             // The copy in front, and worked on (the original kept as it is).
@@ -171,7 +171,7 @@ impl Tessera {
                             self.backgrounds.insert(copied, background);
                         }
                     }
-                    self.selected = copy;
+                    self.layers_panel.selected = copy;
                     if let Some(layer) = self.layers.first_layer_of(copy) {
                         self.current = layer;
                     }
@@ -181,7 +181,7 @@ impl Tessera {
             },
             LayerAction::Group => match self.layers.group(selected) {
                 Some(group) => {
-                    self.selected = group;
+                    self.layers_panel.selected = group;
                     true
                 }
                 None => false,
@@ -189,7 +189,7 @@ impl Tessera {
             LayerAction::Ungroup => {
                 let ungrouped = self.layers.ungroup(selected);
                 if ungrouped {
-                    self.selected = self.current();
+                    self.layers_panel.selected = self.current();
                 }
                 ungrouped
             }
@@ -211,4 +211,25 @@ impl Tessera {
         }
         Task::none()
     }
+}
+
+/// The layers panel: what's selected, named, dragged, pointed at and isolated in it.
+#[derive(Default)]
+pub struct LayersPanel {
+    /// The layer or group selected in the layers panel.
+    pub selected: NodeId,
+    /// The layer or group whose name is being typed: its renaming is one
+    /// undo step.
+    pub renaming: Option<NodeId>,
+    /// The layer or group whose name is shown as a field to type in.
+    pub naming: Option<NodeId>,
+    /// A layer or group being dragged in the layers panel, and where
+    /// dropping it would put it.
+    pub dragging: Option<(NodeId, Option<Place>)>,
+    /// The layer (or group) pointed at in the layers panel: lit up on the
+    /// canvas.
+    pub pointed: Option<NodeId>,
+    /// The layers and groups isolated in the layers panel: while any are,
+    /// only they (and what's in them) are in view. Not part of the drawing.
+    pub isolated: HashSet<NodeId>,
 }

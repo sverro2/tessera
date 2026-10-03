@@ -18,7 +18,7 @@ pub use export::{ExportMessage, ExportSettings, Format};
 pub use file::Dropped;
 pub use file::FileMessage;
 pub use keys::KeysMessage;
-pub use layers::LayerAction;
+pub use layers::{LayerAction, LayersPanel};
 pub use menu::MenuMessage;
 pub use page::{PageDialog, PageMessage};
 pub use paint::{PaintMessage, Painting};

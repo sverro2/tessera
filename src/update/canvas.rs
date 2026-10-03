@@ -11,7 +11,7 @@ impl Tessera {
                 if revision != self.document().revision() {
                     return Task::none();
                 }
-                self.renaming = None;
+                self.layers_panel.renaming = None;
                 let before = self.layers.clone();
                 let current = self.current();
                 let layer = self.layers.layer_mut(current).expect("current layer");
