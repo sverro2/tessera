@@ -264,7 +264,7 @@ impl Tessera {
             for action in Action::ALL.into_iter().filter(|a| a.context() == context) {
                 let mut keys = row![].spacing(6).align_y(Center);
                 for (i, chord) in self.keys.keys(action).iter().enumerate() {
-                    let setting = self.rebinding == Some((action, Some(i)));
+                    let setting = self.dialogs.rebinding == Some((action, Some(i)));
                     let label = if setting {
                         waiting()
                     } else {
@@ -291,7 +291,7 @@ impl Tessera {
                         .align_y(Center),
                     );
                 }
-                let adding = self.rebinding == Some((action, None));
+                let adding = self.dialogs.rebinding == Some((action, None));
                 keys = keys.push(tooltip(
                     button(if adding {
                         waiting()
@@ -483,4 +483,39 @@ pub(super) fn dropping_hint(path: &Path) -> Element<'_, Message> {
         })
     })
     .into()
+}
+
+/// What's open over the canvas: a menu, or a dialog (Esc closes them all).
+#[derive(Default)]
+pub(crate) struct Dialogs {
+    /// The menu that is open, if any.
+    pub(crate) menu: Option<Menu>,
+    /// Whether the about box is open.
+    pub(crate) about: bool,
+    /// Asking what to do with unsaved changes before doing this.
+    pub(crate) confirming: Option<Replace>,
+    /// Exporting, to what: its dialog open.
+    pub(crate) export_open: Option<Format>,
+    /// The keyboard shortcuts shown (F1).
+    pub(crate) keys_open: bool,
+    /// A key being set: the next key pressed goes to this action (instead
+    /// of its key at that place, or as another).
+    pub(crate) rebinding: Option<(Action, Option<usize>)>,
+    /// The document size dialog, as filled in so far, while it's open.
+    pub(crate) page_dialog: Option<PageDialog>,
+    /// The snap settings dialog's grid step, as typed, while it's open.
+    pub(crate) snap_dialog: Option<String>,
+}
+
+impl Dialogs {
+    /// Whether a dialog is open (not just a menu): keys go to it, not to
+    /// the canvas.
+    pub(crate) fn dialog_open(&self) -> bool {
+        self.confirming.is_some()
+            || self.about
+            || self.keys_open
+            || self.export_open.is_some()
+            || self.page_dialog.is_some()
+            || self.snap_dialog.is_some()
+    }
 }

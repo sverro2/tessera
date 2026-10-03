@@ -16,22 +16,22 @@ impl Tessera {
     pub(crate) fn update_menu(&mut self, message: MenuMessage) -> Task<Message> {
         match message {
             MenuMessage::About(open) => {
-                self.menu = None;
-                self.about = open;
+                self.dialogs.menu = None;
+                self.dialogs.about = open;
                 Task::none()
             }
             MenuMessage::ToggleMenu(menu) => {
-                self.menu = (self.menu != Some(menu)).then_some(menu);
+                self.dialogs.menu = (self.dialogs.menu != Some(menu)).then_some(menu);
                 Task::none()
             }
             MenuMessage::HoverMenu(menu) => {
-                if self.menu.is_some() {
-                    self.menu = Some(menu);
+                if self.dialogs.menu.is_some() {
+                    self.dialogs.menu = Some(menu);
                 }
                 Task::none()
             }
             MenuMessage::CloseMenu => {
-                self.menu = None;
+                self.dialogs.menu = None;
                 Task::none()
             }
         }

@@ -52,11 +52,11 @@ fn the_document_size_is_set_in_its_dialog_and_undone() {
 
     page(&mut app, PageMessage::Show(true));
     page(&mut app, PageMessage::Preset(page::Preset::FullHd));
-    let dialog = app.page_dialog.as_ref().unwrap();
+    let dialog = app.dialogs.page_dialog.as_ref().unwrap();
     assert_eq!((&*dialog.width, &*dialog.height), ("1920", "1080"));
     page(&mut app, PageMessage::Turn);
     page(&mut app, PageMessage::Apply);
-    assert!(app.page_dialog.is_none());
+    assert!(app.dialogs.page_dialog.is_none());
     // Around the triangle, (100, 100)–(300, 300).
     let set = app.layers.page().expect("set");
     assert_eq!(set.size, iced::Size::new(1080.0, 1920.0));
@@ -73,11 +73,11 @@ fn the_document_size_is_set_in_its_dialog_and_undone() {
 
     // A custom size, where it was.
     page(&mut app, PageMessage::Show(true));
-    assert!(!app.page_dialog.as_ref().unwrap().centre);
+    assert!(!app.dialogs.page_dialog.as_ref().unwrap().centre);
     page(&mut app, PageMessage::Width("1000".into()));
     page(&mut app, PageMessage::Height("700".into()));
     assert_eq!(
-        app.page_dialog.as_ref().unwrap().preset,
+        app.dialogs.page_dialog.as_ref().unwrap().preset,
         page::Preset::Custom
     );
     page(&mut app, PageMessage::Apply);
@@ -89,7 +89,7 @@ fn the_document_size_is_set_in_its_dialog_and_undone() {
     page(&mut app, PageMessage::Show(true));
     page(&mut app, PageMessage::Width("0".into()));
     page(&mut app, PageMessage::Apply);
-    assert!(app.page_dialog.is_some());
+    assert!(app.dialogs.page_dialog.is_some());
     page(&mut app, PageMessage::Remove);
     assert_eq!(app.layers.page(), None);
 
@@ -341,8 +341,8 @@ fn files_dropped_on_the_window_open_or_go_behind_the_layer() {
     // A drawing dropped with changes unsaved: asked first.
     edit(&mut app, 0.0);
     let _ = app.update(Message::File(FileMessage::Dropped(path.clone())));
-    assert!(matches!(&app.confirming, Some(Replace::OpenPath(p)) if *p == path));
-    app.confirming = None;
+    assert!(matches!(&app.dialogs.confirming, Some(Replace::OpenPath(p)) if *p == path));
+    app.dialogs.confirming = None;
 
     // Neither: said so.
     let _ = app.update(Message::File(FileMessage::Dropped("/a/notes.txt".into())));
@@ -465,7 +465,7 @@ fn recent_files() {
     // With unsaved changes, opening a recent file asks first.
     edit(&mut app, 0.0);
     let _ = app.update(Message::File(FileMessage::OpenRecent(path.clone())));
-    assert!(matches!(&app.confirming, Some(Replace::OpenPath(p)) if *p == path));
+    assert!(matches!(&app.dialogs.confirming, Some(Replace::OpenPath(p)) if *p == path));
 
     // Gone: said so, and forgotten.
     let _ = app.update(Message::File(FileMessage::RecentFailed(
@@ -508,8 +508,8 @@ fn the_about_box_opens_and_closes() {
     let mut app = Tessera::default();
     let _ = app.update(Message::Menu(MenuMessage::ToggleMenu(Menu::Help)));
     let _ = app.update(Message::Menu(MenuMessage::About(true)));
-    assert!(app.about);
-    assert_eq!(app.menu, None);
+    assert!(app.dialogs.about);
+    assert_eq!(app.dialogs.menu, None);
     let _ = app.update(Message::Key(keyboard::Event::KeyPressed {
         key: Key::Named(keyboard::key::Named::Escape),
         modified_key: Key::Named(keyboard::key::Named::Escape),
@@ -521,7 +521,7 @@ fn the_about_box_opens_and_closes() {
         text: None,
         repeat: false,
     }));
-    assert!(!app.about);
+    assert!(!app.dialogs.about);
 }
 
 #[test]
@@ -591,7 +591,7 @@ fn keys_are_looked_up_and_set() {
     let letter = |c: &str| Key::Character(c.into());
 
     press(&mut app, Key::Named(keyboard::key::Named::F1), none);
-    assert!(app.keys_open);
+    assert!(app.dialogs.keys_open);
     // While they're open, keys don't do what they do.
     press(&mut app, Key::Named(keyboard::key::Named::Tab), none);
     assert_eq!(app.mode, Mode::Shape);
@@ -602,7 +602,7 @@ fn keys_are_looked_up_and_set() {
         Some(0),
     )))));
     press(&mut app, letter("q"), none);
-    assert_eq!(app.rebinding, None);
+    assert_eq!(app.dialogs.rebinding, None);
     assert_eq!(app.keys.first(Action::ToggleMode), "Q");
     // Esc while setting one: never mind; then closes.
     let _ = app.update(Message::Keys(KeysMessage::Rebind(Some((
@@ -610,10 +610,10 @@ fn keys_are_looked_up_and_set() {
         None,
     )))));
     press(&mut app, Key::Named(keyboard::key::Named::Escape), none);
-    assert!(app.keys_open);
+    assert!(app.dialogs.keys_open);
     assert_eq!(app.keys.keys(Action::ToggleMode).len(), 1);
     press(&mut app, Key::Named(keyboard::key::Named::Escape), none);
-    assert!(!app.keys_open);
+    assert!(!app.dialogs.keys_open);
 
     // Now Q switches, Tab doesn't.
     press(&mut app, Key::Named(keyboard::key::Named::Tab), none);
@@ -669,16 +669,16 @@ fn another_menu_opens_straight_away() {
 
     // Hovering the menu bar opens nothing by itself.
     let _ = app.update(Message::Menu(MenuMessage::HoverMenu(Menu::View)));
-    assert_eq!(app.menu, None);
+    assert_eq!(app.dialogs.menu, None);
 
     let _ = app.update(Message::Menu(MenuMessage::ToggleMenu(Menu::File)));
-    assert_eq!(app.menu, Some(Menu::File));
+    assert_eq!(app.dialogs.menu, Some(Menu::File));
     let _ = app.update(Message::Menu(MenuMessage::HoverMenu(Menu::View)));
-    assert_eq!(app.menu, Some(Menu::View));
+    assert_eq!(app.dialogs.menu, Some(Menu::View));
     let _ = app.update(Message::Menu(MenuMessage::ToggleMenu(Menu::File)));
-    assert_eq!(app.menu, Some(Menu::File));
+    assert_eq!(app.dialogs.menu, Some(Menu::File));
     let _ = app.update(Message::Menu(MenuMessage::ToggleMenu(Menu::File)));
-    assert_eq!(app.menu, None);
+    assert_eq!(app.dialogs.menu, None);
 }
 
 #[test]
@@ -953,7 +953,7 @@ fn the_background_counts_as_content() {
 
     // New asks, and clears it.
     let _ = app.update(Message::File(FileMessage::New));
-    assert!(matches!(app.confirming, Some(Replace::New)));
+    assert!(matches!(app.dialogs.confirming, Some(Replace::New)));
     let _ = app.update(Message::File(FileMessage::Replace(Replace::New)));
     assert!(app.background().is_none());
     assert!(!app.is_unsaved());
@@ -964,7 +964,7 @@ fn new_on_a_blank_canvas_does_nothing() {
     let mut app = Tessera::default();
     app.camera.zoom = 2.0;
     let _ = app.update(Message::File(FileMessage::New));
-    assert!(app.confirming.is_none());
+    assert!(app.dialogs.confirming.is_none());
     assert_eq!(app.camera.zoom, 2.0);
 }
 
@@ -977,9 +977,9 @@ fn new_asks_before_losing_changes() {
     assert_eq!(app.title(), "Untitled • — Tessera");
 
     let _ = app.update(Message::File(FileMessage::New));
-    assert!(matches!(app.confirming, Some(Replace::New)));
+    assert!(matches!(app.dialogs.confirming, Some(Replace::New)));
     let _ = app.update(Message::File(FileMessage::Confirm(Choice::Cancel)));
-    assert!(app.confirming.is_none());
+    assert!(app.dialogs.confirming.is_none());
     assert!(!app.document().is_empty());
 
     // "Don't save" goes on with it: a blank document and view.
@@ -1004,7 +1004,7 @@ fn saved_changes_need_no_asking() {
     assert!(!app.is_unsaved());
     assert_eq!(app.title(), "drawing.tessera — Tessera");
     let _ = app.update(Message::File(FileMessage::New));
-    assert!(app.confirming.is_none());
+    assert!(app.dialogs.confirming.is_none());
 
     // A cancelled save leaves new changes unsaved.
     edit(&mut app, 500.0);

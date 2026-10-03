@@ -34,8 +34,8 @@ impl Tessera {
     pub(crate) fn update_export(&mut self, message: ExportMessage) -> Task<Message> {
         match message {
             ExportMessage::ShowExport(format) => {
-                self.menu = None;
-                self.export_open = format;
+                self.dialogs.menu = None;
+                self.dialogs.export_open = format;
                 Task::none()
             }
             ExportMessage::ToPage(to_page) => {
@@ -51,15 +51,15 @@ impl Tessera {
                 Task::none()
             }
             ExportMessage::ExportSvg => {
-                self.menu = None;
-                self.export_open = None;
+                self.dialogs.menu = None;
+                self.dialogs.export_open = None;
                 let svg = svg::export(&self.layers, self.export_page());
                 Task::perform(save_svg(svg), |value| {
                     Message::Export(ExportMessage::Exported(value))
                 })
             }
             ExportMessage::ExportPng => {
-                self.export_open = None;
+                self.dialogs.export_open = None;
                 let scale = self.png_scale.max(0.1);
                 // Seals as wide in the image whatever its scale.
                 let seal = svg::SEAL_PIXELS / scale;

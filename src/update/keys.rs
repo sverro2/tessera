@@ -20,28 +20,28 @@ impl Tessera {
     pub(crate) fn update_keys(&mut self, message: KeysMessage) -> Task<Message> {
         match message {
             KeysMessage::ShowKeys(open) => {
-                self.keys_open = open;
-                self.rebinding = None;
-                self.menu = None;
+                self.dialogs.keys_open = open;
+                self.dialogs.rebinding = None;
+                self.dialogs.menu = None;
                 Task::none()
             }
             KeysMessage::Rebind(rebinding) => {
-                self.rebinding = rebinding;
+                self.dialogs.rebinding = rebinding;
                 Task::none()
             }
             KeysMessage::Unbind(action, index) => {
                 self.keys.unbind(action, index);
-                self.rebinding = None;
+                self.dialogs.rebinding = None;
                 Task::none()
             }
             KeysMessage::ResetKey(action) => {
                 self.keys.reset(action);
-                self.rebinding = None;
+                self.dialogs.rebinding = None;
                 Task::none()
             }
             KeysMessage::ResetKeys => {
                 self.keys.reset_all();
-                self.rebinding = None;
+                self.dialogs.rebinding = None;
                 self.notify("All shortcuts back to their defaults".into(), false);
                 Task::none()
             }

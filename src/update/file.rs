@@ -33,7 +33,7 @@ impl Tessera {
     pub(crate) fn update_file(&mut self, message: FileMessage) -> Task<Message> {
         match message {
             FileMessage::New => {
-                self.menu = None;
+                self.dialogs.menu = None;
                 // A blank canvas is new already.
                 if self.is_blank() {
                     return Task::none();
@@ -41,11 +41,11 @@ impl Tessera {
                 self.replace(Replace::New)
             }
             FileMessage::Open => {
-                self.menu = None;
+                self.dialogs.menu = None;
                 self.replace(Replace::Open)
             }
             FileMessage::OpenRecent(path) => {
-                self.menu = None;
+                self.dialogs.menu = None;
                 self.replace(Replace::OpenPath(path))
             }
             FileMessage::Hovered(path) => {
@@ -80,7 +80,7 @@ impl Tessera {
                 Task::none()
             }
             FileMessage::ClearRecent => {
-                self.menu = None;
+                self.dialogs.menu = None;
                 self.recent_files.clear();
                 Task::none()
             }
@@ -104,7 +104,7 @@ impl Tessera {
             }),
             FileMessage::Replace(Replace::Quit(id)) => window::close(id),
             FileMessage::Confirm(choice) => {
-                let Some(then) = self.confirming.take() else {
+                let Some(then) = self.dialogs.confirming.take() else {
                     return Task::none();
                 };
                 match choice {
@@ -168,11 +168,11 @@ impl Tessera {
                 Task::none()
             }
             FileMessage::Save => {
-                self.menu = None;
+                self.dialogs.menu = None;
                 self.save(false, None)
             }
             FileMessage::SaveAs => {
-                self.menu = None;
+                self.dialogs.menu = None;
                 self.save(true, None)
             }
             FileMessage::Saved(result, versions, then) => {

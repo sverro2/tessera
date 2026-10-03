@@ -16,21 +16,22 @@ impl Tessera {
     pub(crate) fn update_snap(&mut self, message: SnapMessage) -> Task<Message> {
         match message {
             SnapMessage::Show(open) => {
-                self.menu = None;
-                self.snap_dialog = open.then(|| format_step(self.snap.grid));
+                self.dialogs.menu = None;
+                self.dialogs.snap_dialog = open.then(|| format_step(self.snap.grid));
             }
             SnapMessage::Grid(text) => {
-                if let Some(dialog) = &mut self.snap_dialog {
+                if let Some(dialog) = &mut self.dialogs.snap_dialog {
                     *dialog = text;
                 }
             }
             SnapMessage::Apply => {
                 let step = self
+                    .dialogs
                     .snap_dialog
                     .as_deref()
                     .and_then(|text| text.trim().parse::<f32>().ok());
                 if step.is_some_and(|step| self.snap.set_grid(step)) {
-                    self.snap_dialog = None;
+                    self.dialogs.snap_dialog = None;
                     // The dot grid goes with it.
                     self.caches.grid.clear();
                 }

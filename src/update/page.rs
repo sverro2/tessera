@@ -43,8 +43,8 @@ impl Tessera {
     pub(crate) fn update_page(&mut self, message: PageMessage) -> Task<Message> {
         match message {
             PageMessage::Show(open) => {
-                self.menu = None;
-                self.page_dialog = open.then(|| {
+                self.dialogs.menu = None;
+                self.dialogs.page_dialog = open.then(|| {
                     let page = self.layers.page();
                     let (width, height) = page.map_or((2480, 3508), |page| {
                         (
@@ -61,7 +61,7 @@ impl Tessera {
                 });
             }
             PageMessage::Preset(preset) => {
-                if let Some(dialog) = &mut self.page_dialog {
+                if let Some(dialog) = &mut self.dialogs.page_dialog {
                     dialog.preset = preset;
                     // As it comes (turning it is up to the orientation).
                     if let Some((w, h)) = preset.pixels() {
@@ -71,33 +71,33 @@ impl Tessera {
                 }
             }
             PageMessage::Width(width) => {
-                if let Some(dialog) = &mut self.page_dialog {
+                if let Some(dialog) = &mut self.dialogs.page_dialog {
                     dialog.width = width;
                     dialog.preset = preset_of(dialog);
                 }
             }
             PageMessage::Height(height) => {
-                if let Some(dialog) = &mut self.page_dialog {
+                if let Some(dialog) = &mut self.dialogs.page_dialog {
                     dialog.height = height;
                     dialog.preset = preset_of(dialog);
                 }
             }
             PageMessage::Turn => {
-                if let Some(dialog) = &mut self.page_dialog {
+                if let Some(dialog) = &mut self.dialogs.page_dialog {
                     std::mem::swap(&mut dialog.width, &mut dialog.height);
                 }
             }
             PageMessage::Centre(centre) => {
-                if let Some(dialog) = &mut self.page_dialog {
+                if let Some(dialog) = &mut self.dialogs.page_dialog {
                     dialog.centre = centre;
                 }
             }
             PageMessage::Apply => {
-                let Some(dialog) = self.page_dialog.take() else {
+                let Some(dialog) = self.dialogs.page_dialog.take() else {
                     return Task::none();
                 };
                 let Some(size) = dialog.size() else {
-                    self.page_dialog = Some(dialog);
+                    self.dialogs.page_dialog = Some(dialog);
                     return Task::none();
                 };
                 let center = match self.layers.page() {
@@ -123,7 +123,7 @@ impl Tessera {
                 self.caches.grid.clear();
             }
             PageMessage::Remove => {
-                self.page_dialog = None;
+                self.dialogs.page_dialog = None;
                 self.set_page(None);
             }
         }

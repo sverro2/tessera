@@ -46,7 +46,7 @@ use iced::{Center, Color, Element, Fill, Padding, Subscription, Task, Theme};
 
 use background::Background;
 use camera::Camera;
-use dialogs::dropping_hint;
+use dialogs::{Dialogs, dropping_hint};
 use disk::{open_file, pick_image, read_file, save_file, save_png, save_svg};
 use document::{Document, Edit};
 use editor::Tool;
@@ -131,12 +131,6 @@ struct Tessera {
     /// (which starts out saved). Anything else has unsaved changes; moving
     /// the view doesn't count.
     saved: Option<Signature>,
-    /// The menu that is open, if any.
-    menu: Option<Menu>,
-    /// Whether the about box is open.
-    about: bool,
-    /// Asking what to do with unsaved changes before doing this.
-    confirming: Option<Replace>,
     /// A short message about what just happened, fading out.
     notice: Option<Notice>,
     /// An image to draw over, kept with the document (not part of undo).
@@ -188,24 +182,11 @@ struct Tessera {
     clipboard: Option<document::Piece>,
     /// Which keys do what (kept in the config folder).
     keys: Keymap,
-    /// Exporting: its dialog open (for what), whether just the document is
-    /// exported (its size set), and how large a PNG is and on what (as last
-    /// chosen).
-    export_open: Option<Format>,
     export_to_page: bool,
     png_scale: f32,
     png_backdrop: raster::Backdrop,
-    /// The keyboard shortcuts shown (F1); and one being set: the next key
-    /// pressed goes to this action (instead of its key at that place, or
-    /// as another).
-    keys_open: bool,
-    /// The document size dialog, as filled in so far, while it's open.
-    page_dialog: Option<PageDialog>,
-    /// How dragged points snap (kept in the config folder); and its
-    /// dialog's grid step, as typed, while it's open.
+    /// How dragged points snap (kept in the config folder).
     snap: snap::Snap,
-    snap_dialog: Option<String>,
-    rebinding: Option<(Action, Option<usize>)>,
     /// The modifier keys held (Shift turns painting a layer into painting
     /// all layers).
     modifiers: keyboard::Modifiers,
@@ -214,6 +195,8 @@ struct Tessera {
     window_size: Option<iced::Size>,
     /// Undo and redo: the layers as they were before each change, most recent last; and as they were before each undo. Unchanged drawings are shared.
     history: History,
+    /// What's open over the canvas: a menu, or a dialog.
+    dialogs: Dialogs,
 }
 
 /// The background panel's number fields, as typed (so half-typed numbers
@@ -542,7 +525,7 @@ impl Tessera {
             Message::Page(message) => self.update_page(message),
             Message::Snap(message) => self.update_snap(message),
             Message::Undo => {
-                self.menu = None;
+                self.dialogs.menu = None;
                 if !self.history.undo(&mut self.layers) {
                     return Task::none();
                 }
@@ -550,7 +533,7 @@ impl Tessera {
                 Task::none()
             }
             Message::Redo => {
-                self.menu = None;
+                self.dialogs.menu = None;
                 if !self.history.redo(&mut self.layers) {
                     return Task::none();
                 }
@@ -585,7 +568,7 @@ impl Tessera {
                 Task::none()
             }
             Message::ResetView => {
-                self.menu = None;
+                self.dialogs.menu = None;
                 self.camera = Camera::default();
                 self.view_changed()
             }
@@ -631,11 +614,11 @@ impl Tessera {
     ) -> Task<Message> {
         let escape = key == Key::Named(keyboard::key::Named::Escape);
         // Setting a key: the next one pressed (Esc: never mind).
-        if let Some((action, index)) = self.rebinding {
+        if let Some((action, index)) = self.dialogs.rebinding {
             if escape {
-                self.rebinding = None;
+                self.dialogs.rebinding = None;
             } else if let Some(chord) = Chord::pressed(&key, physical_key, modifiers) {
-                self.rebinding = None;
+                self.dialogs.rebinding = None;
                 let taken = self.keys.bind(action, index, chord.clone());
                 if !taken.is_empty() {
                     let from: Vec<_> = taken.iter().map(|a| a.label()).collect();
@@ -648,25 +631,13 @@ impl Tessera {
             return Task::none();
         }
         if escape {
-            self.menu = None;
-            self.confirming = None;
-            self.about = false;
-            self.keys_open = false;
-            self.export_open = None;
-            self.page_dialog = None;
-            self.snap_dialog = None;
+            self.dialogs = Dialogs::default();
             self.editing_background = false;
             self.picking = false;
             self.placing_mirror = false;
             return Task::none();
         }
-        if self.confirming.is_some()
-            || self.about
-            || self.keys_open
-            || self.export_open.is_some()
-            || self.page_dialog.is_some()
-            || self.snap_dialog.is_some()
-        {
+        if self.dialogs.dialog_open() {
             return Task::none();
         }
         let context = match self.mode {
@@ -742,7 +713,7 @@ impl Tessera {
         // Leaving this file (unless that's cancelled): where the user was.
         self.remember_place();
         if self.is_unsaved() {
-            self.confirming = Some(replace);
+            self.dialogs.confirming = Some(replace);
             Task::none()
         } else {
             Task::done(Message::File(FileMessage::Replace(replace)))
@@ -787,7 +758,7 @@ impl Tessera {
             let button = button(text(label).size(14))
                 .width(MENU_WIDTH)
                 .padding([6, 12])
-                .style(if self.menu == Some(menu) {
+                .style(if self.dialogs.menu == Some(menu) {
                     button::secondary
                 } else {
                     button::text
@@ -857,7 +828,7 @@ impl Tessera {
                         proportional: self.proportional.then_some(self.reach),
                         clipboard: self.clipboard.as_ref(),
                         // Not while they're being looked up (or set).
-                        keys: (!self.keys_open).then_some(&self.keys),
+                        keys: (!self.dialogs.keys_open).then_some(&self.keys),
                         // Back to front; hidden ones not, though out of view
                         // while others are isolated.
                         lit: self
@@ -904,28 +875,28 @@ impl Tessera {
             .on_press(Message::Menu(MenuMessage::CloseMenu)),
             row![canvas, self.layers_panel()],
         ]];
-        if let Some(menu) = self.menu {
+        if let Some(menu) = self.dialogs.menu {
             screen = screen.push(self.dropdown(menu));
         }
-        if self.about {
+        if self.dialogs.about {
             screen = screen.push(self.about_box());
         }
-        if self.keys_open {
+        if self.dialogs.keys_open {
             screen = screen.push(self.shortcuts());
         }
-        if let Some(format) = self.export_open {
+        if let Some(format) = self.dialogs.export_open {
             screen = screen.push(self.export_dialog(format));
         }
-        if let Some(dialog) = &self.page_dialog {
+        if let Some(dialog) = &self.dialogs.page_dialog {
             screen = screen.push(self.page_dialog(dialog));
         }
-        if let Some(step) = &self.snap_dialog {
+        if let Some(step) = &self.dialogs.snap_dialog {
             screen = screen.push(self.snap_dialog(step));
         }
         if let Some(path) = &self.dropping {
             screen = screen.push(dropping_hint(path));
         }
-        if self.confirming.is_some() {
+        if self.dialogs.confirming.is_some() {
             screen = screen.push(self.confirmation());
         }
         screen.into()
