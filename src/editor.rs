@@ -417,14 +417,18 @@ impl canvas::Program<Message> for Backdrop<'_> {
             draw_grid(frame, self.camera, self.grid);
             if let (Some(sheet), Some(page)) = (&sheet, self.page) {
                 frame.stroke(sheet, stroke(PAGE_EDGE, 1.0));
-                // Its size, above its top left corner (as seen).
+                // Its size, above its top left corner, turned with it.
                 let corner = self.camera.to_screen(page.min());
-                frame.fill_text(canvas::Text {
-                    content: format!("{:.0} × {:.0}", page.size.width, page.size.height),
-                    position: corner + Vector::new(0.0, -18.0),
-                    color: PAGE_EDGE,
-                    size: 12.0.into(),
-                    ..canvas::Text::default()
+                frame.with_save(|frame| {
+                    frame.translate(corner - Point::ORIGIN);
+                    frame.rotate(self.camera.rotation);
+                    frame.fill_text(canvas::Text {
+                        content: format!("{:.0} × {:.0}", page.size.width, page.size.height),
+                        position: Point::new(0.0, -18.0),
+                        color: PAGE_EDGE,
+                        size: 12.0.into(),
+                        ..canvas::Text::default()
+                    });
                 });
             }
         })]
