@@ -126,7 +126,7 @@ struct Tessera {
     /// The window's size, once it has been resized (or first laid out);
     /// until then, the size it opens at.
     window_size: Option<iced::Size>,
-    /// Undo and redo: the layers as they were before each change, most recent last; and as they were before each undo. Unchanged drawings are shared.
+    /// Undo and redo (see [`History`]).
     history: History,
     /// What's open over the canvas: a menu, or a dialog.
     dialogs: Dialogs,
@@ -134,7 +134,8 @@ struct Tessera {
     export: ExportSettings,
     /// The brush and painting with it.
     paint: Painting,
-    /// The layers panel: what's selected, named, dragged, pointed at and isolated in it.
+    /// The layers panel: what's selected, named, dragged, pointed at and
+    /// isolated in it.
     layers_panel: LayersPanel,
     /// The layers' background images, and adjusting them.
     backgrounds: Backgrounds,

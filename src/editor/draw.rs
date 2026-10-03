@@ -137,6 +137,20 @@ pub(super) fn push_layer(
     }
 }
 
+/// Why nothing can be edited: the current layer is out of view.
+pub(super) fn draw_out_of_view(overlay: &mut Frame, bounds: Rectangle) {
+    overlay.fill_text(canvas::Text {
+        content:
+            "The current layer is out of view (hidden, or others isolated): show it to edit it"
+                .into(),
+        position: Point::new(bounds.width / 2.0, 14.0),
+        color: EDGE,
+        size: 13.0.into(),
+        align_x: iced::widget::text::Alignment::Center,
+        ..canvas::Text::default()
+    });
+}
+
 /// The layers, with the overlay over them.
 pub(super) fn with_overlay(mut layers: Vec<Drawn>, overlay: Frame) -> Vec<Drawn> {
     layers.push(Drawn::Geometry(overlay.into_geometry()));
@@ -178,8 +192,6 @@ impl Editor<'_> {
         others_view: &Editor,
         meshes: bool,
     ) -> Vec<Drawn> {
-        let camera = self.camera;
-
         // While dragging, draw the document as it will be after release.
         let pending = match state.interaction {
             Interaction::Idle
@@ -198,10 +210,51 @@ impl Editor<'_> {
             _ => None,
         };
 
-        // The layers: in the paint mode as they are, in their order;
-        // otherwise the others faded, and the current layer over them all,
-        // so it's always seen whole.
-        let size = bounds.size();
+        let layers = self.draw_layers(
+            state,
+            renderer,
+            bounds.size(),
+            others_view,
+            meshes,
+            pending,
+            source,
+        );
+
+        let mut overlay = Frame::new(renderer, bounds.size());
+        self.draw_lit(&mut overlay);
+        let cursor_pos = cursor.position_in(bounds);
+        match self.tool {
+            // Adjusting the background: just its outline; the drawing rests.
+            Tool::Background { .. } => self.draw_background_outline(&mut overlay),
+            // Hidden: nothing to edit; say why clicking does nothing.
+            _ if !self.shown => draw_out_of_view(&mut overlay, bounds),
+            // Painting: what the stroke paints so far, what clicking would
+            // paint, and the brush as the cursor.
+            Tool::Paint { .. } => self.draw_painting(&mut overlay, state, cursor_pos),
+            Tool::Mirror => self.draw_placing_mirror(&mut overlay, state, bounds, cursor_pos),
+            Tool::Shape => {
+                self.draw_shaping(&mut overlay, state, bounds, cursor_pos, pending, source)
+            }
+        }
+        with_overlay(layers, overlay)
+    }
+
+    /// The layers: in the paint mode as they are, in their order;
+    /// otherwise the others faded, and the current layer over them all, so
+    /// it's always seen whole; while dragging (`pending`) or tweaking an
+    /// edge, the current one as it will be. Then those pointed at in the
+    /// layers panel, lit up. The others as `others_view` sees them.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_layers(
+        &self,
+        state: &State,
+        renderer: &Renderer,
+        size: Size,
+        others_view: &Editor,
+        meshes: bool,
+        pending: Option<&Pending>,
+        source: Option<(VertexId, VertexId)>,
+    ) -> Vec<Drawn> {
         let look = self.look();
         let others = if look == Look::Painted {
             Look::Painted
@@ -310,60 +363,47 @@ impl Editor<'_> {
                     .flatten(),
             );
         }
+        layers
+    }
 
-        let mut overlay = Frame::new(renderer, bounds.size());
-        self.draw_lit(&mut overlay);
-        let cursor_pos = cursor.position_in(bounds);
-
-        // Adjusting the background: just its outline; the drawing rests.
-        if matches!(self.tool, Tool::Background { .. }) {
-            if let Some(background) = self.background {
-                let corners = background.corners().map(|p| camera.to_screen(p));
-                let outline = Path::new(|p| {
-                    p.move_to(corners[0]);
-                    for &corner in &corners[1..] {
-                        p.line_to(corner);
-                    }
-                    p.close();
-                });
-                let dashed = Stroke {
-                    line_dash: LineDash {
-                        segments: &[6.0, 4.0],
-                        offset: 0,
-                    },
-                    ..stroke(HOVER, 2.0)
-                };
-                overlay.stroke(&outline, dashed);
+    /// Adjusting the background: its outline, dashed.
+    fn draw_background_outline(&self, overlay: &mut Frame) {
+        let Some(background) = self.background else {
+            return;
+        };
+        let corners = background.corners().map(|p| self.camera.to_screen(p));
+        let outline = Path::new(|p| {
+            p.move_to(corners[0]);
+            for &corner in &corners[1..] {
+                p.line_to(corner);
             }
-            return with_overlay(layers, overlay);
-        }
+            p.close();
+        });
+        let dashed = Stroke {
+            line_dash: LineDash {
+                segments: &[6.0, 4.0],
+                offset: 0,
+            },
+            ..stroke(HOVER, 2.0)
+        };
+        overlay.stroke(&outline, dashed);
+    }
 
-        // Hidden: nothing to edit; say why clicking does nothing.
-        if !self.shown {
-            overlay.fill_text(canvas::Text {
-                content: "The current layer is out of view (hidden, or others isolated): show it to edit it".into(),
-                position: Point::new(bounds.width / 2.0, 14.0),
-                color: EDGE,
-                size: 13.0.into(),
-                align_x: iced::widget::text::Alignment::Center,
-                ..canvas::Text::default()
-            });
-            return with_overlay(layers, overlay);
-        }
-
-        // Painting: what the stroke paints so far, what clicking would
-        // paint, and the brush as the cursor.
-        if matches!(self.tool, Tool::Paint { .. }) {
-            self.draw_painting(&mut overlay, state, cursor_pos);
-            return with_overlay(layers, overlay);
-        }
-
-        if self.tool == Tool::Mirror {
-            self.draw_placing_mirror(&mut overlay, state, bounds, cursor_pos);
-            return with_overlay(layers, overlay);
-        }
+    /// The shape mode's overlay: the mirror lines, the shape hovered (and
+    /// the rest dimmed), the grid and guides a drag lines up with, and what
+    /// the drag would do.
+    fn draw_shaping(
+        &self,
+        overlay: &mut Frame,
+        state: &State,
+        bounds: Rectangle,
+        cursor_pos: Option<Point>,
+        pending: Option<&Pending>,
+        source: Option<(VertexId, VertexId)>,
+    ) {
+        let camera = self.camera;
         for &mirror in self.mirrors {
-            self.draw_mirror_line(&mut overlay, mirror, bounds, Color { a: 0.6, ..MIRROR });
+            self.draw_mirror_line(overlay, mirror, bounds, Color { a: 0.6, ..MIRROR });
         }
 
         let hover = cursor_pos.and_then(|p| self.hit_test(p));
@@ -433,7 +473,7 @@ impl Editor<'_> {
 
         for (shape, strength) in highlighted {
             if let Some(shape) = shape {
-                self.draw_shape(&mut overlay, document, shape, strength);
+                self.draw_shape(overlay, document, shape, strength);
             }
         }
 
@@ -453,7 +493,7 @@ impl Editor<'_> {
                 Some(pending) => self.placed(state, pending),
                 None => cursor_pos.map(|p| camera.to_world(p)).into_iter().collect(),
             };
-            self.draw_snap_grid(&mut overlay, &points);
+            self.draw_snap_grid(overlay, &points);
         }
         // Holding Ctrl or Shift before pressing, as pressing then would:
         // with Ctrl, the grid around the cursor; on blank canvas, where a
@@ -469,7 +509,7 @@ impl Editor<'_> {
         {
             let world = camera.to_world(cursor);
             if grid {
-                self.draw_snap_grid(&mut overlay, &[world]);
+                self.draw_snap_grid(overlay, &[world]);
             }
             if state.selection.is_empty() && hover.is_none() {
                 let (start, _, near) = self.creation_start(world, grid, shift);
@@ -479,7 +519,7 @@ impl Editor<'_> {
                     .filter(|&&guide| self.runs_through(guide, start))
                 {
                     let shape = guide.shape(self.document, camera);
-                    self.draw_guide_line(&mut overlay, guide, shape, true, reach);
+                    self.draw_guide_line(overlay, guide, shape, true, reach);
                 }
                 // With Shift alone, only where it lines up (else it's just
                 // where the cursor is).
@@ -501,7 +541,7 @@ impl Editor<'_> {
                     | Interaction::Extruding { .. }
             )
         {
-            self.draw_guides(&mut overlay, state, pending, bounds);
+            self.draw_guides(overlay, state, pending, bounds);
         }
         // Pasting where it doesn't fit: the piece, in red.
         if let (Interaction::Pasting { base, from, to }, None, Some(piece)) =
@@ -513,7 +553,7 @@ impl Editor<'_> {
             overlay.fill(&mesh, Color { a: 0.3, ..REMOVED });
             overlay.stroke(&mesh, stroke(REMOVED, 1.5));
         }
-        self.draw_selection(&mut overlay, state, pending, cursor_pos);
+        self.draw_selection(overlay, state, pending, cursor_pos);
 
         match (state.interaction, &pending) {
             (
@@ -536,13 +576,13 @@ impl Editor<'_> {
                     // A ring as well, to stand out against the shape outline.
                     let at = camera.to_screen(self.document.vertex(id));
                     overlay.stroke(&Path::circle(at, 11.0), stroke(HOVER, 2.5));
-                    handle(&mut overlay, at, HOVER);
+                    handle(overlay, at, HOVER);
                 }
                 Some((_, Some(Hover::Edge { a, b, at }))) => {
                     let a = camera.to_screen(self.document.vertex(a));
                     let b = camera.to_screen(self.document.vertex(b));
                     overlay.stroke(&Path::line(a, b), stroke(HOVER, 2.5));
-                    handle(&mut overlay, camera.to_screen(at), HOVER);
+                    handle(overlay, camera.to_screen(at), HOVER);
                 }
                 Some((p, hover)) => {
                     // A face lights up: it's what D would delete.
@@ -592,17 +632,15 @@ impl Editor<'_> {
                 } else {
                     ADDED
                 };
-                handle(&mut overlay, at, color);
+                handle(overlay, at, color);
             }
             // Releasing now would do nothing.
             (_, None) => {
                 if let Some(p) = cursor_pos {
-                    handle(&mut overlay, p, EDGE);
+                    handle(overlay, p, EDGE);
                 }
             }
         }
-
-        with_overlay(layers, overlay)
     }
 
     /// Draws the current layer, or what it's about to become.
