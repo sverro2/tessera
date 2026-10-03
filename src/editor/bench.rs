@@ -634,7 +634,10 @@ fn bench_render() {
     };
     let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
     let layers = &contents.layers;
-    let current = layers.first_layer();
+    let named = std::env::var("TESSERA_BENCH_LAYER").ok();
+    let current = named
+        .and_then(|name| layers.layers().iter().find(|layer| layer.name == name).map(|layer| layer.id))
+        .unwrap_or_else(|| layers.first_layer());
     fn scene_layer(layer: &crate::layers::Layer) -> SceneLayer<'_> {
         SceneLayer {
             id: layer.id,
@@ -717,7 +720,9 @@ fn bench_render() {
             editor.above = above.iter().map(|l| SceneLayer { ..*l }).collect();
             editor.tool = tool;
             let state = State::default();
-            for meshes in [false, true] {
+            // Only with meshes (as the app on a GPU), if `TESSERA_BENCH_MESHES` is set.
+            let only_meshes = std::env::var("TESSERA_BENCH_MESHES").is_ok();
+            for meshes in [false, true].into_iter().filter(|&m| m || !only_meshes) {
                 let frames = 8;
                 let mut times = Vec::new();
                 for frame in 0..frames {
@@ -788,7 +793,9 @@ fn bench_face_meshes() {
             let mut editor = super::tests::editor(doc, &cache);
             editor.camera = camera;
             let seen = editor.view(&frame, 0.0);
-            for (color, triangles) in painted_faces(doc, &seen) {
+            let derived = editor.derived(doc);
+            let visible = derived.visible(doc, &seen);
+            for (color, triangles) in painted_faces(doc, &visible, derived.colors(doc)) {
                 frame.fill(&editor.mesh(triangles.into_iter()), color);
             }
         }

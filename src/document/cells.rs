@@ -10,7 +10,7 @@ use super::quick::QuickMap;
 /// edge across the drawing, say): looked at for every query.
 const MAX_CELLS: i64 = 64;
 
-pub(super) struct Cells {
+pub(crate) struct Cells {
     /// How wide a cell is (world units).
     size: f32,
     cells: QuickMap<(i64, i64), Vec<usize>>,
@@ -44,7 +44,7 @@ impl Cells {
     }
 
     /// Each of `shapes` (its corners) by its place among them.
-    pub(super) fn of_shapes<const N: usize>(shapes: impl Iterator<Item = [Point; N]>) -> Self {
+    pub(crate) fn of_shapes<const N: usize>(shapes: impl Iterator<Item = [Point; N]>) -> Self {
         let shapes: Vec<(Point, Point)> =
             shapes.map(|corners| bounds(corners.into_iter())).collect();
         let all = bounds(shapes.iter().flat_map(|&(min, max)| [min, max]));
@@ -79,7 +79,7 @@ impl Cells {
     /// The things in the cells the rectangle `min`–`max` touches: all that
     /// may reach into it (and some that don't); a thing in several of
     /// those cells, more than once.
-    pub(super) fn within(&self, min: Point, max: Point) -> impl Iterator<Item = usize> + '_ {
+    pub(crate) fn within(&self, min: Point, max: Point) -> impl Iterator<Item = usize> + '_ {
         let ((x0, y0), (x1, y1)) = (self.cell(min), self.cell(max));
         // A query wider than there are cells: just all of them.
         let wide = (x1 - x0 + 1).saturating_mul(y1 - y0 + 1) > self.cells.len() as i64;

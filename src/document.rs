@@ -27,7 +27,7 @@ use iced::{Color, Point, Vector};
 
 use crate::geometry::{Affine, area2, min_height, overlap};
 
-mod cells;
+pub(crate) mod cells;
 mod fill;
 mod quick;
 

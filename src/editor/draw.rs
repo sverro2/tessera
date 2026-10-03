@@ -1,7 +1,10 @@
 //! Drawing the canvas: the layers (each cached), and over them what a
 //! drag would do.
 
+use std::cell::OnceCell;
+
 use super::*;
+use crate::document::cells::Cells;
 
 /// Edges of `before` that the pending result no longer has, as ids after
 /// it. Vertices are never removed, so they can be drawn where their ends
@@ -150,74 +153,175 @@ pub(super) fn detail(length: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// How crowded a drawing's lines are (world units: times the zoom, on
-/// screen; see [`detail`]). An edge by its length or by how close the
-/// edges beside it are, whichever is less: a sliver's long sides lie as
-/// close together as it's thin (its height across them), crowding as much
-/// as short edges do.
-pub(super) struct Spacing {
-    /// Each triangle's edges (`ab`, `bc`, `ca`); infinite on the outline,
-    /// which the plain look keeps however far out, so the shape stays.
-    by_triangle: Vec<[f32; 3]>,
-    /// Each edge once, as `(low, high)`.
-    edges: Vec<((VertexId, VertexId), f32)>,
-    /// Each vertex's shortest edge (by vertex id).
-    shortest: Vec<f32>,
+/// A side of a triangle (`ab`, `bc` or `ca`), as drawing it needs.
+#[derive(Clone, Copy)]
+pub(super) struct Side {
+    /// How crowded it is (world units: times the zoom, on screen; see
+    /// [`detail`]): by its length or by how close the edges beside it
+    /// are, whichever is less. A sliver's long sides lie as close
+    /// together as it's thin (its height across them), crowding as much as
+    /// short edges do.
+    near: f32,
+    /// On the drawing's outline (used by this triangle only), which the
+    /// plain look keeps however far out, so the shape stays.
+    outline: bool,
+    /// The first triangle (lowest id) with this edge: so each edge is
+    /// drawn once. Whenever an edge may show, so may each triangle with it
+    /// (it's within their bounds), so going through those that may show
+    /// finds every edge that may.
+    owns_edge: bool,
+    /// The first triangle with the vertex it starts at, likewise.
+    owns_start: bool,
+    /// Its edge is painted.
+    painted: bool,
 }
 
-impl Spacing {
-    fn of(document: &Document) -> Spacing {
-        let triangles = document.triangle_ids();
-        let mut shortest = vec![f32::INFINITY; document.vertex_slots()];
-        // Each side of each triangle: its edge, spacing, and where it is.
-        let mut sides = Vec::with_capacity(triangles.len() * 3);
-        for (t, &[a, b, c]) in triangles.iter().enumerate() {
-            let [pa, pb, pc] = [a, b, c].map(|v| document.vertex(v));
-            let area2 = ((pb - pa).x * (pc - pa).y - (pb - pa).y * (pc - pa).x).abs();
-            for (k, ((u, v), (p, q))) in [((a, b), (pa, pb)), ((b, c), (pb, pc)), ((c, a), (pc, pa))]
-                .into_iter()
-                .enumerate()
-            {
-                let length = p.distance(q);
-                // Its height across this edge.
-                let height = if length > 0.0 { area2 / length } else { 0.0 };
-                sides.push(((u.min(v), u.max(v)), length.min(height), t * 3 + k));
-                shortest[u] = shortest[u].min(length);
-                shortest[v] = shortest[v].min(length);
-            }
+/// What drawing a drawing needs worked out from it, beyond what it says:
+/// remembered while it's drawn (by its revision), and each part only once
+/// it's needed.
+pub(super) struct Derived {
+    /// Each triangle's sides.
+    sides: OnceCell<Vec<[Side; 3]>>,
+    /// Each vertex's shortest edge (by vertex id; world units).
+    shortest: OnceCell<Vec<f32>>,
+    /// Each triangle's colour, as [`Document::colors`] has them (looked up
+    /// one by one, they take a while).
+    colors: OnceCell<Vec<Option<Color>>>,
+    /// The triangles by place, with the bounds of all of them, to find
+    /// those in view without going through all of them; none if empty.
+    index: OnceCell<Option<(Cells, Point, Point)>>,
+    /// How often it was asked for: one drawn just once (a mirror image
+    /// worked out anew each time) isn't worth indexing.
+    uses: Cell<u32>,
+}
+
+impl Derived {
+    fn new() -> Self {
+        Derived {
+            sides: OnceCell::new(),
+            shortest: OnceCell::new(),
+            colors: OnceCell::new(),
+            index: OnceCell::new(),
+            uses: Cell::new(0),
         }
-        sides.sort_unstable_by_key(|&(edge, ..)| edge);
-        let mut by_triangle = vec![[f32::INFINITY; 3]; triangles.len()];
-        let mut edges = Vec::new();
-        for run in sides.chunk_by(|x, y| x.0 == y.0) {
-            let near = run.iter().map(|&(_, near, _)| near).fold(f32::INFINITY, f32::min);
-            edges.push((run[0].0, near));
-            // Between two triangles (else on the outline).
-            if run.len() > 1 {
-                for &(_, _, at) in run {
-                    by_triangle[at / 3][at % 3] = near;
+    }
+
+    pub(super) fn sides(&self, document: &Document) -> &[[Side; 3]] {
+        self.sides.get_or_init(|| sides_of(document))
+    }
+
+    pub(super) fn shortest(&self, document: &Document) -> &[f32] {
+        self.shortest.get_or_init(|| {
+            let mut shortest = vec![f32::INFINITY; document.vertex_slots()];
+            for &[a, b, c] in document.triangle_ids() {
+                for (u, v) in [(a, b), (b, c), (c, a)] {
+                    let length = document.vertex(u).distance(document.vertex(v));
+                    shortest[u] = shortest[u].min(length);
+                    shortest[v] = shortest[v].min(length);
                 }
             }
-        }
-        Spacing {
-            by_triangle,
-            edges,
-            shortest,
+            shortest
+        })
+    }
+
+    pub(super) fn colors(&self, document: &Document) -> &[Option<Color>] {
+        self.colors.get_or_init(|| document.colors().collect())
+    }
+
+    /// The triangles that may show in `seen`, in order. When it's only a
+    /// little of the drawing, found by place.
+    pub(super) fn visible(&self, document: &Document, seen: &View) -> Vec<TriangleId> {
+        let triangles = document.triangle_ids();
+        let shows = |t: TriangleId| seen.shows(&triangles[t].map(|v| document.vertex(v)));
+        let area = |min: Point, max: Point| (max.x - min.x).max(0.0) * (max.y - min.y).max(0.0);
+        // Drawn more than once, and big enough to bother.
+        let indexed = (self.uses.get() > 1 && triangles.len() > 256)
+            .then(|| {
+                self.index.get_or_init(|| {
+                    let (min, max) = document.bounds()?;
+                    Some((Cells::of_shapes(document.triangles()), min, max))
+                })
+            })
+            .and_then(Option::as_ref);
+        match indexed {
+            // A small part of it in view.
+            Some((cells, min, max)) if 4.0 * area(seen.min, seen.max) < area(*min, *max) => {
+                let mut found: Vec<TriangleId> = cells.within(seen.min, seen.max).collect();
+                found.sort_unstable();
+                found.dedup();
+                found.retain(|&t| shows(t));
+                found
+            }
+            _ => (0..triangles.len()).filter(|&t| shows(t)).collect(),
         }
     }
 }
 
-/// The painted faces `seen` says, by colour.
+/// Each triangle's sides of `document`.
+fn sides_of(document: &Document) -> Vec<[Side; 3]> {
+    let triangles = document.triangle_ids();
+    let mut first_with = vec![usize::MAX; document.vertex_slots()];
+    // Each side of each triangle: its edge, how crowded, and where it is.
+    let mut all = Vec::with_capacity(triangles.len() * 3);
+    for (t, &[a, b, c]) in triangles.iter().enumerate() {
+        let [pa, pb, pc] = [a, b, c].map(|v| document.vertex(v));
+        let area2 = ((pb - pa).x * (pc - pa).y - (pb - pa).y * (pc - pa).x).abs();
+        for (k, ((u, v), (p, q))) in [((a, b), (pa, pb)), ((b, c), (pb, pc)), ((c, a), (pc, pa))]
+            .into_iter()
+            .enumerate()
+        {
+            let length = p.distance(q);
+            // Its height across this edge.
+            let height = if length > 0.0 { area2 / length } else { 0.0 };
+            all.push(((u.min(v), u.max(v)), length.min(height), t * 3 + k));
+        }
+        for v in [a, b, c] {
+            if first_with[v] == usize::MAX {
+                first_with[v] = t;
+            }
+        }
+    }
+    let unset = Side {
+        near: f32::INFINITY,
+        outline: false,
+        owns_edge: false,
+        owns_start: false,
+        painted: false,
+    };
+    let mut sides = vec![[unset; 3]; triangles.len()];
+    all.sort_unstable_by_key(|&(edge, ..)| edge);
+    for run in all.chunk_by(|x, y| x.0 == y.0) {
+        let (u, v) = run[0].0;
+        let near = run.iter().map(|&(_, near, _)| near).fold(f32::INFINITY, f32::min);
+        let owner = run.iter().map(|&(.., at)| at).min().expect("a side");
+        let painted = document.edge_style(u, v).is_some();
+        for &(_, _, at) in run {
+            let (t, k) = (at / 3, at % 3);
+            let start = triangles[t][k];
+            sides[t][k] = Side {
+                near,
+                outline: run.len() == 1,
+                owns_edge: at == owner,
+                owns_start: first_with[start] == t,
+                painted,
+            };
+        }
+    }
+    sides
+}
+
+/// Of `visible` triangles (with these `colors`), the painted ones by
+/// colour.
 pub(super) fn painted_faces(
     document: &Document,
-    seen: &View,
+    visible: &[TriangleId],
+    colors: &[Option<Color>],
 ) -> Vec<(Color, Vec<[Point; 3]>)> {
+    let triangles = document.triangle_ids();
     let mut groups = ByColor::default();
-    for (t, color) in document.triangles().zip(document.colors()) {
-        if let Some(color) = color
-            && seen.shows(&t)
-        {
-            groups.add(color, t);
+    for &t in visible {
+        if let Some(color) = colors[t] {
+            groups.add(color, triangles[t].map(|v| document.vertex(v)));
         }
     }
     groups.0
@@ -898,11 +1002,14 @@ impl Editor<'_> {
         // Unpainted faces hatched, as they're not exported: plainly not
         // painted (and not some colour). Then the painted ones by colour.
         let screen = |v| self.camera.to_screen(document.vertex(v));
-        let unpainted: Vec<_> = document
-            .triangles()
-            .zip(document.colors())
-            .filter(|(t, color)| color.is_none() && seen.shows(t))
-            .map(|(t, _)| t)
+        let derived = self.derived(document);
+        let visible = derived.visible(document, &seen);
+        let colors = derived.colors(document);
+        let corners = |t: TriangleId| document.triangle_ids()[t].map(|v| document.vertex(v));
+        let unpainted: Vec<_> = visible
+            .iter()
+            .filter(|&&t| colors[t].is_none())
+            .map(|&t| corners(t))
             .collect();
         let unpainted_tint = Color { a: 0.05, ..EDGE };
         match meshes.as_deref_mut() {
@@ -910,17 +1017,15 @@ impl Editor<'_> {
                 for &t in &unpainted {
                     meshes.under.triangle(t.map(|p| self.camera.to_screen(p)), unpainted_tint);
                 }
-                for (t, color) in document.triangles().zip(document.colors()) {
-                    if let Some(color) = color
-                        && seen.shows(&t)
-                    {
-                        meshes.under.triangle(t.map(|p| self.camera.to_screen(p)), color);
+                for &t in &visible {
+                    if let Some(color) = colors[t] {
+                        meshes.under.triangle(corners(t).map(|p| self.camera.to_screen(p)), color);
                     }
                 }
             }
             None => {
                 frame.fill(&self.mesh(unpainted.iter().copied()), unpainted_tint);
-                for (color, triangles) in painted_faces(document, &seen) {
+                for (color, triangles) in painted_faces(document, &visible, colors) {
                     frame.fill(&self.mesh(triangles.into_iter()), color);
                 }
             }
@@ -938,16 +1043,19 @@ impl Editor<'_> {
         // Zoomed out, short ones fade away (see `detail`).
         let dashed = Color { a: 0.5, ..EDGE };
         let zoom = self.camera.zoom;
-        let unpainted: Vec<_> = self
-            .spacing(document)
-            .edges
-            .iter()
-            .map(|&((a, b), near)| (a, b, detail(near * zoom)))
-            .filter(|&(a, b, shown)| {
-                shown > 0.0 && document.edge_style(a, b).is_none() && shows(a, b)
-            })
-            .map(|(a, b, shown)| (screen(a), screen(b), shown))
-            .collect();
+        let sides = derived.sides(document);
+        let mut unpainted = Vec::new();
+        for &t in &visible {
+            let [a, b, c] = document.triangle_ids()[t];
+            for ((u, v), side) in [(a, b), (b, c), (c, a)].into_iter().zip(sides[t]) {
+                let shown = detail(side.near * zoom);
+                if side.owns_edge && !side.painted && shown > 0.0 && shows(u, v) {
+                    // From its lowest end, so its dashes stay put.
+                    let (u, v) = (u.min(v), u.max(v));
+                    unpainted.push((screen(u), screen(v), shown));
+                }
+            }
+        }
         match meshes.as_deref_mut() {
             // Over the faces, under the painted edges.
             Some(meshes) => {
@@ -1051,13 +1159,19 @@ impl Editor<'_> {
     ) {
         let seen = self.view(frame, 4.0);
         let screen = |v| self.camera.to_screen(document.vertex(v));
-        let spacing = self.spacing(document);
+        let derived = self.derived(document);
+        let (sides, shortest) = (derived.sides(document), derived.shortest(document));
         let zoom = self.camera.zoom;
-        let dots = document
-            .unique_vertices()
+        // Each vertex once: by the first triangle with it.
+        let dots = derived
+            .visible(document, &seen)
             .into_iter()
+            .flat_map(|t| {
+                let corners = document.triangle_ids()[t];
+                (0..3).filter(move |&k| sides[t][k].owns_start).map(move |k| corners[k])
+            })
             .filter(|&v| seen.shows(&[document.vertex(v)]))
-            .map(|v| (screen(v), detail(spacing.shortest[v] * zoom / 2.0)))
+            .map(|v| (screen(v), detail(shortest[v] * zoom / 2.0)))
             .filter(|&(_, shown)| shown > 0.0);
         match meshes {
             Some(meshes) => {
@@ -1078,16 +1192,19 @@ impl Editor<'_> {
         }
     }
 
-    /// How crowded `document`'s lines are, remembered per drawing.
-    fn spacing(&self, document: &Document) -> Rc<Spacing> {
-        let mut memo = self.caches.spacings.borrow_mut();
+    /// What drawing `document` needs worked out, remembered per drawing.
+    pub(super) fn derived(&self, document: &Document) -> Rc<Derived> {
+        let mut memo = self.caches.derived.borrow_mut();
         // Only a few drawings at a time (those drawn lately).
         if memo.len() > 64 && !memo.contains_key(&document.revision()) {
             memo.clear();
         }
-        memo.entry(document.revision())
-            .or_insert_with(|| Rc::new(Spacing::of(document)))
-            .clone()
+        let derived = memo
+            .entry(document.revision())
+            .or_insert_with(|| Rc::new(Derived::new()))
+            .clone();
+        derived.uses.set(derived.uses.get().saturating_add(1));
+        derived
     }
 
     /// The plain look, `strength` strong (1: full), edges `width` wide, with
@@ -1110,16 +1227,22 @@ impl Editor<'_> {
         // Each visible triangle's edges, on screen, and how much of each to
         // draw: zoomed out, crowded ones fade away (see `Spacing`), but not
         // the outline, so the shape stays.
+        let derived = self.derived(document);
+        let visible = derived.visible(document, &seen);
+        let colors = derived.colors(document);
+        let corners = |t: TriangleId| document.triangle_ids()[t].map(|v| document.vertex(v));
         let wireframe = || {
-            let spacing = self.spacing(document);
+            let sides = derived.sides(document);
             let zoom = self.camera.zoom;
             let mut lines = Vec::new();
-            for (&[a, b, c], near) in document.triangle_ids().iter().zip(&spacing.by_triangle) {
-                if !seen.shows(&[a, b, c].map(|v| document.vertex(v))) {
-                    continue;
-                }
-                for ((u, v), near) in [(a, b), (b, c), (c, a)].into_iter().zip(near) {
-                    let shown = detail(near * zoom);
+            for &t in &visible {
+                let [a, b, c] = document.triangle_ids()[t];
+                for ((u, v), side) in [(a, b), (b, c), (c, a)].into_iter().zip(sides[t]) {
+                    let shown = if side.outline {
+                        1.0
+                    } else {
+                        detail(side.near * zoom)
+                    };
                     if shown > 0.0 {
                         lines.push((screen(u), screen(v), shown));
                     }
@@ -1129,13 +1252,11 @@ impl Editor<'_> {
         };
         match meshes.as_deref_mut() {
             Some(meshes) => {
-                for (t, color) in document.triangles().zip(document.colors()) {
-                    if seen.shows(&t) {
-                        let t = t.map(|p| self.camera.to_screen(p));
-                        meshes.under.triangle(t, faint(FILL, 1.0));
-                        if let Some(color) = color {
-                            meshes.under.triangle(t, faint(color, 0.25));
-                        }
+                for &t in &visible {
+                    let on_screen = corners(t).map(|p| self.camera.to_screen(p));
+                    meshes.under.triangle(on_screen, faint(FILL, 1.0));
+                    if let Some(color) = colors[t] {
+                        meshes.under.triangle(on_screen, faint(color, 0.25));
                     }
                 }
                 // Each triangle outlined, over all the faces (shared edges
@@ -1145,9 +1266,9 @@ impl Editor<'_> {
                 }
             }
             None => {
-                let mesh = self.mesh(document.triangles().filter(|t| seen.shows(t)));
+                let mesh = self.mesh(visible.iter().map(|&t| corners(t)));
                 frame.fill(&mesh, faint(FILL, 1.0));
-                for (color, triangles) in painted_faces(document, &seen) {
+                for (color, triangles) in painted_faces(document, &visible, colors) {
                     frame.fill(&self.mesh(triangles.into_iter()), faint(color, 0.25));
                 }
                 // One colour for all: those mostly faded, left out.
@@ -1525,15 +1646,47 @@ mod tests {
             vec![[0, 1, 2], [1, 0, 3]],
         )
         .unwrap();
-        let spacing = Spacing::of(&document);
-        let shared = spacing.edges.iter().find(|&&(edge, _)| edge == (0, 1)).unwrap().1;
+        let sides = sides_of(&document);
+        // Shared: as crowded as on the sliver's side, on both; drawn once.
+        let shared = sides[0][0].near;
         assert!((shared - 2.0).abs() < 0.01, "{shared}");
-        // Shared: as crowded as on the sliver's side; on the outline: kept.
-        assert_eq!(spacing.by_triangle[1][0], shared);
-        assert!(spacing.by_triangle[1][1].is_infinite());
+        assert_eq!(sides[1][0].near, shared);
+        assert!(sides[0][0].owns_edge && !sides[1][0].owns_edge);
+        assert!(!sides[0][0].outline && sides[1][1].outline);
+        // Each vertex once: 3 by the first triangle, only to the second.
+        assert!(sides[0].iter().all(|side| side.owns_start));
+        assert!(sides[1][2].owns_start && !sides[1][0].owns_start);
         // Thinned out zoomed out (2 px apart), not zoomed in (20 px).
         assert_eq!(detail(shared), 0.0);
         assert_eq!(detail(shared * 10.0), 1.0);
-        assert_eq!(spacing.shortest[2], 2.0f32.hypot(50.0));
+    }
+
+    #[test]
+    fn only_triangles_in_view_are_drawn() {
+        // A row of 300 apart, 10 wide each.
+        let mut points = Vec::new();
+        let mut triangles = Vec::new();
+        for i in 0..300 {
+            let x = i as f32 * 20.0;
+            let at = points.len();
+            points.extend([Point::new(x, 0.0), Point::new(x + 10.0, 0.0), Point::new(x + 5.0, 10.0)]);
+            triangles.push([at, at + 1, at + 2]);
+        }
+        let document = Document::from_parts(points, triangles).unwrap();
+        let derived = Derived::new();
+        let seen = View {
+            min: Point::new(95.0, -1.0),
+            max: Point::new(205.0, 1.0),
+        };
+        let all: Vec<_> = (0..300)
+            .filter(|&t| seen.shows(&document.triangle_ids()[t].map(|v| document.vertex(v))))
+            .collect();
+        assert_eq!(all, (5..=10).collect::<Vec<_>>());
+        // By going through them all, then (drawn again) by place: the same.
+        derived.uses.set(1);
+        assert_eq!(derived.visible(&document, &seen), all);
+        derived.uses.set(2);
+        assert_eq!(derived.visible(&document, &seen), all);
+        assert!(derived.index.get().is_some_and(Option::is_some));
     }
 }

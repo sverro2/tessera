@@ -223,9 +223,9 @@ pub struct Caches {
     layers: RefCell<HashMap<NodeId, LayerCache>>,
     /// Painted edges' outlines worked out, by drawing (its revision).
     outlines: RefCell<HashMap<u64, EdgeOutlines>>,
-    /// How crowded drawings' lines are, by drawing (its revision): to
-    /// thin them out, zoomed out.
-    spacings: RefCell<HashMap<u64, Rc<draw::Spacing>>>,
+    /// What drawing drawings needs worked out from them (see
+    /// `draw::Derived`), by drawing (its revision).
+    derived: RefCell<HashMap<u64, Rc<draw::Derived>>>,
 }
 
 /// A drawing's painted edges' outlines (world), as at `zoom`, and around
