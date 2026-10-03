@@ -283,7 +283,7 @@ fn pointing_at_a_layer_lights_it_up_until_off_it() {
     assert_eq!(app.pointed_layer, None);
     // Not a change (nothing to undo).
     assert_eq!(app.layers.signature(), before);
-    assert_eq!(app.undo.len(), 1);
+    assert_eq!(app.history.undo.len(), 1);
 }
 
 #[test]
@@ -737,7 +737,7 @@ fn undo_and_redo_step_through_edits() {
     // A new edit after undoing drops what could be redone.
     let _ = app.update(Message::Undo);
     edit(&mut app, 1000.0);
-    assert!(app.redo.is_empty());
+    assert!(!app.history.can_redo());
     let _ = app.update(Message::Redo);
     assert_eq!(app.document().triangle_ids().len(), 2);
 }
@@ -784,7 +784,7 @@ fn new_starts_a_fresh_history() {
     let mut app = Tessera::default();
     edit(&mut app, 0.0);
     let _ = app.update(Message::File(FileMessage::Replace(Replace::New)));
-    assert!(app.undo.is_empty() && app.redo.is_empty());
+    assert!(!app.history.can_undo() && !app.history.can_redo());
 }
 
 #[test]

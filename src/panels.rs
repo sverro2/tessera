@@ -865,12 +865,12 @@ impl Tessera {
                     item(
                         "Undo",
                         self.keys.first(Action::Undo),
-                        (!self.undo.is_empty()).then_some(Message::Undo)
+                        self.history.can_undo().then_some(Message::Undo)
                     ),
                     item(
                         "Redo",
                         self.keys.first(Action::Redo),
-                        (!self.redo.is_empty()).then_some(Message::Redo)
+                        self.history.can_redo().then_some(Message::Redo)
                     ),
                     iced::widget::rule::horizontal(1),
                     item(

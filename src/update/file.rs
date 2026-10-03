@@ -87,8 +87,7 @@ impl Tessera {
             FileMessage::Replace(Replace::New) => {
                 self.layers = Layers::default();
                 self.layers_replaced();
-                self.undo.clear();
-                self.redo.clear();
+                self.history = History::default();
                 self.camera = Camera::default();
                 self.path = None;
                 self.saved = None;
@@ -130,8 +129,7 @@ impl Tessera {
                     }
                     self.layers = contents.layers;
                     self.layers_replaced();
-                    self.undo.clear();
-                    self.redo.clear();
+                    self.history = History::default();
                     self.camera = contents.camera;
                     if let Some(layer) = contents.current {
                         self.current = layer;

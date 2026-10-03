@@ -120,10 +120,6 @@ struct Tessera {
     /// The layers and groups isolated in the layers panel: while any are,
     /// only they (and what's in them) are in view. Not part of the drawing.
     isolated: HashSet<NodeId>,
-    /// The layers as they were before each change, most recent last; and
-    /// as they were before each undo. Unchanged drawings are shared.
-    undo: Vec<Layers>,
-    redo: Vec<Layers>,
     /// View state, independent of the data.
     camera: Camera,
     /// What's drawn on the canvas; see `editor::Caches` for when to clear
@@ -216,6 +212,8 @@ struct Tessera {
     /// The window's size, once it has been resized (or first laid out);
     /// until then, the size it opens at.
     window_size: Option<iced::Size>,
+    /// Undo and redo: the layers as they were before each change, most recent last; and as they were before each undo. Unchanged drawings are shared.
+    history: History,
 }
 
 /// The background panel's number fields, as typed (so half-typed numbers
@@ -393,11 +391,7 @@ impl Tessera {
     fn push_undo(&mut self, before: Layers) {
         // A new document starts out saved.
         self.saved.get_or_insert_with(|| before.signature());
-        self.undo.push(before);
-        if self.undo.len() > MAX_UNDO {
-            self.undo.remove(0);
-        }
-        self.redo.clear();
+        self.history.push(before);
     }
 
     /// After the layers were replaced (undo, new, open): keeps the current
@@ -549,19 +543,17 @@ impl Tessera {
             Message::Snap(message) => self.update_snap(message),
             Message::Undo => {
                 self.menu = None;
-                let Some(before) = self.undo.pop() else {
+                if !self.history.undo(&mut self.layers) {
                     return Task::none();
-                };
-                self.redo.push(std::mem::replace(&mut self.layers, before));
+                }
                 self.layers_replaced();
                 Task::none()
             }
             Message::Redo => {
                 self.menu = None;
-                let Some(after) = self.redo.pop() else {
+                if !self.history.redo(&mut self.layers) {
                     return Task::none();
-                };
-                self.undo.push(std::mem::replace(&mut self.layers, after));
+                }
                 self.layers_replaced();
                 Task::none()
             }
@@ -955,6 +947,53 @@ impl Tessera {
                 picking: self.picking,
             },
         }
+    }
+}
+
+/// Undo and redo: the layers as they were before each change, most
+/// recent last; and as they were before each undo. Unchanged drawings are
+/// shared.
+#[derive(Default)]
+pub(crate) struct History {
+    undo: Vec<Layers>,
+    redo: Vec<Layers>,
+}
+
+impl History {
+    /// A change was made to what were `before`: a step to undo (the oldest
+    /// forgotten past [`MAX_UNDO`]), and nothing to redo any more.
+    fn push(&mut self, before: Layers) {
+        self.undo.push(before);
+        if self.undo.len() > MAX_UNDO {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// Takes `layers` a step back, if there's one; whether there was.
+    fn undo(&mut self, layers: &mut Layers) -> bool {
+        let Some(before) = self.undo.pop() else {
+            return false;
+        };
+        self.redo.push(std::mem::replace(layers, before));
+        true
+    }
+
+    /// Takes `layers` a step forward again, if undone; whether it was.
+    fn redo(&mut self, layers: &mut Layers) -> bool {
+        let Some(after) = self.redo.pop() else {
+            return false;
+        };
+        self.undo.push(std::mem::replace(layers, after));
+        true
+    }
+
+    fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
     }
 }
 
