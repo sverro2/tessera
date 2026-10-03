@@ -588,3 +588,152 @@ fn bench_big_drag() {
         editor.limit_move(middle, from + Vector::new(300.0, 200.0))
     });
 }
+
+/// A renderer as the app's (wgpu), on a GPU without a window: to draw the
+/// canvas as the app does. `None` without a GPU.
+fn gpu_renderer() -> Option<Renderer> {
+    use iced::wgpu;
+    let instance = wgpu::Instance::default();
+    let adapter = iced::futures::executor::block_on(
+        instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+    )
+    .ok()?;
+    let (device, queue) = iced::futures::executor::block_on(
+        adapter.request_device(&wgpu::DeviceDescriptor::default()),
+    )
+    .ok()?;
+    let engine = iced_wgpu::Engine::new(
+        &adapter,
+        device,
+        queue,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+        None,
+        iced_renderer::graphics::Shell::headless(),
+    );
+    let settings = iced_renderer::core::renderer::Settings::default();
+    Some(iced_renderer::fallback::Renderer::Primary(iced_wgpu::Renderer::new(
+        engine, settings,
+    )))
+}
+
+/// Draws the canvas of the drawing in `TESSERA_BENCH` as panning does
+/// (each frame a little further, so the layers' caches are drawn again):
+/// as saved, and zoomed in on a few places; in the shape and the paint
+/// mode. Run with `TESSERA_BENCH=file.tessera cargo test --release
+/// bench_render -- --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark: slow, and needs a drawing and a GPU"]
+fn bench_render() {
+    use canvas::Program;
+    let Ok(path) = std::env::var("TESSERA_BENCH") else {
+        return;
+    };
+    let Some(renderer) = gpu_renderer() else {
+        println!("BENCH render: no GPU");
+        return;
+    };
+    let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
+    let layers = &contents.layers;
+    let current = layers.first_layer();
+    fn scene_layer(layer: &crate::layers::Layer) -> SceneLayer<'_> {
+        SceneLayer {
+            id: layer.id,
+            document: &layer.document,
+            crossfade: layer.crossfade,
+            show_edges: layer.show_edges,
+            mirrors: layer.mirror.as_slice(),
+        }
+    }
+    let (below, above) = layers.around(current);
+    let below: Vec<SceneLayer> = below.into_iter().map(scene_layer).collect();
+    let above: Vec<SceneLayer> = above.into_iter().map(scene_layer).collect();
+    let total: usize = layers
+        .layers()
+        .iter()
+        .map(|layer| layer.document.triangle_ids().len())
+        .sum();
+    println!("BENCH render: {} layers, {total} triangles", layers.layers().len());
+
+    let size = iced::Size::new(1600.0, 1000.0);
+    let bounds = Rectangle::new(Point::ORIGIN, size);
+    let (min, max) = layers
+        .layers()
+        .iter()
+        .filter_map(|layer| layer.document.bounds())
+        .fold(
+            (Point::new(f32::MAX, f32::MAX), Point::new(f32::MIN, f32::MIN)),
+            |(a, b), (min, max)| {
+                (
+                    Point::new(a.x.min(min.x), a.y.min(min.y)),
+                    Point::new(b.x.max(max.x), b.y.max(max.y)),
+                )
+            },
+        );
+    let whole = Camera::default().framing(&[min, max], size, 40.0);
+    // Zoomed in on a point (world), at a zoom.
+    let on = |p: Point, zoom: f32| Camera {
+        pan: Vector::new(size.width / 2.0 - p.x * zoom, size.height / 2.0 - p.y * zoom),
+        zoom,
+        ..Camera::default()
+    };
+    let middle = Point::new((min.x + max.x) / 2.0, (min.y + max.y) / 2.0);
+    let views = [
+        ("as saved", contents.camera),
+        ("whole", whole),
+        ("middle ×1", on(middle, 1.0)),
+        ("middle ×4", on(middle, 4.0)),
+        ("middle ×16", on(middle, 16.0)),
+    ];
+    let tools = [
+        ("shape", Tool::Shape),
+        (
+            "paint",
+            Tool::Paint {
+                target: paint::Target::Faces,
+                brush: Brush::default(),
+                width: 2.0,
+                picking: false,
+            },
+        ),
+    ];
+    let current_layer = layers.layer(current).unwrap();
+    for (tool_name, tool) in tools {
+        for (view_name, camera) in views {
+            let cache = Caches::default();
+            let mut editor = super::tests::editor(&current_layer.document, &cache);
+            editor.current = current;
+            editor.crossfade = current_layer.crossfade;
+            editor.show_edges = current_layer.show_edges;
+            editor.below = below.iter().map(|l| SceneLayer { ..*l }).collect();
+            editor.above = above.iter().map(|l| SceneLayer { ..*l }).collect();
+            editor.tool = tool;
+            let state = State::default();
+            let frames = 8;
+            let mut times = Vec::new();
+            for frame in 0..frames {
+                // Panned a little each frame.
+                editor.camera = Camera {
+                    pan: camera.pan + Vector::new(frame as f32 * 3.0, 0.0),
+                    ..camera
+                };
+                let start = std::time::Instant::now();
+                let geometry = editor.draw(
+                    &state,
+                    &renderer,
+                    &Theme::Dark,
+                    bounds,
+                    mouse::Cursor::Unavailable,
+                );
+                std::hint::black_box(geometry);
+                times.push(start.elapsed());
+            }
+            times.sort();
+            println!(
+                "BENCH render {tool_name:>5} {view_name:<11} (zoom {:.2}): median {:?}, max {:?}",
+                camera.zoom,
+                times[times.len() / 2],
+                times.last().unwrap()
+            );
+        }
+    }
+}

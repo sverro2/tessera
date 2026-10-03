@@ -136,7 +136,8 @@ mod tests {
         });
 
         // Two faces sharing an edge, nothing behind: where they meet, the
-        // seal leaves no see-through line (unsealed, there is one).
+        // seal leaves no see-through line (unsealed, there is one), right
+        // into the corners; and nothing of it shows past them.
         let mut square = Document::default();
         for corners in [
             [
@@ -159,18 +160,28 @@ mod tests {
         let mut two = Layers::default();
         let only = two.first_layer();
         two.layer_mut(only).unwrap().document = std::sync::Arc::new(square);
-        let on_the_seam = |seal: f32| {
+        let render = |seal: f32| {
             let svg = crate::svg::export_sealed(&two, None, seal);
             let png = super::png(&svg, 1.0, Backdrop::Transparent).unwrap();
-            let image = image::load_from_memory(&png).unwrap().to_rgba8();
-            // (Ten pixels of room all round.)
-            (5..35)
+            image::load_from_memory(&png).unwrap().to_rgba8()
+        };
+        // (Ten pixels of room all round.)
+        let on_the_seam = |image: &image::RgbaImage| {
+            (0..40)
                 .map(|i| image.get_pixel(10 + i, 10 + i).0[3])
                 .min()
                 .unwrap()
         };
-        assert!(on_the_seam(0.0) < 250, "unsealed, see-through");
-        assert_eq!(on_the_seam(crate::svg::SEAL_PIXELS), 255);
+        let (unsealed, sealed) = (render(0.0), render(crate::svg::SEAL_PIXELS));
+        assert!(on_the_seam(&unsealed) < 250, "unsealed, see-through");
+        assert_eq!(on_the_seam(&sealed), 255);
+        assert!(
+            unsealed
+                .enumerate_pixels()
+                .filter(|(x, y, _)| !(10..50).contains(x) || !(10..50).contains(y))
+                .all(|(x, y, pixel)| sealed.get_pixel(x, y) == pixel),
+            "the same past the faces"
+        );
 
         // A hidden layer isn't in it, as in the SVG.
         layers.set_visible(first, false);

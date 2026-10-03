@@ -25,3 +25,9 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# Only to draw the canvas in benchmarks, with the renderer the app uses
+# (on a GPU without a window); the same iced as above.
+[dev-dependencies]
+iced_renderer = { git = "https://github.com/iced-rs/iced", branch = "master" }
+iced_wgpu = { git = "https://github.com/iced-rs/iced", branch = "master" }

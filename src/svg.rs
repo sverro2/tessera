@@ -5,18 +5,20 @@
 //! Faces drawn one by one, each smoothed (anti-aliased) on its own, don't
 //! quite cover the edges they share: half covered by each, a pixel there
 //! is only three quarters covered by both, so what's behind shows through
-//! in fine lines. Each layer's shared edges are sealed: stroked under the
-//! faces, in a sublayer of their own ("Seals"), to delete if they're not
-//! wanted. Under them, a seal only shows where the faces don't quite cover;
-//! all else of it (its width, its ends) they hide.
+//! in fine lines. Each layer's shared edges are sealed: a band along each,
+//! under the faces, in a sublayer of their own ("Seals"), to delete if
+//! they're not wanted. Under them, a seal only shows where the faces don't
+//! quite cover; and as it keeps to the two faces it lies between, all the
+//! way to the edge's ends, nothing of it shows past what's painted.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 
 use iced::Color;
 
 use crate::document::{Document, VertexId};
 use crate::fade;
+use crate::geometry::area2;
 use crate::joints;
 use crate::layers::{Layer, Layers, Node};
 use crate::page::Page;
@@ -24,8 +26,8 @@ use crate::paint;
 
 const PADDING: f32 = 10.0;
 
-/// How wide (pixels) seals are: thinner, smoothed as they are, they only
-/// part cover the line they're to seal.
+/// How wide (pixels) seals are, where their faces have room: thinner,
+/// smoothed as they are, they only part cover the line they're to seal.
 pub const SEAL_PIXELS: f32 = 2.0;
 
 /// How wide (world units: a pixel at 1×) seals are in an SVG on its own.
@@ -203,10 +205,10 @@ fn write_drawing(svg: &mut String, layer: &Layer, prefix: &str, depth: usize, se
 
 /// The seals of `document`'s shared edges, `seal` wide, as a sublayer:
 /// each edge two painted faces share, but for those painted (and shown,
-/// `show_edges`), which cover it themselves. Each is the two faces' colours
-/// mixed, as the line it fills would be; one path a colour. Where one reaches the outline of what's painted
-/// (where no face hides it), it stops short, so its square end doesn't
-/// stick out past it.
+/// `show_edges`), which cover it themselves. Each is a band along the edge,
+/// `seal` wide but cut to its two faces (a trapezoid of each), so it goes
+/// right to the edge's ends without ever sticking out of them; in the two
+/// faces' colours mixed, as the line it fills would be. One path a colour.
 fn write_seals(
     svg: &mut String,
     document: &Document,
@@ -215,43 +217,61 @@ fn write_seals(
     depth: usize,
     seal: f32,
 ) {
-    // Each edge's painted faces' colours. (Ordered, so the same drawing is
-    // always written the same.)
-    let mut faces: BTreeMap<(VertexId, VertexId), Vec<Color>> = BTreeMap::new();
+    // Each edge's painted faces: their colours, and corners across the edge.
+    // (Ordered, so the same drawing is always written the same.)
+    let mut faces: BTreeMap<(VertexId, VertexId), Vec<(Color, VertexId)>> = BTreeMap::new();
     for (&[a, b, c], color) in document.triangle_ids().iter().zip(document.colors()) {
         let Some(color) = color else { continue };
-        for (u, v) in [(a, b), (b, c), (c, a)] {
-            faces.entry((u.min(v), u.max(v))).or_default().push(color);
+        for (u, v, across) in [(a, b, c), (b, c, a), (c, a, b)] {
+            faces
+                .entry((u.min(v), u.max(v)))
+                .or_default()
+                .push((color, across));
         }
     }
-    // Vertices on the outline: of an edge with a painted face one side only.
-    let outline: HashSet<VertexId> = faces
-        .iter()
-        .filter(|(_, colors)| colors.len() == 1)
-        .flat_map(|(&(a, b), _)| [a, b])
-        .collect();
     let mut paths: BTreeMap<String, String> = BTreeMap::new();
-    for (&(a, b), colors) in &faces {
-        if colors.len() < 2 || (show_edges && document.edge_style(a, b).is_some()) {
+    for (&(a, b), sides) in &faces {
+        let &[(one, c), (other, d)] = &sides[..] else {
+            continue; // On the outline: nothing to seal.
+        };
+        if show_edges && document.edge_style(a, b).is_some() {
             continue;
         }
-        let (mut p, mut q) = (document.vertex(a), document.vertex(b));
+        let [p, q, c, d] = [a, b, c, d].map(|v| document.vertex(v));
         let length = p.distance(q);
         if length == 0.0 {
             continue;
         }
-        // Short of the outline by a seal's width (a third of it at most).
-        let short = (q - p) * (seal.min(length / 3.0) / length);
-        if outline.contains(&a) {
-            p += short;
-        }
-        if outline.contains(&b) {
-            q -= short;
+        // In the face with corner `r`: the band's far side, `seal` / 2 from
+        // the edge (or `r` itself, if that's nearer), from side to side.
+        let across = |r: iced::Point| {
+            let height = area2(p, q, r).abs() / length;
+            let k = (seal / 2.0 / height).min(1.0);
+            (p + (r - p) * k, q + (r - q) * k)
+        };
+        let ((p1, q1), (p2, q2)) = (across(c), across(d));
+        let mut band = [p, p1, q1, q, q2, p2];
+        // All one way round, so where they overlap, they add up (rather
+        // than cancel out, as the nonzero rule has it).
+        let winding: f32 = (0..band.len())
+            .map(|i| area2(p, band[i], band[(i + 1) % band.len()]))
+            .sum();
+        if winding < 0.0 {
+            band.reverse();
         }
         let d = paths
-            .entry(paint::to_hex(fade::average(colors)))
+            .entry(paint::to_hex(fade::average(&[one, other])))
             .or_default();
-        let _ = write!(d, "M {},{} L {},{} ", p.x, p.y, q.x, q.y);
+        for (i, corner) in band.iter().enumerate() {
+            let _ = write!(
+                d,
+                "{} {},{} ",
+                if i == 0 { "M" } else { "L" },
+                corner.x,
+                corner.y
+            );
+        }
+        d.push_str("Z ");
     }
     if paths.is_empty() {
         return;
@@ -264,7 +284,7 @@ fn write_seals(
     for (i, (color, d)) in paths.iter().enumerate() {
         let _ = writeln!(
             svg,
-            r#"{indent}  <path id="{prefix}seal{i}" d="{}" fill="none" stroke="{color}" stroke-width="{seal}"/>"#,
+            r#"{indent}  <path id="{prefix}seal{i}" d="{}" fill="{color}"/>"#,
             d.trim_end()
         );
     }
@@ -460,10 +480,32 @@ mod tests {
             "{svg}"
         );
         assert!(svg.contains(r##"<path id="l1-seal0" d="M "##), "{svg}");
-        assert!(
-            svg.contains(r##"fill="none" stroke="#ff0000" stroke-width="0.5"/>"##),
-            "{svg}"
-        );
+        assert!(svg.contains(r##"Z" fill="#ff0000"/>"##), "{svg}");
+        // Bands kept to their faces: inside the triangle they make up.
+        let seal = svg.lines().find(|line| line.contains("l1-seal0")).unwrap();
+        let d = seal
+            .split(r#" d=""#)
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        let numbers: Vec<f32> = d
+            .split(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-'))
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        assert_eq!(numbers.len(), 3 * 6 * 2, "{seal}");
+        let outline = [
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 0.0),
+            Point::new(5.0, 10.0),
+        ];
+        for xy in numbers.chunks(2) {
+            let p = Point::new(xy[0], xy[1]);
+            let inside = (0..3)
+                .all(|i| crate::geometry::area2(outline[i], outline[(i + 1) % 3], p) >= -1e-4);
+            assert!(inside, "{p:?} in {seal}");
+        }
         // One of them painted: covered by the edge, not sealed. (Edges to
         // the middle vertex, 3, are the shared ones.)
         let shared = document
@@ -489,7 +531,7 @@ mod tests {
         let svg = export_sealed(&layers, None, 0.5);
         assert_eq!(seals(&svg), 3, "{svg}");
         // And plain `export` as wide as at 1×.
-        assert!(export(&layers, None).contains(r#"stroke-width="2""#));
+        assert_eq!(export(&layers, None), export_sealed(&layers, None, SEAL));
     }
 
     #[test]
@@ -522,8 +564,9 @@ mod tests {
         let first = layers.first_layer();
         layers.layer_mut(first).unwrap().document = std::sync::Arc::new(document);
         let svg = export(&layers, None);
-        assert!(svg.contains(r##"stroke="#800080""##), "{svg}");
-        assert_eq!(svg.matches("stroke=").count(), 1, "{svg}");
+        let seals: Vec<_> = svg.lines().filter(|line| line.contains("-seal")).collect();
+        assert_eq!(seals.len(), 2, "the group, and one path: {svg}");
+        assert!(seals[1].ends_with(r##"Z" fill="#800080"/>"##), "{svg}");
     }
 
     #[test]

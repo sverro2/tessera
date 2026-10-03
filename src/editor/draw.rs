@@ -108,18 +108,61 @@ pub(super) fn draw_grid(frame: &mut Frame, camera: Camera, grid: Grid) {
     frame.fill(&dots, GRID_DOT);
 }
 
-/// The painted faces, by colour.
-pub(super) fn painted_faces(document: &Document) -> Vec<(Color, Vec<[Point; 3]>)> {
-    let mut painted: Vec<(Color, Vec<[Point; 3]>)> = Vec::new();
+/// The painted faces `seen` says, by colour.
+pub(super) fn painted_faces(
+    document: &Document,
+    seen: &View,
+) -> Vec<(Color, Vec<[Point; 3]>)> {
+    let mut groups = ByColor::default();
     for (t, color) in document.triangles().zip(document.colors()) {
-        if let Some(color) = color {
-            match painted.iter_mut().find(|(c, _)| *c == color) {
-                Some((_, group)) => group.push(t),
-                None => painted.push((color, vec![t])),
-            }
+        if let Some(color) = color
+            && seen.shows(&t)
+        {
+            groups.add(color, t);
         }
     }
-    painted
+    groups.0
+}
+
+/// Things grouped by colour, each colour once (in the order they came),
+/// to draw each colour's in one go.
+pub(super) struct ByColor<T>(pub Vec<(Color, Vec<T>)>, HashMap<[u32; 4], usize>);
+
+impl<T> Default for ByColor<T> {
+    fn default() -> Self {
+        ByColor(Vec::new(), HashMap::new())
+    }
+}
+
+impl<T> ByColor<T> {
+    pub(super) fn add(&mut self, color: Color, thing: T) {
+        let key = [color.r, color.g, color.b, color.a].map(f32::to_bits);
+        let groups = &mut self.0;
+        let i = *self.1.entry(key).or_insert_with(|| {
+            groups.push((color, Vec::new()));
+            groups.len() - 1
+        });
+        groups[i].1.push(thing);
+    }
+}
+
+/// The part of the world in view (with a margin): what's wholly outside it
+/// needn't be drawn.
+pub(super) struct View {
+    min: Point,
+    max: Point,
+}
+
+impl View {
+    /// Whether something with these corners (world) may show.
+    pub(super) fn shows(&self, corners: &[Point]) -> bool {
+        let (mut min, mut max) = (corners[0], corners[0]);
+        for p in &corners[1..] {
+            min = Point::new(min.x.min(p.x), min.y.min(p.y));
+            max = Point::new(max.x.max(p.x), max.y.max(p.y));
+        }
+        min.x <= self.max.x && self.min.x <= max.x && min.y <= self.max.y && self.min.y <= max.y
+    }
 }
 
 /// How a layer is drawn.
@@ -577,6 +620,35 @@ impl Editor<'_> {
     /// painted look as it will be, otherwise its mirror images faint, so
     /// it's clear they're not there to edit. (Seen through one of them,
     /// that one's drawn as the drawing, and the drawing faint.)
+    /// What of the world shows in `frame`, and as far out as `margin`
+    /// (screen px) past its sides: a stroke's width, say.
+    pub(super) fn view(&self, frame: &Frame, margin: f32) -> View {
+        let size = frame.size();
+        let corners = [
+            Point::new(-margin, -margin),
+            Point::new(size.width + margin, -margin),
+            Point::new(-margin, size.height + margin),
+            Point::new(size.width + margin, size.height + margin),
+        ]
+        .map(|p| self.camera.to_world(p));
+        let (mut min, mut max) = (corners[0], corners[0]);
+        for p in &corners[1..] {
+            min = Point::new(min.x.min(p.x), min.y.min(p.y));
+            max = Point::new(max.x.max(p.x), max.y.max(p.y));
+        }
+        View { min, max }
+    }
+
+    /// How far (screen px) `document`'s painted edges may reach past what
+    /// they join: the widest of them, and some.
+    fn edge_reach(&self, document: &Document) -> f32 {
+        let widest = document
+            .edge_styles()
+            .map(|(_, _, style)| self.edge_width(style.width))
+            .fold(0.0, f32::max);
+        2.0 * widest + 4.0
+    }
+
     pub(super) fn draw_layer(
         &self,
         frame: &mut Frame,
@@ -622,13 +694,18 @@ impl Editor<'_> {
             }
         }
 
+        // Only what may show: past the sides as far as a painted edge may
+        // reach.
+        let seen = self.view(frame, self.edge_reach(document));
+        let shows = |a: VertexId, b: VertexId| seen.shows(&[document.vertex(a), document.vertex(b)]);
+
         // Unpainted faces hatched, as they're not exported: plainly not
         // painted (and not some colour). Then the painted ones by colour.
         let screen = |v| self.camera.to_screen(document.vertex(v));
         let unpainted: Vec<_> = document
             .triangles()
             .zip(document.colors())
-            .filter(|(_, color)| color.is_none())
+            .filter(|(t, color)| color.is_none() && seen.shows(t))
             .map(|(t, _)| t)
             .collect();
         frame.fill(
@@ -639,7 +716,7 @@ impl Editor<'_> {
             &self.hatch(&unpainted),
             stroke(Color { a: 0.3, ..EDGE }, 1.0),
         );
-        for (color, triangles) in painted_faces(document) {
+        for (color, triangles) in painted_faces(document, &seen) {
             frame.fill(&self.mesh(triangles.into_iter()), color);
         }
         if !show_edges {
@@ -656,7 +733,7 @@ impl Editor<'_> {
         };
         let unpainted = Path::new(|p| {
             for (a, b) in document.unique_edges() {
-                if document.edge_style(a, b).is_none() {
+                if document.edge_style(a, b).is_none() && shows(a, b) {
                     p.move_to(screen(a));
                     p.line_to(screen(b));
                 }
@@ -668,6 +745,7 @@ impl Editor<'_> {
         // widths meet without lying over each other.
         let edges: Vec<_> = document
             .edge_styles()
+            .filter(|&(a, b, _)| shows(a, b))
             .map(|(a, b, style)| (a, b, self.edge_width(style.width), style.color))
             .collect();
         let outlines = joints::outlines(
@@ -695,7 +773,7 @@ impl Editor<'_> {
         } else {
             HashMap::new()
         };
-        let mut by_color: Vec<(Color, Vec<&Vec<Point>>)> = Vec::new();
+        let mut by_color = ByColor::default();
         for (&(a, b, _, color), outline) in edges.iter().zip(&outlines) {
             if let Some(stops) = fades.get(&(a, b)) {
                 let (pa, pb) = (screen(a), screen(b));
@@ -707,12 +785,9 @@ impl Editor<'_> {
                 frame.fill(&path(&[outline]), gradient);
                 continue;
             }
-            match by_color.iter_mut().find(|(c, _)| *c == color) {
-                Some((_, group)) => group.push(outline),
-                None => by_color.push((color, vec![outline])),
-            }
+            by_color.add(color, outline);
         }
-        for (color, outlines) in by_color {
+        for (color, outlines) in by_color.0 {
             frame.fill(&path(&outlines), color);
         }
     }
@@ -725,9 +800,12 @@ impl Editor<'_> {
 
     /// A dot on each vertex.
     pub(super) fn draw_vertices(&self, frame: &mut Frame, document: &Document) {
+        let seen = self.view(frame, 4.0);
         let dots = Path::new(|p| {
             for v in document.unique_vertices() {
-                p.circle(self.camera.to_screen(document.vertex(v)), 2.5);
+                if seen.shows(&[document.vertex(v)]) {
+                    p.circle(self.camera.to_screen(document.vertex(v)), 2.5);
+                }
             }
         });
         frame.fill(&dots, EDGE);
@@ -746,18 +824,30 @@ impl Editor<'_> {
             a: color.a * alpha * strength,
             ..color
         };
-        let mesh = self.mesh(document.triangles());
+        // Only what may show.
+        let seen = self.view(frame, width + 2.0);
+        let mesh = self.mesh(document.triangles().filter(|t| seen.shows(t)));
         frame.fill(&mesh, faint(FILL, 1.0));
-        for (color, triangles) in painted_faces(document) {
+        for (color, triangles) in painted_faces(document, &seen) {
             frame.fill(&self.mesh(triangles.into_iter()), faint(color, 0.25));
         }
         frame.stroke(&mesh, stroke(faint(EDGE, 1.0), width));
         let screen = |v| self.camera.to_screen(document.vertex(v));
+        // Each colour's edges as one path.
+        let mut by_color = ByColor::default();
         for (a, b, style) in document.edge_styles() {
-            frame.stroke(
-                &Path::line(screen(a), screen(b)),
-                stroke(faint(style.color, 0.5), width),
-            );
+            if seen.shows(&[document.vertex(a), document.vertex(b)]) {
+                by_color.add(style.color, (a, b));
+            }
+        }
+        for (color, edges) in by_color.0 {
+            let path = Path::new(|p| {
+                for (a, b) in edges {
+                    p.move_to(screen(a));
+                    p.line_to(screen(b));
+                }
+            });
+            frame.stroke(&path, stroke(faint(color, 0.5), width));
         }
     }
 
