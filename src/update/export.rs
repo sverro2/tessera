@@ -94,9 +94,10 @@ pub struct ExportSettings {
 
 impl Default for ExportSettings {
     fn default() -> Self {
+        // The page, at its size: larger only when chosen.
         ExportSettings {
             to_page: true,
-            png_scale: 2.0,
+            png_scale: 1.0,
             png_backdrop: raster::Backdrop::default(),
         }
     }
