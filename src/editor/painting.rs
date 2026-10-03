@@ -171,12 +171,13 @@ impl Editor<'_> {
         }
     }
 
-    /// Tweaking a painted edge's width or lightness (painting edges, holding
-    /// W or C): the current layer with the edge being tweaked painted as
-    /// it will be.
-    pub(super) fn tweaked_edge(&self, state: &State) -> Option<Document> {
+    /// Tweaking the brush (holding W, C or Shift+C): the current layer with
+    /// the face or edge being tweaked painted as it will be, so it shows
+    /// just as it will (its colour exactly as light and as opaque, over
+    /// nothing of what it was).
+    pub(super) fn tweaked(&self, state: &State) -> Option<Document> {
         let Tool::Paint {
-            target: paint::Target::Edges,
+            target,
             brush,
             width,
             ..
@@ -184,13 +185,21 @@ impl Editor<'_> {
         else {
             return None;
         };
-        // Edges hidden, the overlay shows it instead.
-        if !self.show_edges {
-            return None;
-        }
-        let (a, b) = self.edge_at(state.tweaking?.at)?;
-        let style = brush.color().map(|color| EdgeStyle { color, width });
-        let (tweaked, _) = self.document.preview(&[Edit::PaintEdge { a, b, style }])?;
+        let at = state.tweaking?.at;
+        let edit = match target {
+            paint::Target::Faces => Edit::Paint {
+                triangle: self.document.triangle_at(self.camera.to_world(at))?,
+                color: brush.color(),
+            },
+            // Edges hidden, the overlay shows it instead.
+            paint::Target::Edges if !self.show_edges => return None,
+            paint::Target::Edges => {
+                let (a, b) = self.edge_at(at)?;
+                let style = brush.color().map(|color| EdgeStyle { color, width });
+                Edit::PaintEdge { a, b, style }
+            }
+        };
+        let (tweaked, _) = self.document.preview(&[edit])?;
         Some(tweaked)
     }
 
@@ -230,17 +239,23 @@ impl Editor<'_> {
 
                 let hovered =
                     focus.and_then(|p| self.document.triangle_at(self.camera.to_world(p)));
-                if let Some(t) = hovered {
+                // Tweaking its lightness or opacity, the layer itself shows
+                // it as it will be (see `tweaked`): nothing over it. Else a
+                // hint of it, half as opaque as the brush, outlined.
+                if let Some(t) = hovered
+                    && state.tweaking.is_none()
+                {
                     let face = faces(&[t]);
-                    // Tweaking its lightness: as it will be, unoutlined.
-                    let tweaking = state.tweaking.is_some();
                     if let Some(color) = color.filter(|_| !picking) {
-                        let alpha = if tweaking { 1.0 } else { 0.5 };
-                        frame.fill(&face, Color { a: alpha, ..color });
+                        frame.fill(
+                            &face,
+                            Color {
+                                a: color.a * 0.5,
+                                ..color
+                            },
+                        );
                     }
-                    if !tweaking {
-                        frame.stroke(&face, stroke(HOVER, 2.5));
-                    }
+                    frame.stroke(&face, stroke(HOVER, 2.5));
                 }
             }
             paint::Target::Edges => {
@@ -254,9 +269,9 @@ impl Editor<'_> {
                     frame.stroke(&line(edge), look);
                 }
                 // Tweaking its width (or lightness), the layer itself shows
-                // it as it will be (see `tweaked_edge`): nothing over it.
+                // it as it will be (see `tweaked`): nothing over it.
                 if let Some(edge) = focus.and_then(|p| self.edge_at(p))
-                    && self.tweaked_edge(state).is_none()
+                    && self.tweaked(state).is_none()
                 {
                     frame.stroke(&line(edge), stroke(HOVER, self.edge_width(width) + 4.0));
                     if !picking {

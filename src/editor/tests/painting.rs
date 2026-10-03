@@ -225,9 +225,9 @@ fn tweaking_an_edge_shows_the_layer_with_just_its_new_width() {
         picking: false,
     };
     let mut state = State::default();
-    assert!(editor.tweaked_edge(&state).is_none());
+    assert!(editor.tweaked(&state).is_none());
     run(&editor, &mut state, key('w'), 200.0, 300.0);
-    let tweaked = editor.tweaked_edge(&state).expect("tweaking");
+    let tweaked = editor.tweaked(&state).expect("tweaking");
     let style = tweaked.edge_style(0, 1).unwrap();
     assert_eq!(style.width, 2.0);
     assert_eq!(Some(style.color), brush.color());
@@ -236,6 +236,40 @@ fn tweaking_an_edge_shows_the_layer_with_just_its_new_width() {
     // Another drawing to what's derived from it (the edges' outlines):
     // drawn as it is, not as the layer is.
     assert_ne!(tweaked.revision(), doc.revision());
+}
+
+#[test]
+fn tweaking_a_face_shows_the_layer_with_it_as_it_will_be() {
+    // The face painted red; Shift+C over it, the brush a see-through blue:
+    // the layer drawn with the face just that, not blue over red.
+    let mut doc = one();
+    let red = Color::from_rgb(1.0, 0.0, 0.0);
+    assert!(doc.apply(Edit::Paint {
+        triangle: 0,
+        color: Some(red),
+    }));
+    let cache = Caches::default();
+    let mut editor = editor(&doc, &cache);
+    let see_through = Color::from_rgba(0.0, 0.0, 1.0, 0.3);
+    editor.tool = Tool::Paint {
+        target: paint::Target::Faces,
+        brush: Brush::Color(see_through),
+        width: 2.0,
+        picking: false,
+    };
+    let mut state = State::default();
+    assert!(editor.tweaked(&state).is_none());
+    run(
+        &editor,
+        &mut state,
+        press(letter('c'), keyboard::Modifiers::SHIFT),
+        200.0,
+        250.0,
+    );
+    let tweaked = editor.tweaked(&state).expect("tweaking");
+    assert_eq!(tweaked.color(0), Some(see_through));
+    // The layer itself is left be.
+    assert_eq!(doc.color(0), Some(red));
 }
 
 #[test]

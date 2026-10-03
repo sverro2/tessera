@@ -272,7 +272,7 @@ impl Editor<'_> {
             mirrors: self.mirrors,
         };
         let tweaked = (self.shown && pending.is_none())
-            .then(|| self.tweaked_edge(state))
+            .then(|| self.tweaked(state))
             .flatten();
         let cached_current = self.shown && pending.is_none() && tweaked.is_none();
         let others_painter = others_view.painter();
@@ -310,9 +310,10 @@ impl Editor<'_> {
                     self.draw_changes(&mut changes, pending, source);
                     layers.push(Drawn::Geometry(changes.into_geometry()));
                 }
-                // Tweaking a painted edge (holding W or C): the layer as
-                // it will be, that edge in its new style only, so a wide one
-                // made thin doesn't show from under it.
+                // Tweaking the brush (holding W, C or Shift+C): the layer as
+                // it will be, the face or edge tweaked painted anew only, so
+                // what it was doesn't show from under it (a wide edge made
+                // thin, a colour made see-through).
                 None if let Some(tweaked) = &tweaked => {
                     let mut sink = meshes.then(LayerMeshes::default);
                     let mut frame = Frame::new(renderer, size);
