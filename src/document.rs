@@ -519,7 +519,6 @@ impl Document {
         match self.preview(edits) {
             Some((next, _)) => {
                 *self = next;
-                self.revision = next_revision();
                 true
             }
             None => false,
@@ -580,6 +579,8 @@ impl Document {
             document = next;
         }
 
+        // Another drawing than this one, for views to tell apart.
+        document.revision = next_revision();
         Some((document, changes))
     }
 

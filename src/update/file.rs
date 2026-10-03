@@ -94,6 +94,8 @@ impl Tessera {
                 self.saved = None;
                 self.notice = None;
                 self.backgrounds.clear();
+                // Their ids start over.
+                self.isolated.clear();
                 self.editing_background = false;
                 self.saved_background = self.background_version;
                 self.view_changed()
@@ -136,6 +138,8 @@ impl Tessera {
                         self.selected = layer;
                     }
                     self.backgrounds = contents.backgrounds;
+                    // Their ids start over.
+                    self.isolated.clear();
                     self.editing_background = false;
                     self.background_version += 1;
                     self.saved_background = self.background_version;

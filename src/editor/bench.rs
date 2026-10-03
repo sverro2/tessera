@@ -644,7 +644,7 @@ fn bench_render() {
             mirrors: layer.mirror.as_slice(),
         }
     }
-    let (below, above) = layers.around(current);
+    let (below, above) = layers.around(current, &Default::default());
     let below: Vec<SceneLayer> = below.into_iter().map(scene_layer).collect();
     let above: Vec<SceneLayer> = above.into_iter().map(scene_layer).collect();
     let total: usize = layers
@@ -923,7 +923,7 @@ fn bench_frames() {
             mirrors: layer.mirror.as_slice(),
         }
     }
-    let (below, above) = layers.around(current);
+    let (below, above) = layers.around(current, &Default::default());
     let size = iced::Size::new(1600.0, 1000.0);
     let bounds = Rectangle::new(Point::ORIGIN, size);
     let points: Vec<Point> = layers

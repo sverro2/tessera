@@ -294,8 +294,9 @@ pub struct Settings<'a> {
     pub clipboard: Option<&'a Piece>,
     /// Which keys do what; none while they're being looked up (or set).
     pub keys: Option<&'a Keymap>,
-    /// Layers to light up (pointed at in the layers panel).
-    pub lit: Vec<NodeId>,
+    /// Layers to light up (pointed at in the layers panel), back to
+    /// front; also those out of view while others are isolated.
+    pub lit: Vec<SceneLayer<'a>>,
     /// The document size, if one's set: shown as a sheet behind it all.
     pub page: Option<Page>,
     /// The grid points snap to, holding Ctrl.
@@ -493,8 +494,8 @@ struct Editor<'a> {
     /// Which keys do what; none while they're being looked up (or set).
     keys: Option<&'a Keymap>,
     /// Layers to light up, whatever the mode (pointed at in the layers
-    /// panel): to see what's on them.
-    lit: Vec<NodeId>,
+    /// panel): to see what's on them. Back to front.
+    lit: Vec<SceneLayer<'a>>,
     /// When working out what a drag does should give up, so a heavy case
     /// (e.g. a fill through crowded geometry) can't make it crawl.
     /// The grid points snap to, holding Ctrl.

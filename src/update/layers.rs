@@ -1,5 +1,5 @@
 //! The layers panel: picking, adding, grouping, ordering (by dragging),
-//! naming and hiding layers.
+//! naming, hiding and isolating layers.
 
 use crate::*;
 
@@ -33,6 +33,9 @@ pub enum LayerAction {
     EndRename,
     Rename(String),
     ToggleVisible(NodeId),
+    /// Isolates a line, or no longer: while any are, only they are in
+    /// view.
+    ToggleIsolated(NodeId),
     ToggleExpanded(NodeId),
 }
 
@@ -114,6 +117,13 @@ impl Tessera {
                 Some((id, Some(place))) => self.layers.move_to(id, place),
                 _ => return Task::none(),
             },
+            // A way of looking, not a change to the drawing.
+            LayerAction::ToggleIsolated(id) => {
+                if !self.isolated.remove(&id) {
+                    self.isolated.insert(id);
+                }
+                return Task::none();
+            }
             LayerAction::ToggleExpanded(id) => {
                 self.layers.toggle_expanded(id);
                 return Task::none();

@@ -23,7 +23,7 @@ mod svg;
 mod update;
 mod wheel;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -109,6 +109,9 @@ struct Tessera {
     /// The layer (or group) pointed at in the layers panel: lit up on the
     /// canvas.
     pointed_layer: Option<NodeId>,
+    /// The layers and groups isolated in the layers panel: while any are,
+    /// only they (and what's in them) are in view. Not part of the drawing.
+    isolated: HashSet<NodeId>,
     /// The layers as they were before each change, most recent last; and
     /// as they were before each undo. Unchanged drawings are shared.
     undo: Vec<Layers>,
@@ -835,10 +838,10 @@ impl Tessera {
         let canvas = stack![
             {
                 let current = self.current();
-                let (below, above) = self.layers.around(current);
+                let (below, above) = self.layers.around(current, &self.isolated);
                 let scene = editor::Scene {
                     current: scene_layer(self.layers.layer(current).expect("current layer")),
-                    shown: self.layers.shown(current),
+                    shown: self.layers.in_view(current, &self.isolated),
                     below: below.into_iter().map(scene_layer).collect(),
                     above: above.into_iter().map(scene_layer).collect(),
                 };
@@ -853,12 +856,17 @@ impl Tessera {
                         clipboard: self.clipboard.as_ref(),
                         // Not while they're being looked up (or set).
                         keys: (!self.keys_open).then_some(&self.keys),
+                        // Back to front; hidden ones not, though out of view
+                        // while others are isolated.
                         lit: self
                             .pointed_layer
                             .map(|id| self.layers.layers_of(id))
                             .unwrap_or_default()
                             .into_iter()
+                            .rev()
                             .filter(|&id| self.layers.shown(id))
+                            .filter_map(|id| self.layers.layer(id))
+                            .map(scene_layer)
                             .collect(),
                         page: self.layers.page(),
                         grid: editor::Grid {
@@ -1069,7 +1077,7 @@ mod tests {
         assert_eq!(app.document().triangle_ids().len(), 1);
 
         // Drawn around the current layer, back to front.
-        let (below, above) = app.layers.around(front);
+        let (below, above) = app.layers.around(front, &Default::default());
         assert_eq!((below.len(), above.len()), (1, 0));
 
         // Back to the first layer; its drawing is untouched.

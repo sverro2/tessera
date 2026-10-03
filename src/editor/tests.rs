@@ -1467,6 +1467,9 @@ fn tweaking_an_edge_shows_the_layer_with_just_its_new_width() {
     assert_eq!(Some(style.color), brush.color());
     // The layer itself is left be.
     assert_eq!(doc.edge_style(0, 1), Some(wide));
+    // Another drawing to what's derived from it (the edges' outlines):
+    // drawn as it is, not as the layer is.
+    assert_ne!(tweaked.revision(), doc.revision());
 }
 
 #[test]

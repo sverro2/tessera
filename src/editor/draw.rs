@@ -335,6 +335,7 @@ impl Editor<'_> {
                     .below
                     .iter()
                     .chain(&self.above)
+                    .chain(&self.lit)
                     .any(|layer| layer.id == *id)
         });
 
@@ -351,19 +352,7 @@ impl Editor<'_> {
                 },
             );
             layers.push(Drawn::Geometry(wash.into_geometry()));
-            let current = SceneLayer {
-                id: self.current,
-                document: self.document,
-                crossfade: self.crossfade,
-                show_edges: self.show_edges,
-                mirrors: self.mirrors,
-            };
-            let lit: Vec<SceneLayer> = std::iter::once(current)
-                .chain(self.below.iter().copied())
-                .chain(self.above.iter().copied())
-                .filter(|layer| self.lit.contains(&layer.id))
-                .collect();
-            for layer in lit {
+            for &layer in &self.lit {
                 self.draw_cached(renderer, size, layer, look, &mut layers, meshes);
             }
         }
@@ -398,7 +387,7 @@ impl Editor<'_> {
         // Hidden: nothing to edit; say why clicking does nothing.
         if !self.shown {
             overlay.fill_text(canvas::Text {
-                content: "The current layer is hidden: show it to edit it".into(),
+                content: "The current layer is out of view (hidden, or others isolated): show it to edit it".into(),
                 position: Point::new(bounds.width / 2.0, 14.0),
                 color: EDGE,
                 size: 13.0.into(),
@@ -1116,18 +1105,7 @@ impl Editor<'_> {
             return;
         }
         let camera = self.plain_camera();
-        let current = SceneLayer {
-            id: self.current,
-            document: self.document,
-            crossfade: self.crossfade,
-            show_edges: self.show_edges,
-            mirrors: self.mirrors,
-        };
-        let layers = std::iter::once(&current)
-            .chain(&self.below)
-            .chain(&self.above)
-            .filter(|layer| self.lit.contains(&layer.id));
-        for layer in layers {
+        for layer in &self.lit {
             let document = layer.document;
             let images = doc::images(layer.mirrors);
             let faces = Path::new(|p| {

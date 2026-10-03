@@ -4,7 +4,12 @@
 //!
 //! The first node is the front; the stack is drawn back to front, i.e. in
 //! reverse. A hidden group hides everything in it.
+//!
+//! Some layers and groups may be isolated, to look at them on their own:
+//! while any is, the rest are out of view (but not hidden: they're
+//! exported as ever). Which are isn't kept here, but by whoever looks.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::document::{Document, Mirror, next_revision};
@@ -156,8 +161,6 @@ pub struct Row<'a> {
     pub depth: usize,
     pub name: &'a str,
     pub visible: bool,
-    /// Visible, and so are the groups it's in.
-    pub shown: bool,
     /// For a group, whether it's expanded.
     pub group: Option<bool>,
 }
@@ -286,10 +289,45 @@ impl Layers {
         walk(&self.nodes, id).unwrap_or(false)
     }
 
+    /// Whether any of `isolated` (layers and groups) is one of these.
+    pub fn isolating(&self, isolated: &HashSet<NodeId>) -> bool {
+        isolated.iter().any(|&id| self.contains(id))
+    }
+
+    /// Whether a layer or group is in view: shown and, while any of
+    /// `isolated` are, isolated itself or in a group that is (a group also
+    /// when something in it is).
+    pub fn in_view(&self, id: NodeId, isolated: &HashSet<NodeId>) -> bool {
+        fn walk(nodes: &[Node], id: NodeId, isolated: &HashSet<NodeId>) -> Option<bool> {
+            nodes.iter().find_map(|node| {
+                let here = isolated.contains(&node.id());
+                match node {
+                    _ if node.id() == id => Some(here || within(node, isolated)),
+                    Node::Group(group) => {
+                        walk(&group.children, id, isolated).map(|inside| inside || here)
+                    }
+                    Node::Layer(_) => None,
+                }
+            })
+        }
+        /// Whether something in a group is isolated.
+        fn within(node: &Node, isolated: &HashSet<NodeId>) -> bool {
+            match node {
+                Node::Layer(_) => false,
+                Node::Group(group) => group
+                    .children
+                    .iter()
+                    .any(|child| isolated.contains(&child.id()) || within(child, isolated)),
+            }
+        }
+        self.shown(id)
+            && (!self.isolating(isolated) || walk(&self.nodes, id, isolated).unwrap_or(false))
+    }
+
     /// The panel's lines, front first; the contents of collapsed groups
     /// left out.
     pub fn rows(&self) -> Vec<Row<'_>> {
-        fn walk<'a>(nodes: &'a [Node], depth: usize, shown: bool, out: &mut Vec<Row<'a>>) {
+        fn walk<'a>(nodes: &'a [Node], depth: usize, out: &mut Vec<Row<'a>>) {
             for node in nodes {
                 match node {
                     Node::Layer(layer) => out.push(Row {
@@ -297,7 +335,6 @@ impl Layers {
                         depth,
                         name: &layer.name,
                         visible: layer.visible,
-                        shown: shown && layer.visible,
                         group: None,
                     }),
                     Node::Group(group) => {
@@ -306,35 +343,52 @@ impl Layers {
                             depth,
                             name: &group.name,
                             visible: group.visible,
-                            shown: shown && group.visible,
                             group: Some(group.expanded),
                         });
                         if group.expanded {
-                            walk(&group.children, depth + 1, shown && group.visible, out);
+                            walk(&group.children, depth + 1, out);
                         }
                     }
                 }
             }
         }
         let mut out = Vec::new();
-        walk(&self.nodes, 0, true, &mut out);
+        walk(&self.nodes, 0, &mut out);
         out
     }
 
-    /// The visible layers behind layer `current` and those in front of it,
-    /// each back to front: the order to draw them in.
-    pub fn around<'a>(&'a self, current: NodeId) -> (Vec<&'a Layer>, Vec<&'a Layer>) {
-        // Back to front, with whether each is shown.
-        fn walk<'a>(nodes: &'a [Node], shown: bool, out: &mut Vec<(&'a Layer, bool)>) {
+    /// The layers in view (see [`Self::in_view`]) behind layer `current`
+    /// and those in front of it, each back to front: the order to draw them
+    /// in.
+    pub fn around<'a>(
+        &'a self,
+        current: NodeId,
+        isolated: &HashSet<NodeId>,
+    ) -> (Vec<&'a Layer>, Vec<&'a Layer>) {
+        // Back to front, with whether each is in view.
+        fn walk<'a>(
+            nodes: &'a [Node],
+            (shown, inside): (bool, bool),
+            isolated: &HashSet<NodeId>,
+            out: &mut Vec<(&'a Layer, bool)>,
+        ) {
             for node in nodes.iter().rev() {
+                let inside = inside || isolated.contains(&node.id());
                 match node {
-                    Node::Layer(layer) => out.push((layer, shown && layer.visible)),
-                    Node::Group(group) => walk(&group.children, shown && group.visible, out),
+                    Node::Layer(layer) => out.push((layer, shown && layer.visible && inside)),
+                    Node::Group(group) => walk(
+                        &group.children,
+                        (shown && group.visible, inside),
+                        isolated,
+                        out,
+                    ),
                 }
             }
         }
         let mut stack = Vec::new();
-        walk(&self.nodes, true, &mut stack);
+        // Nothing isolated: everything is in view (as if all were).
+        let everything = !self.isolating(isolated);
+        walk(&self.nodes, (true, everything), isolated, &mut stack);
 
         let at = stack
             .iter()
@@ -689,11 +743,11 @@ mod tests {
         // Hidden groups hide what's in them; drawn back to front around
         // the current layer.
         layers.set_visible(group, false);
-        let (below, above) = layers.around(three);
+        let (below, above) = layers.around(three, &HashSet::new());
         assert_eq!((below.len(), above.len()), (0, 0));
         assert!(!layers.shown(one) && !layers.shown(group) && layers.shown(three));
         layers.set_visible(group, true);
-        let (below, above) = layers.around(two);
+        let (below, above) = layers.around(two, &HashSet::new());
         assert_eq!((below.len(), above.len()), (1, 1));
         assert_eq!(below[0].id, one);
 
@@ -723,6 +777,49 @@ mod tests {
         assert!(left[0].document.is_empty());
         assert_ne!(left[0].id, one);
         assert!(!layers.contains(group));
+    }
+
+    #[test]
+    fn isolating_leaves_the_rest_out_of_view() {
+        let mut layers = Layers::default();
+        let one = layers.first_layer();
+        let two = layers.add_layer(one);
+        let three = layers.add_layer(two);
+        let group = layers.group(two).unwrap();
+        let ids = |part: Vec<&Layer>| part.iter().map(|layer| layer.id).collect::<Vec<_>>();
+
+        // Nothing isolated: everything in view.
+        let none = HashSet::new();
+        assert!(!layers.isolating(&none));
+        assert!(
+            [one, two, three, group]
+                .iter()
+                .all(|&id| layers.in_view(id, &none))
+        );
+
+        // A layer: only it, though around another.
+        let isolated = HashSet::from([one]);
+        assert!(layers.in_view(one, &isolated) && !layers.in_view(three, &isolated));
+        let (below, above) = layers.around(three, &isolated);
+        assert_eq!((ids(below), ids(above)), (vec![one], vec![]));
+        // The group it isn't in is out of view; one holding it isn't.
+        assert!(!layers.in_view(group, &isolated));
+        assert!(layers.in_view(group, &HashSet::from([two])));
+
+        // A group: what's in it.
+        let isolated = HashSet::from([group]);
+        assert!(layers.in_view(two, &isolated) && !layers.in_view(one, &isolated));
+        let (below, above) = layers.around(one, &isolated);
+        assert_eq!((ids(below), ids(above)), (vec![], vec![two]));
+
+        // Hidden stays hidden, isolated or not.
+        layers.set_visible(two, false);
+        assert!(!layers.in_view(two, &isolated));
+
+        // Isolating what's gone: as if nothing were.
+        assert!(layers.remove(group));
+        assert!(!layers.isolating(&isolated));
+        assert!(layers.in_view(one, &isolated));
     }
 
     #[test]

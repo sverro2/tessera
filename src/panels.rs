@@ -392,6 +392,36 @@ impl Tessera {
             .padding([2, 4])
             .style(button::text)
             .on_press(Message::Layers(ToggleVisible(id)));
+            // Faint until isolated, so the line stays quiet.
+            let isolated = self.isolated.contains(&id);
+            let isolate = tooltip(
+                button(icon(
+                    icons::FOCUS,
+                    if isolated {
+                        |theme: &Theme, status| button::Style {
+                            text_color: theme.palette().primary.base.color,
+                            ..button::text(theme, status)
+                        }
+                    } else {
+                        |theme: &Theme, status| {
+                            let style = button::text(theme, status);
+                            button::Style {
+                                text_color: style.text_color.scale_alpha(0.35),
+                                ..style
+                            }
+                        }
+                    },
+                ))
+                .padding([2, 4])
+                .style(button::text)
+                .on_press(Message::Layers(ToggleIsolated(id))),
+                tip(if isolated {
+                    "Isolated: click to stop"
+                } else {
+                    "Isolate: hide the layers not isolated"
+                }),
+                tooltip::Position::Bottom,
+            );
             let name: Element<'_, Message> = if self.naming == Some(id) {
                 text_input("Name", row.name)
                     .id(NAME_FIELD)
@@ -401,8 +431,9 @@ impl Tessera {
                     .on_submit(Message::Layers(EndRename))
                     .into()
             } else {
-                // Hidden (itself or by its group), or being dragged: dimmed.
-                let dim = !row.shown || dragged == Some(id);
+                // Hidden (itself or by its group), out of view while others
+                // are isolated, or being dragged: dimmed.
+                let dim = !self.layers.in_view(id, &self.isolated) || dragged == Some(id);
                 text(row.name)
                     .size(12)
                     .style(move |theme: &Theme| {
@@ -422,9 +453,15 @@ impl Tessera {
                     .layer(layer)
                     .is_none_or(|layer| layer.document.is_empty())
             });
-            let mut line = row![space().width(row.depth as f32 * 14.0), expander, eye, name]
-                .spacing(2)
-                .align_y(Center);
+            let mut line = row![
+                space().width(row.depth as f32 * 14.0),
+                expander,
+                eye,
+                isolate,
+                name
+            ]
+            .spacing(2)
+            .align_y(Center);
             if empty && self.naming != Some(id) {
                 line = line
                     .push(space::horizontal())
