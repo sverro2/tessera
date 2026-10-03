@@ -401,13 +401,22 @@ impl Editor<'_> {
         pending: Option<&Pending>,
         source: Option<(VertexId, VertexId)>,
     ) {
-        let camera = self.camera;
         for &mirror in self.mirrors {
             self.draw_mirror_line(overlay, mirror, bounds, Color { a: 0.6, ..MIRROR });
         }
 
         let hover = cursor_pos.and_then(|p| self.hit_test(p));
 
+        self.draw_highlights(overlay, state, pending);
+        self.draw_lining_up(overlay, state, bounds, cursor_pos, hover, pending);
+        self.draw_drag(overlay, state, cursor_pos, hover, pending, source);
+    }
+
+    /// The outline of the shape last hovered, so it's clear what hangs
+    /// together and what is loose (everything else dimmed); while dragging,
+    /// where the preview puts its vertices. Moving over to another shape,
+    /// the old outline fades out as the new one fades in.
+    fn draw_highlights(&self, overlay: &mut Frame, state: &State, pending: Option<&Pending>) {
         // The outline of the shape last hovered, so it's clear what hangs
         // together and what is loose; while dragging, where the preview puts
         // its vertices. Moving over to another shape, the old outline fades
@@ -476,7 +485,21 @@ impl Editor<'_> {
                 self.draw_shape(overlay, document, shape, strength);
             }
         }
+    }
 
+    /// What a drag lines up with: the grid (holding Ctrl) and the guides
+    /// (holding Shift); before pressing, as pressing then would.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_lining_up(
+        &self,
+        overlay: &mut Frame,
+        state: &State,
+        bounds: Rectangle,
+        cursor_pos: Option<Point>,
+        hover: Option<Hover>,
+        pending: Option<&Pending>,
+    ) {
+        let camera = self.camera;
         // Holding Ctrl while dragging: the grid, around what lands on it.
         let gridded = matches!(
             state.interaction,
@@ -543,6 +566,21 @@ impl Editor<'_> {
         {
             self.draw_guides(overlay, state, pending, bounds);
         }
+    }
+
+    /// What the drag (or click) in hand would do: what it adds, removes and
+    /// joins up, the selection, and where it lands.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_drag(
+        &self,
+        overlay: &mut Frame,
+        state: &State,
+        cursor_pos: Option<Point>,
+        hover: Option<Hover>,
+        pending: Option<&Pending>,
+        source: Option<(VertexId, VertexId)>,
+    ) {
+        let camera = self.camera;
         // Pasting where it doesn't fit: the piece, in red.
         if let (Interaction::Pasting { base, from, to }, None, Some(piece)) =
             (state.interaction, pending, self.clipboard)
