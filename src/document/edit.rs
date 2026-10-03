@@ -3,6 +3,17 @@
 //! overlapping), its faces and edges keeping their paint.
 
 use super::*;
+use quick::QuickMap;
+
+/// How a changed face kept its shape, to tell those that can't have come
+/// to overlap each other.
+#[derive(Clone, Copy, PartialEq)]
+enum Rigid {
+    /// Moved, with all its corners by the same amount (as bits).
+    Moved(u32, u32),
+    /// Pasted, as it was copied.
+    Pasted,
+}
 
 /// What changed in a document since `before`: the vertices that are new or
 /// moved, and (to tell the triangles that are new) the triangles before.
@@ -56,8 +67,15 @@ const FEW: usize = 16;
 
 impl Document {
     /// Checks the invariants, assuming they held in `before`: only triangles
-    /// that are new or have a moved corner need checking for overlaps.
-    pub(super) fn is_valid_after(&self, before: &Document) -> bool {
+    /// that are new or have a moved corner need checking for overlaps, and
+    /// not among themselves those that moved together, unchanged (each by
+    /// the same amount), or were `pasted` as they were copied (see
+    /// [`corners_key`]): they lay clear of each other before.
+    pub(super) fn is_valid_after(
+        &self,
+        before: &Document,
+        pasted: &QuickSet<[(u32, u32); 3]>,
+    ) -> bool {
         if !self.triangles().all(|[a, b, c]| area2(a, b, c) > 0.0) {
             return false;
         }
@@ -65,39 +83,73 @@ impl Document {
         // The same faces as before (moved, say): none new.
         let existed: Option<QuickSet<[VertexId; 3]>> = (self.triangles != before.triangles)
             .then(|| before.triangles.iter().map(|&t| key(t)).collect());
-        let changed = |t: &[VertexId; 3]| {
-            t.iter()
-                .any(|&v| before.vertices.get(v) != Some(&self.vertices[v]))
-                || existed
-                    .as_ref()
-                    .is_some_and(|existed| !existed.contains(&key(*t)))
+        let had = |t: &[VertexId; 3]| {
+            existed
+                .as_ref()
+                .is_none_or(|existed| existed.contains(&key(*t)))
         };
-
-        let changed: Vec<usize> = (0..self.triangles.len())
-            .filter(|&i| changed(&self.triangles[i]))
-            .collect();
+        let moved = |v: VertexId| before.vertices.get(v) != Some(&self.vertices[v]);
         let corners = |i: usize| self.triangles[i].map(|v| self.vertices[v]);
-        // Each against those it may reach: with many, those in the cells it
-        // touches; with a few, all of them.
-        let faces = (changed.len() > FEW).then(|| Cells::of_shapes(self.triangles()));
-        changed.into_iter().all(|i| {
-            let points = corners(i);
-            let (min, max) = cells::bounds(points.into_iter());
-            // Quickly apart by their bounds, else not overlapping.
-            let clear = |j: usize| {
-                let other = corners(j);
-                let (umin, umax) = cells::bounds(other.into_iter());
-                i == j
-                    || umax.x < min.x
-                    || max.x < umin.x
-                    || umax.y < min.y
-                    || max.y < umin.y
-                    || !overlap(points, other)
-            };
-            match &faces {
-                Some(faces) => faces.within(min, max).all(clear),
-                None => (0..self.triangles.len()).all(clear),
+
+        // Those changed, each with the group it moved with, if any.
+        let changed: Vec<(usize, Option<Rigid>)> = (0..self.triangles.len())
+            .filter_map(|i| {
+                let t = self.triangles[i];
+                let had = had(&t);
+                if had && !t.iter().any(|&v| moved(v)) {
+                    return None;
+                }
+                // Each corner moved by (as a face that was there, all its
+                // corners were).
+                let by = had.then(|| t.map(|v| self.vertices[v] - before.vertices[v]));
+                let rigid = if let Some([a, b, c]) = by
+                    && a == b
+                    && b == c
+                {
+                    Some(Rigid::Moved(a.x.to_bits(), a.y.to_bits()))
+                } else if !had && pasted.contains(&corners_key(corners(i))) {
+                    Some(Rigid::Pasted)
+                } else {
+                    None
+                };
+                Some((i, rigid))
+            })
+            .collect();
+        if changed.is_empty() {
+            return true;
+        }
+        let rigid: QuickMap<usize, Option<Rigid>> = changed.iter().copied().collect();
+        let bounds = |i: usize| cells::bounds(corners(i).into_iter());
+        let apart = |(min, max): (Point, Point), (umin, umax): (Point, Point)| {
+            umax.x < min.x || max.x < umin.x || umax.y < min.y || max.y < umin.y
+        };
+        // Changed `i` and any other `j`: the same face, moved together,
+        // quickly apart by their bounds, else not overlapping.
+        let clear = |i: usize, j: usize| {
+            i == j
+                || rigid
+                    .get(&j)
+                    .is_some_and(|&group| group.is_some() && group == rigid[&i])
+                || apart(bounds(i), bounds(j))
+                || !overlap(corners(i), corners(j))
+        };
+        // Few: each against all. Many: the changed ones sorted into cells,
+        // and each face against those of them it may reach (unchanged
+        // ones apart from all that changed, at once).
+        if changed.len() <= FEW {
+            return changed
+                .iter()
+                .all(|&(i, _)| (0..self.triangles.len()).all(|j| clear(i, j)));
+        }
+        let near = Cells::of_shapes(changed.iter().map(|&(i, _)| corners(i)));
+        let (all_min, all_max) =
+            cells::bounds(changed.iter().flat_map(|&(i, _)| corners(i).into_iter()));
+        (0..self.triangles.len()).all(|j| {
+            let (min, max) = bounds(j);
+            if !rigid.contains_key(&j) && apart((min, max), (all_min, all_max)) {
+                return true;
             }
+            near.within(min, max).all(|k| clear(changed[k].0, j))
         })
     }
 
@@ -540,6 +592,15 @@ impl Document {
         let mut used = Vec::new();
         let mut near = None;
         let mut stale = true;
+        // Where the changed vertices are, for unchanged triangles (which can
+        // only have gained one of them on an edge): far from all of them,
+        // nothing to look for.
+        let near_changed = changed
+            .filter(|changed| changed.vertices.len() > MANY)
+            .map(|changed| Cells::of_points(&self.vertices, &changed.vertices));
+        let changed_bounds = changed
+            .filter(|changed| !changed.vertices.is_empty())
+            .map(|changed| cells::bounds(changed.vertices.iter().map(|&v| self.vertices[v])));
         for _ in 0..limit {
             let vertices = &self.vertices;
             let count = self.triangles.len();
@@ -567,26 +628,31 @@ impl Document {
                 (0..3).find_map(|k| {
                     let (u, v, x) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
                     let (a, b) = (vertices[u], vertices[v]);
-                    let candidates: Box<dyn Iterator<Item = VertexId>> = match (&near, only_changed)
-                    {
-                        (Some(near), _) => {
-                            let reach = tolerance(a.distance(b));
-                            let reach = Vector::new(reach, reach);
-                            let min = Point::new(a.x.min(b.x), a.y.min(b.y)) - reach;
-                            let max = Point::new(a.x.max(b.x), a.y.max(b.y)) + reach;
-                            Box::new(near.within(min, max).filter(move |&w| {
-                                only_changed.is_none_or(|changed| changed.vertex(w))
-                            }))
-                        }
-                        (None, Some(changed)) => Box::new(changed.vertices.iter().copied()),
-                        (None, None) => Box::new(used.iter().copied()),
-                    };
-                    // Quickly out of its bounds, then really on it.
                     let reach = tolerance(a.distance(b));
                     let (min, max) = (
                         Point::new(a.x.min(b.x) - reach, a.y.min(b.y) - reach),
                         Point::new(a.x.max(b.x) + reach, a.y.max(b.y) + reach),
                     );
+                    // Unchanged, and away from all that changed: nothing.
+                    if only_changed.is_some()
+                        && changed_bounds.is_none_or(|(cmin, cmax)| {
+                            max.x < cmin.x || cmax.x < min.x || max.y < cmin.y || cmax.y < min.y
+                        })
+                    {
+                        return None;
+                    }
+                    let candidates: Box<dyn Iterator<Item = VertexId>> =
+                        match (only_changed, &near_changed, &near) {
+                            (Some(_), Some(near_changed), _) => Box::new(
+                                near_changed
+                                    .within(min, max)
+                                    .filter(|w| used.binary_search(w).is_ok()),
+                            ),
+                            (Some(changed), None, _) => Box::new(changed.vertices.iter().copied()),
+                            (None, _, Some(near)) => Box::new(near.within(min, max)),
+                            (None, _, None) => Box::new(used.iter().copied()),
+                        };
+                    // Quickly out of its bounds, then really on it.
                     candidates
                         .filter(|&w| {
                             let p = vertices[w];

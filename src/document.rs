@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use iced::{Color, Point, Vector};
+use iced::{Color, Point};
 
 use crate::geometry::{Affine, area2, min_height, overlap};
 
@@ -409,7 +409,7 @@ impl Document {
             }
             document.push_triangle(t);
         }
-        if !document.is_valid_after(&Document::default()) {
+        if !document.is_valid_after(&Document::default(), &QuickSet::default()) {
             return Err("triangles overlap".to_string());
         }
         Ok(document)
@@ -475,9 +475,19 @@ impl Document {
                 Edit::MoveVertices { moves } => moves.iter().map(|&(id, _)| id).collect(),
                 _ => Vec::new(),
             };
+            // A pasted piece's faces, as they were copied (see
+            // `is_valid_after`).
+            let pasted: QuickSet<[(u32, u32); 3]> = match edit {
+                Edit::Paste { piece } => piece
+                    .triangles
+                    .iter()
+                    .map(|t| corners_key(t.map(|v| piece.vertices[v])))
+                    .collect(),
+                _ => QuickSet::default(),
+            };
             let valid = next.apply_unchecked(edit.clone(), &mut changes, deadline)
                 && next.normalize(&moved, &mut changes, &document)
-                && next.is_valid_after(&document);
+                && next.is_valid_after(&document, &pasted);
             if !valid {
                 return None;
             }
@@ -576,6 +586,14 @@ fn contains([a, b, c]: [Point; 3], point: Point) -> bool {
 fn key(mut t: [VertexId; 3]) -> [VertexId; 3] {
     t.sort_unstable();
     t
+}
+
+/// A triangle's corners, in a fixed order, to tell it by where it is
+/// (exactly: a face moved or pasted as it was, not one near it).
+pub fn corners_key(corners: [Point; 3]) -> [(u32, u32); 3] {
+    let mut key = corners.map(|p| (p.x.to_bits(), p.y.to_bits()));
+    key.sort_unstable();
+    key
 }
 
 /// The corners of `t` other than `id`, in winding order after it.
