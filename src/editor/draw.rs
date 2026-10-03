@@ -512,9 +512,12 @@ impl Editor<'_> {
             };
             self.draw_snap_grid(&mut overlay, &points);
         }
-        // Holding Ctrl before pressing: the grid around the cursor, and on
-        // blank canvas, the grid point a new triangle would start at.
-        if state.modifiers.command()
+        // Holding Ctrl or Shift before pressing, as pressing then would:
+        // with Ctrl, the grid around the cursor; on blank canvas, where a
+        // new triangle would start (with Shift, the guides it lines up
+        // with). Over the drawing, nothing until something's dragged.
+        let (grid, shift) = (state.modifiers.command(), state.modifiers.shift());
+        if (grid || shift)
             && matches!(state.interaction, Interaction::Idle)
             && self.tool == Tool::Shape
             && self.shown
@@ -522,13 +525,24 @@ impl Editor<'_> {
             && let Some(cursor) = cursor_pos
         {
             let world = camera.to_world(cursor);
-            self.draw_snap_grid(&mut overlay, &[world]);
+            if grid {
+                self.draw_snap_grid(&mut overlay, &[world]);
+            }
             if state.selection.is_empty() && hover.is_none() {
-                let (start, ..) = self.creation_start(world, true, state.modifiers.shift());
-                overlay.stroke(
-                    &Path::circle(camera.to_screen(start), 5.0),
-                    stroke(ADDED, 1.5),
-                );
+                let (start, _, near) = self.creation_start(world, grid, shift);
+                let reach = bounds.width + bounds.height;
+                for &guide in near.iter().filter(|&&guide| self.runs_through(guide, start)) {
+                    let shape = guide.shape(self.document, camera);
+                    self.draw_guide_line(&mut overlay, guide, shape, true, reach);
+                }
+                // With Shift alone, only where it lines up (else it's just
+                // where the cursor is).
+                if grid || start.distance(world) > 1e-3 {
+                    overlay.stroke(
+                        &Path::circle(camera.to_screen(start), 5.0),
+                        stroke(ADDED, 1.5),
+                    );
+                }
             }
         }
         if !state.near_guides.is_empty()

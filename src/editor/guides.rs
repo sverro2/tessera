@@ -862,6 +862,48 @@ impl Editor<'_> {
         off < 0.75
     }
 
+    /// One guide, running along `shape` (as far as `reach`, screen px, either
+    /// way): bold if lined up with (`on`), with the edge it follows; else
+    /// faint.
+    pub(super) fn draw_guide_line(
+        &self,
+        frame: &mut Frame,
+        guide: Guide,
+        shape: Shape,
+        on: bool,
+        reach: f32,
+    ) {
+        let camera = self.camera;
+        let dashed = Stroke {
+            line_dash: LineDash {
+                segments: &[6.0, 4.0],
+                offset: 0,
+            },
+            ..stroke(
+                Color {
+                    a: if on { 0.9 } else { 0.3 },
+                    ..GUIDE
+                },
+                if on { 1.5 } else { 1.0 },
+            )
+        };
+        match shape {
+            Shape::Line(o, d) => {
+                let (a, b) = (camera.to_screen(o), camera.to_screen(o + d));
+                let length = a.distance(b).max(1e-6);
+                let far = (b - a) * (reach * 2.0 / length);
+                frame.stroke(&Path::line(a - far, b + far), dashed);
+            }
+            Shape::Circle(c, r) => {
+                frame.stroke(&Path::circle(camera.to_screen(c), r * camera.zoom), dashed);
+            }
+        }
+        if let (true, Some((u, v))) = (on, guide.followed()) {
+            let screen = |v| camera.to_screen(self.document.vertex(v));
+            frame.stroke(&Path::line(screen(u), screen(v)), stroke(GUIDE, 3.0));
+        }
+    }
+
     /// The guides for a point dragged with Shift, now at `at` (as it will
     /// be released): those it lines up with there bold, with the edges they
     /// follow, marked (parallel edges with an arrowhead each, edges as long
@@ -888,35 +930,8 @@ impl Editor<'_> {
 
         let reach = bounds.width + bounds.height;
         for guide in &shown {
-            let on = lit.contains(guide);
-            let dashed = Stroke {
-                line_dash: LineDash {
-                    segments: &[6.0, 4.0],
-                    offset: 0,
-                },
-                ..stroke(
-                    Color {
-                        a: if on { 0.9 } else { 0.3 },
-                        ..GUIDE
-                    },
-                    if on { 1.5 } else { 1.0 },
-                )
-            };
             let (shape, ..) = self.guide_view(state, *guide, at.unwrap_or(Point::ORIGIN));
-            match shape {
-                Shape::Line(o, d) => {
-                    let (a, b) = (camera.to_screen(o), camera.to_screen(o + d));
-                    let length = a.distance(b).max(1e-6);
-                    let far = (b - a) * (reach * 2.0 / length);
-                    frame.stroke(&Path::line(a - far, b + far), dashed);
-                }
-                Shape::Circle(c, r) => {
-                    frame.stroke(&Path::circle(camera.to_screen(c), r * camera.zoom), dashed);
-                }
-            }
-            if let (true, Some((u, v))) = (on, guide.followed()) {
-                frame.stroke(&Path::line(screen(u), screen(v)), stroke(GUIDE, 3.0));
-            }
+            self.draw_guide_line(frame, *guide, shape, lit.contains(guide), reach);
         }
 
         let Some(at) = at.filter(|_| !lit.is_empty()) else {
