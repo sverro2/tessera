@@ -7,7 +7,8 @@
 //!
 //! Some layers and groups may be isolated, to look at them on their own:
 //! while any is, the rest are out of view (but not hidden: they're
-//! exported as ever). Which are isn't kept here, but by whoever looks.
+//! exported as ever), and those isolated show even if hidden. Which are
+//! isn't kept here, but by whoever looks.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -90,6 +91,25 @@ impl Node {
         match self {
             Node::Layer(layer) => layer.id,
             Node::Group(group) => group.id,
+        }
+    }
+
+    fn visible(&self) -> bool {
+        match self {
+            Node::Layer(layer) => layer.visible,
+            Node::Group(group) => group.visible,
+        }
+    }
+
+    /// Into this node from what it's in, seen as `(shown, inside)`: whether
+    /// it's shown (it and the groups it's in visible) and in an isolated
+    /// one. Isolated, it shows whatever its eye and theirs say; what's in
+    /// it, as far as its own eyes say.
+    fn seen_from(&self, (shown, inside): (bool, bool), isolated: &HashSet<NodeId>) -> (bool, bool) {
+        if isolated.contains(&self.id()) {
+            (true, true)
+        } else {
+            (shown && self.visible(), inside)
         }
     }
 
@@ -294,18 +314,23 @@ impl Layers {
         isolated.iter().any(|&id| self.contains(id))
     }
 
-    /// Whether a layer or group is in view: shown and, while any of
-    /// `isolated` are, isolated itself or in a group that is (a group also
-    /// when something in it is).
+    /// Whether a layer or group is in view: shown; while any of `isolated`
+    /// are, only if isolated itself (then shown, hidden or not) or in a
+    /// group that is (a group also when something in it is).
     pub fn in_view(&self, id: NodeId, isolated: &HashSet<NodeId>) -> bool {
-        fn walk(nodes: &[Node], id: NodeId, isolated: &HashSet<NodeId>) -> Option<bool> {
+        let isolating = self.isolating(isolated);
+        let walk_from = (true, !isolating);
+        fn walk(
+            nodes: &[Node],
+            id: NodeId,
+            from: (bool, bool),
+            isolated: &HashSet<NodeId>,
+        ) -> Option<bool> {
             nodes.iter().find_map(|node| {
-                let here = isolated.contains(&node.id());
+                let (shown, inside) = node.seen_from(from, isolated);
                 match node {
-                    _ if node.id() == id => Some(here || within(node, isolated)),
-                    Node::Group(group) => {
-                        walk(&group.children, id, isolated).map(|inside| inside || here)
-                    }
+                    _ if node.id() == id => Some(shown && (inside || within(node, isolated))),
+                    Node::Group(group) => walk(&group.children, id, (shown, inside), isolated),
                     Node::Layer(_) => None,
                 }
             })
@@ -320,8 +345,7 @@ impl Layers {
                     .any(|child| isolated.contains(&child.id()) || within(child, isolated)),
             }
         }
-        self.shown(id)
-            && (!self.isolating(isolated) || walk(&self.nodes, id, isolated).unwrap_or(false))
+        walk(&self.nodes, id, walk_from, isolated).unwrap_or(false)
     }
 
     /// The panel's lines, front first; the contents of collapsed groups
@@ -368,20 +392,15 @@ impl Layers {
         // Back to front, with whether each is in view.
         fn walk<'a>(
             nodes: &'a [Node],
-            (shown, inside): (bool, bool),
+            from: (bool, bool),
             isolated: &HashSet<NodeId>,
             out: &mut Vec<(&'a Layer, bool)>,
         ) {
             for node in nodes.iter().rev() {
-                let inside = inside || isolated.contains(&node.id());
+                let (shown, inside) = node.seen_from(from, isolated);
                 match node {
-                    Node::Layer(layer) => out.push((layer, shown && layer.visible && inside)),
-                    Node::Group(group) => walk(
-                        &group.children,
-                        (shown && group.visible, inside),
-                        isolated,
-                        out,
-                    ),
+                    Node::Layer(layer) => out.push((layer, shown && inside)),
+                    Node::Group(group) => walk(&group.children, (shown, inside), isolated, out),
                 }
             }
         }
@@ -812,9 +831,17 @@ mod tests {
         let (below, above) = layers.around(one, &isolated);
         assert_eq!((ids(below), ids(above)), (vec![], vec![two]));
 
-        // Hidden stays hidden, isolated or not.
+        // Hidden in an isolated group: stays hidden. Isolated itself (or a
+        // hidden group isolated): shown all the same.
         layers.set_visible(two, false);
         assert!(!layers.in_view(two, &isolated));
+        let only_two = HashSet::from([two]);
+        assert!(layers.in_view(two, &only_two));
+        let (below, above) = layers.around(one, &only_two);
+        assert_eq!((ids(below), ids(above)), (vec![], vec![two]));
+        layers.set_visible(two, true);
+        layers.set_visible(group, false);
+        assert!(layers.in_view(two, &isolated) && !layers.in_view(two, &none));
 
         // Isolating what's gone: as if nothing were.
         assert!(layers.remove(group));

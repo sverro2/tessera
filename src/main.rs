@@ -765,7 +765,10 @@ impl Tessera {
                             .unwrap_or_default()
                             .into_iter()
                             .rev()
-                            .filter(|&id| self.layers.shown(id))
+                            .filter(|&id| {
+                                self.layers.shown(id)
+                                    || self.layers.in_view(id, &self.layers_panel.isolated)
+                            })
                             .filter_map(|id| self.layers.layer(id))
                             .map(editor::SceneLayer::of)
                             .collect(),
