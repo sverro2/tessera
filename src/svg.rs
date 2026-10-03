@@ -8,14 +8,19 @@ use std::fmt::Write;
 use crate::fade;
 use crate::joints;
 use crate::layers::{Layer, Layers, Node};
+use crate::page::Page;
 use crate::paint;
 
 const PADDING: f32 = 10.0;
 
-/// The area exported: around everything shown (mirrored too), with some
-/// room; its top left corner and size (world units, a pixel each). Hidden
-/// layers are in the SVG, but don't show, so they don't count.
-pub fn area(layers: &Layers) -> (iced::Point, iced::Size) {
+/// The area exported: `page` if given (what's past it cut off), else
+/// around everything shown (mirrored too), with some room; its top left
+/// corner and size (world units, a pixel each). Hidden layers are in the
+/// SVG, but don't show, so they don't count.
+pub fn area(layers: &Layers, page: Option<Page>) -> (iced::Point, iced::Size) {
+    if let Some(page) = page {
+        return (page.min(), page.size);
+    }
     let bounds = layers
         .layers()
         .iter()
@@ -34,8 +39,11 @@ pub fn area(layers: &Layers) -> (iced::Point, iced::Size) {
     )
 }
 
-pub fn export(layers: &Layers) -> String {
-    let (corner, size) = area(layers);
+/// The layers as an SVG of [`area`]: clipped to `page`, if given, by its
+/// view box (so faces running past it are cut off cleanly where they
+/// cross it, and are whole in the file).
+pub fn export(layers: &Layers, page: Option<Page>) -> String {
+    let (corner, size) = area(layers, page);
     let (x, y) = (corner.x, corner.y);
     let (width, height) = (size.width, size.height);
 
@@ -208,10 +216,37 @@ mod tests {
                 b: Point::new(20.0, 10.0),
             }),
         );
-        let svg = export(&layers);
+        let svg = export(&layers, None);
         assert_eq!(svg.matches("-face").count(), 2, "{svg}");
         // Its mirror image is in view too.
         assert!(svg.contains(r#"viewBox="-10 -10 60 30""#), "{svg}");
+    }
+
+    #[test]
+    fn clipped_to_the_document_it_shows_just_that() {
+        let mut document = Document::default();
+        document.apply(Edit::AddTriangle {
+            corners: [
+                Point::new(0.0, 0.0),
+                Point::new(500.0, 0.0),
+                Point::new(250.0, 400.0),
+            ],
+            snap: 0.0,
+        });
+        let mut layers = Layers::default();
+        let first = layers.first_layer();
+        layers.layer_mut(first).unwrap().document = std::sync::Arc::new(document);
+        let page = Page {
+            center: Point::new(100.0, 50.0),
+            size: iced::Size::new(200.0, 100.0),
+        };
+        let svg = export(&layers, Some(page));
+        assert!(
+            svg.contains(r#"viewBox="0 0 200 100" width="200" height="100""#),
+            "{svg}"
+        );
+        // The face running past it is whole in the file.
+        assert_eq!(svg.matches("-face").count(), 1, "{svg}");
     }
 
     #[test]
@@ -233,9 +268,9 @@ mod tests {
         let mut layers = Layers::default();
         let first = layers.first_layer();
         layers.layer_mut(first).unwrap().document = std::sync::Arc::new(document);
-        assert_eq!(export(&layers).matches("-edge").count(), 3);
+        assert_eq!(export(&layers, None).matches("-edge").count(), 3);
         layers.set_show_edges(first, false);
-        let svg = export(&layers);
+        let svg = export(&layers, None);
         assert_eq!(svg.matches("-edge").count(), 0, "{svg}");
         assert_eq!(svg.matches("-face").count(), 1, "{svg}");
     }
@@ -264,7 +299,7 @@ mod tests {
         let mut layers = Layers::default();
         let first = layers.first_layer();
         layers.layer_mut(first).unwrap().document = std::sync::Arc::new(document);
-        let solid = export(&layers);
+        let solid = export(&layers, None);
         assert!(!solid.contains("linearGradient"), "{solid}");
 
         layers.set_crossfade(
@@ -274,7 +309,7 @@ mod tests {
                 width: 2.0,
             },
         );
-        let svg = export(&layers);
+        let svg = export(&layers, None);
         // Two painted edges, 10 long: their own colour but for the last 2
         // at an end where they meet, fading into the blend there.
         assert_eq!(svg.matches("<linearGradient").count(), 2, "{svg}");
@@ -324,7 +359,7 @@ mod tests {
         layers.rename(hidden, "A \"quote\"".into());
         layers.set_visible(hidden, false);
 
-        let svg = export(&layers);
+        let svg = export(&layers, None);
         // The painted face and edge only (of three and six): what isn't
         // painted isn't there.
         assert_eq!(svg.matches("<path ").count(), 1 + 1, "{svg}");

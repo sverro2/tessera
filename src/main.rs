@@ -12,6 +12,7 @@ mod icons;
 mod joints;
 mod keys;
 mod layers;
+mod page;
 mod paint;
 mod panels;
 mod places;
@@ -45,8 +46,8 @@ use layers::{Layers, NodeId, Place, Signature};
 use paint::{Brush, Hsv, Target};
 use panels::{joined, tip};
 use update::{
-    BackgroundMessage, ExportMessage, FileMessage, KeysMessage, LayerAction, MenuMessage,
-    PaintMessage, ShapeMessage,
+    BackgroundMessage, ExportMessage, FileMessage, Format, KeysMessage, LayerAction, MenuMessage,
+    PageDialog, PageMessage, PaintMessage, ShapeMessage,
 };
 
 pub fn main() -> iced::Result {
@@ -179,15 +180,19 @@ struct Tessera {
     clipboard: Option<document::Piece>,
     /// Which keys do what (kept in the config folder).
     keys: Keymap,
-    /// Exporting a PNG: its dialog open, and how large and on what (as last
+    /// Exporting: its dialog open (for what), whether just the document is
+    /// exported (its size set), and how large a PNG is and on what (as last
     /// chosen).
-    png_open: bool,
+    export_open: Option<Format>,
+    export_to_page: bool,
     png_scale: f32,
     png_backdrop: raster::Backdrop,
     /// The keyboard shortcuts shown (F1); and one being set: the next key
     /// pressed goes to this action (instead of its key at that place, or
     /// as another).
     keys_open: bool,
+    /// The document size dialog, as filled in so far, while it's open.
+    page_dialog: Option<PageDialog>,
     rebinding: Option<(Action, Option<usize>)>,
     /// The modifier keys held (Shift turns painting a layer into painting
     /// all layers).
@@ -293,6 +298,7 @@ enum Message {
     Export(ExportMessage),
     Background(BackgroundMessage),
     Menu(MenuMessage),
+    Page(PageMessage),
 }
 
 /// What was saved: the layers and background version.
@@ -387,6 +393,8 @@ impl Tessera {
         self.renaming = None;
         self.naming = None;
         self.dragging = None;
+        // The document size may be another.
+        self.caches.grid.clear();
     }
 
     /// Paints every face (or edge) of the current layer, or of all layers,
@@ -489,6 +497,7 @@ impl Tessera {
             reach: 100.0,
             keys: Keymap::load(),
             png_scale: 2.0,
+            export_to_page: true,
             brush,
             recent_files: recent::Recent::load(),
             places: places::Places::load(),
@@ -518,6 +527,7 @@ impl Tessera {
             Message::Export(message) => self.update_export(message),
             Message::Background(message) => self.update_background(message),
             Message::Menu(message) => self.update_menu(message),
+            Message::Page(message) => self.update_page(message),
             Message::Undo => {
                 self.menu = None;
                 let Some(before) = self.undo.pop() else {
@@ -631,13 +641,19 @@ impl Tessera {
             self.confirming = None;
             self.about = false;
             self.keys_open = false;
-            self.png_open = false;
+            self.export_open = None;
+            self.page_dialog = None;
             self.editing_background = false;
             self.picking = false;
             self.placing_mirror = false;
             return Task::none();
         }
-        if self.confirming.is_some() || self.about || self.keys_open || self.png_open {
+        if self.confirming.is_some()
+            || self.about
+            || self.keys_open
+            || self.export_open.is_some()
+            || self.page_dialog.is_some()
+        {
             return Task::none();
         }
         let context = match self.mode {
@@ -834,6 +850,7 @@ impl Tessera {
                             .into_iter()
                             .filter(|&id| self.layers.shown(id))
                             .collect(),
+                        page: self.layers.page(),
                     },
                 )
             }
@@ -873,8 +890,11 @@ impl Tessera {
         if self.keys_open {
             screen = screen.push(self.shortcuts());
         }
-        if self.png_open {
-            screen = screen.push(self.png_dialog());
+        if let Some(format) = self.export_open {
+            screen = screen.push(self.export_dialog(format));
+        }
+        if let Some(dialog) = &self.page_dialog {
+            screen = screen.push(self.page_dialog(dialog));
         }
         if let Some(path) = &self.dropping {
             screen = screen.push(dropping_hint(path));
@@ -933,6 +953,54 @@ mod tests {
             edits: vec![Edit::AddTriangle { corners, snap: 0.0 }],
             revision,
         }));
+    }
+
+    #[test]
+    fn the_document_size_is_set_in_its_dialog_and_undone() {
+        let mut app = Tessera::default();
+        edit(&mut app, 0.0);
+        let page = |app: &mut Tessera, message| {
+            let _ = app.update(Message::Page(message));
+        };
+
+        page(&mut app, PageMessage::Show(true));
+        page(&mut app, PageMessage::Preset(page::Preset::FullHd));
+        let dialog = app.page_dialog.as_ref().unwrap();
+        assert_eq!((&*dialog.width, &*dialog.height), ("1920", "1080"));
+        page(&mut app, PageMessage::Turn);
+        page(&mut app, PageMessage::Apply);
+        assert!(app.page_dialog.is_none());
+        // Around the triangle, (100, 100)–(300, 300).
+        let set = app.layers.page().expect("set");
+        assert_eq!(set.size, iced::Size::new(1080.0, 1920.0));
+        assert_eq!(set.center, Point::new(200.0, 200.0));
+
+        // A custom size, where it was.
+        page(&mut app, PageMessage::Show(true));
+        assert!(!app.page_dialog.as_ref().unwrap().centre);
+        page(&mut app, PageMessage::Width("1000".into()));
+        page(&mut app, PageMessage::Height("700".into()));
+        assert_eq!(
+            app.page_dialog.as_ref().unwrap().preset,
+            page::Preset::Custom
+        );
+        page(&mut app, PageMessage::Apply);
+        let custom = app.layers.page().unwrap();
+        assert_eq!(custom.size, iced::Size::new(1000.0, 700.0));
+        assert_eq!(custom.center, set.center);
+
+        // A size that won't do isn't applied.
+        page(&mut app, PageMessage::Show(true));
+        page(&mut app, PageMessage::Width("0".into()));
+        page(&mut app, PageMessage::Apply);
+        assert!(app.page_dialog.is_some());
+        page(&mut app, PageMessage::Remove);
+        assert_eq!(app.layers.page(), None);
+
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.layers.page(), Some(custom));
+        let _ = app.update(Message::Undo);
+        assert_eq!(app.layers.page(), Some(set));
     }
 
     #[test]

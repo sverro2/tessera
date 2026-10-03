@@ -53,6 +53,7 @@ use crate::icons;
 use crate::joints;
 use crate::keys::{Action, Chord, Context, Keymap};
 use crate::layers::{Crossfade, NodeId};
+use crate::page::Page;
 use crate::paint::{self, Brush};
 
 mod draw;
@@ -98,6 +99,10 @@ const ROTATE_STEP: f32 = 5.0 * std::f32::consts::PI / 180.0;
 
 pub const BACKGROUND: Color = Color::from_rgb8(0x1a, 0x1b, 0x26);
 pub const GRID_DOT: Color = Color::from_rgb8(0x2f, 0x33, 0x4d);
+/// The document (its size set): a sheet a little lighter than around it,
+/// and its edge.
+const PAGE: Color = Color::from_rgb8(0x22, 0x24, 0x34);
+const PAGE_EDGE: Color = Color::from_rgb8(0x56, 0x5f, 0x89);
 const FILL: Color = Color::from_rgba8(0x7a, 0xa2, 0xf7, 0.35);
 pub const EDGE: Color = Color::from_rgb8(0xc0, 0xca, 0xf5);
 /// Washed over the shapes other than the highlighted one: fading them
@@ -269,6 +274,8 @@ pub struct Settings<'a> {
     pub keys: Option<&'a Keymap>,
     /// Layers to light up (pointed at in the layers panel).
     pub lit: Vec<NodeId>,
+    /// The document size, if one's set: shown as a sheet behind it all.
+    pub page: Option<Page>,
 }
 
 /// The canvas for editing the current layer of `scene`, over the backdrop
@@ -292,11 +299,13 @@ pub fn view<'a>(
         clipboard,
         keys,
         lit,
+        page,
     } = settings;
     let backdrop = Canvas::new(Backdrop {
         cache: &caches.grid,
         background,
         camera,
+        page,
     });
     let editor = Canvas::new(Editor {
         document: current.document,
@@ -326,11 +335,13 @@ pub fn view<'a>(
     .into()
 }
 
-/// The background colour, the background image and the grid.
+/// The background colour, the document (its size set), the background
+/// image and the grid.
 struct Backdrop<'a> {
     cache: &'a canvas::Cache,
     background: Option<&'a Background>,
     camera: Camera,
+    page: Option<Page>,
 }
 
 impl canvas::Program<Message> for Backdrop<'_> {
@@ -346,10 +357,35 @@ impl canvas::Program<Message> for Backdrop<'_> {
     ) -> Vec<Geometry> {
         vec![self.cache.draw(renderer, bounds.size(), |frame| {
             frame.fill_rectangle(Point::ORIGIN, frame.size(), BACKGROUND);
+            let sheet = self.page.map(|page| {
+                let [first, rest @ ..] = page.corners().map(|p| self.camera.to_screen(p));
+                Path::new(|path| {
+                    path.move_to(first);
+                    for p in rest {
+                        path.line_to(p);
+                    }
+                    path.close();
+                })
+            });
+            if let Some(sheet) = &sheet {
+                frame.fill(sheet, PAGE);
+            }
             if let Some(background) = self.background {
                 background.draw(frame, self.camera);
             }
             draw_grid(frame, self.camera);
+            if let (Some(sheet), Some(page)) = (&sheet, self.page) {
+                frame.stroke(sheet, stroke(PAGE_EDGE, 1.0));
+                // Its size, above its top left corner (as seen).
+                let corner = self.camera.to_screen(page.min());
+                frame.fill_text(canvas::Text {
+                    content: format!("{:.0} × {:.0}", page.size.width, page.size.height),
+                    position: corner + Vector::new(0.0, -18.0),
+                    color: PAGE_EDGE,
+                    size: 12.0.into(),
+                    ..canvas::Text::default()
+                });
+            }
         })]
     }
 }

@@ -9,73 +9,199 @@ impl Tessera {
     /// Asks what to do with unsaved changes, over the dimmed window.
     /// What Tessera is, its version, and whose work it builds on (with
     /// their licences).
-    /// Exporting a PNG: how large (with its size in pixels) and on what,
-    /// then where.
-    pub(super) fn png_dialog(&self) -> Element<'_, Message> {
+    /// Exporting: with a document size, all there is or just the
+    /// document; a PNG, how large (with its size in pixels) and on what.
+    /// Then where.
+    pub(super) fn export_dialog(&self, format: Format) -> Element<'_, Message> {
         let small = |label: String| text(label).size(13);
-        let (_, area) = svg::area(&self.layers);
+        let close = Message::Export(ExportMessage::ShowExport(None));
+        let (_, area) = svg::area(&self.layers, self.export_page());
         let (width, height) = raster::pixels(area.width, area.height, self.png_scale);
-        let fits = width <= raster::MAX_SIDE && height <= raster::MAX_SIDE;
-        let scales: Vec<_> = [1.0, 2.0, 4.0, 8.0]
-            .into_iter()
-            .map(|scale| {
-                (
-                    match scale {
-                        1.0 => "1×",
-                        2.0 => "2×",
-                        4.0 => "4×",
-                        _ => "8×",
-                    },
-                    self.png_scale == scale,
-                    Message::Export(ExportMessage::PngScale(scale)),
-                )
-            })
-            .collect();
-        let backdrops: Vec<_> = raster::Backdrop::ALL
-            .into_iter()
-            .map(|backdrop| {
-                (
-                    backdrop.label(),
-                    self.png_backdrop == backdrop,
-                    Message::Export(ExportMessage::PngBackdrop(backdrop)),
-                )
-            })
-            .collect();
-        let size = if fits {
-            text(format!("{width} × {height} pixels"))
-                .size(12)
-                .style(text::secondary)
-        } else {
-            text(format!("{width} × {height} pixels: too large"))
-                .size(12)
-                .style(text::danger)
-        };
+        let fits =
+            format == Format::Svg || (width <= raster::MAX_SIDE && height <= raster::MAX_SIDE);
 
-        modal(
-            column![
-                text("Export PNG").size(20),
-                row![small("Size".into()).width(80), joined(scales), size]
+        let mut body = column![
+            text(match format {
+                Format::Svg => "Export SVG",
+                Format::Png => "Export PNG",
+            })
+            .size(20)
+        ]
+        .spacing(14)
+        .width(440);
+        if self.layers.page().is_some() {
+            let areas = vec![
+                (
+                    "Document",
+                    self.export_to_page,
+                    Message::Export(ExportMessage::ToPage(true)),
+                ),
+                (
+                    "Everything",
+                    !self.export_to_page,
+                    Message::Export(ExportMessage::ToPage(false)),
+                ),
+            ];
+            body = body.push(
+                row![small("Area".into()).width(80), joined(areas)]
                     .spacing(10)
                     .align_y(Center),
-                row![small("Background".into()).width(80), joined(backdrops)]
-                    .spacing(10)
-                    .align_y(Center),
+            );
+        }
+        if format == Format::Png {
+            let scales: Vec<_> = [1.0, 2.0, 4.0, 8.0]
+                .into_iter()
+                .map(|scale| {
+                    (
+                        match scale {
+                            1.0 => "1×",
+                            2.0 => "2×",
+                            4.0 => "4×",
+                            _ => "8×",
+                        },
+                        self.png_scale == scale,
+                        Message::Export(ExportMessage::PngScale(scale)),
+                    )
+                })
+                .collect();
+            let backdrops: Vec<_> = raster::Backdrop::ALL
+                .into_iter()
+                .map(|backdrop| {
+                    (
+                        backdrop.label(),
+                        self.png_backdrop == backdrop,
+                        Message::Export(ExportMessage::PngBackdrop(backdrop)),
+                    )
+                })
+                .collect();
+            let size = if fits {
+                text(format!("{width} × {height} pixels"))
+                    .size(12)
+                    .style(text::secondary)
+            } else {
+                text(format!("{width} × {height} pixels: too large"))
+                    .size(12)
+                    .style(text::danger)
+            };
+            body = body
+                .push(
+                    row![small("Size".into()).width(80), joined(scales), size]
+                        .spacing(10)
+                        .align_y(Center),
+                )
+                .push(
+                    row![small("Background".into()).width(80), joined(backdrops)]
+                        .spacing(10)
+                        .align_y(Center),
+                );
+        }
+        let export = Message::Export(match format {
+            Format::Svg => ExportMessage::ExportSvg,
+            Format::Png => ExportMessage::ExportPng,
+        });
+        body = body
+            .push(
                 text("Hidden layers are left out, as in the SVG.")
                     .size(12)
                     .style(text::secondary),
+            )
+            .push(
                 row![
                     space::horizontal(),
                     button("Cancel")
                         .style(button::secondary)
-                        .on_press(Message::Export(ExportMessage::ShowExportPng(false))),
-                    button("Export…")
-                        .on_press_maybe(fits.then_some(Message::Export(ExportMessage::ExportPng))),
+                        .on_press(close.clone()),
+                    button("Export…").on_press_maybe(fits.then_some(export)),
                 ]
                 .spacing(8),
+            );
+        modal(body, close)
+    }
+
+    /// Setting the document size: a preset or any size in pixels, upright
+    /// or turned; where it goes; or none.
+    pub(super) fn page_dialog<'a>(&'a self, dialog: &'a PageDialog) -> Element<'a, Message> {
+        let small = |label: &'a str| text(label).size(13);
+        let close = Message::Page(PageMessage::Show(false));
+        let size = dialog.size();
+        let landscape = size.is_some_and(|size| size.width > size.height);
+        let field = |value: &'a str, on_input: fn(String) -> PageMessage| {
+            text_input("", value)
+                .on_input(move |text| Message::Page(on_input(text)))
+                .on_submit(Message::Page(PageMessage::Apply))
+                .size(13)
+                .width(90)
+        };
+
+        let mut buttons = row![space::horizontal()].spacing(8);
+        if self.layers.page().is_some() {
+            buttons = buttons.push(
+                button("Remove")
+                    .style(button::danger)
+                    .on_press(Message::Page(PageMessage::Remove)),
+            );
+        }
+        buttons = buttons
+            .push(
+                button("Cancel")
+                    .style(button::secondary)
+                    .on_press(close.clone()),
+            )
+            .push(
+                button("Apply")
+                    .on_press_maybe(size.is_some().then_some(Message::Page(PageMessage::Apply))),
+            );
+
+        modal(
+            column![
+                text("Document size").size(20),
+                row![
+                    small("Preset").width(80),
+                    iced::widget::pick_list(
+                        Some(dialog.preset),
+                        &page::Preset::ALL[..],
+                        |preset| { preset.to_string() }
+                    )
+                    .on_select(|preset| Message::Page(PageMessage::Preset(preset)))
+                    .text_size(13)
+                    .width(Fill),
+                ]
+                .spacing(10)
+                .align_y(Center),
+                row![
+                    small("Size").width(80),
+                    field(&dialog.width, PageMessage::Width),
+                    small("×"),
+                    field(&dialog.height, PageMessage::Height),
+                    small("pixels"),
+                ]
+                .spacing(8)
+                .align_y(Center),
+                row![
+                    small("Orientation").width(80),
+                    joined(vec![
+                        ("Portrait", !landscape, Message::Page(PageMessage::Turn)),
+                        ("Landscape", landscape, Message::Page(PageMessage::Turn)),
+                    ]),
+                ]
+                .spacing(10)
+                .align_y(Center),
+                checkbox(dialog.centre)
+                    .label("Centre it on the drawing")
+                    .size(14)
+                    .text_size(13)
+                    .on_toggle(|centre| Message::Page(PageMessage::Centre(centre))),
+                text(
+                    "A guide on the canvas: you can still draw past it. Exports can be \
+                     clipped to it."
+                )
+                .size(12)
+                .style(text::secondary),
+                buttons,
             ]
             .spacing(14)
-            .width(440),
-            Message::Export(ExportMessage::ShowExportPng(false)),
+            .width(460),
+            close,
         )
     }
 

@@ -98,7 +98,7 @@ mod tests {
         let mut layers = Layers::default();
         let first = layers.first_layer();
         layers.layer_mut(first).unwrap().document = std::sync::Arc::new(document);
-        let svg = crate::svg::export(&layers);
+        let svg = crate::svg::export(&layers, None);
 
         let png = png(&svg, 2.0, Backdrop::White).unwrap();
         let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
@@ -123,7 +123,7 @@ mod tests {
             document.apply(Edit::PaintAllEdges { style: None });
             document
         });
-        let bare = crate::svg::export(&layers);
+        let bare = crate::svg::export(&layers, None);
         let png = super::png(&bare, 2.0, Backdrop::Transparent).unwrap();
         let image = image::load_from_memory(&png).unwrap().to_rgba8();
         assert!(image.pixels().all(|pixel| pixel.0[3] == 0));
@@ -137,7 +137,7 @@ mod tests {
 
         // A hidden layer isn't in it, as in the SVG.
         layers.set_visible(first, false);
-        let png = super::png(&crate::svg::export(&layers), 2.0, Backdrop::White).unwrap();
+        let png = super::png(&crate::svg::export(&layers, None), 2.0, Backdrop::White).unwrap();
         let image = image::load_from_memory(&png).unwrap().to_rgba8();
         assert_eq!(image.get_pixel(30, 30).0, [255, 255, 255, 255]);
     }

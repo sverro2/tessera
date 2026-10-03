@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::document::{Document, Mirror, next_revision};
+use crate::page::Page;
 
 /// Identifies a layer or group; unique within [`Layers`].
 pub type NodeId = u64;
@@ -118,6 +119,9 @@ pub struct Layers {
     /// Changes with every change to the layers themselves (not to what's
     /// drawn on them): see [`Self::signature`].
     revision: u64,
+    /// The document size, if one's set: a guide on the canvas, and what
+    /// exports can be clipped to.
+    page: Option<Page>,
 }
 
 impl Default for Layers {
@@ -181,12 +185,26 @@ impl Layers {
             nodes,
             next_id: next + 1,
             revision: next_revision(),
+            page: None,
         };
         if !layers.nodes.iter().any(Node::has_layer) {
             let layer = layers.new_layer();
             layers.nodes.insert(0, layer);
         }
         layers
+    }
+
+    /// The document size, if one's set.
+    pub fn page(&self) -> Option<Page> {
+        self.page
+    }
+
+    /// Sets the document size (`None`: none).
+    pub fn set_page(&mut self, page: Option<Page>) {
+        if self.page != page {
+            self.page = page;
+            self.changed();
+        }
     }
 
     pub fn nodes(&self) -> &[Node] {

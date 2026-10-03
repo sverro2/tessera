@@ -804,13 +804,21 @@ impl Tessera {
                         .push(item(
                             "Export SVG…",
                             String::new(),
-                            has_content.then_some(Message::Export(ExportMessage::ExportSvg)),
+                            // With a document size, first what to export.
+                            has_content.then_some(Message::Export(
+                                if self.layers.page().is_some() {
+                                    ExportMessage::ShowExport(Some(Format::Svg))
+                                } else {
+                                    ExportMessage::ExportSvg
+                                },
+                            )),
                         ))
                         .push(item(
                             "Export PNG…",
                             String::new(),
-                            has_content
-                                .then_some(Message::Export(ExportMessage::ShowExportPng(true))),
+                            has_content.then_some(Message::Export(ExportMessage::ShowExport(
+                                Some(Format::Png),
+                            ))),
                         )),
                 )
             }
@@ -826,6 +834,12 @@ impl Tessera {
                         "Redo",
                         self.keys.first(Action::Redo),
                         (!self.redo.is_empty()).then_some(Message::Redo)
+                    ),
+                    iced::widget::rule::horizontal(1),
+                    item(
+                        "Document size…",
+                        String::new(),
+                        Some(Message::Page(PageMessage::Show(true)))
                     ),
                 ],
             ),

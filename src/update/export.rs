@@ -1,33 +1,45 @@
-//! Exporting: to SVG, and (as chosen in its dialog) to PNG.
+//! Exporting: to SVG, and (as chosen in its dialog) to PNG. With a
+//! document size set, either can be clipped to it.
 
 use crate::*;
 
+/// What's exported to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Svg,
+    Png,
+}
+
 #[derive(Debug, Clone)]
 pub enum ExportMessage {
-    ExportSvg,
-    /// Opens the PNG export's dialog, or closes it.
-    ShowExportPng(bool),
+    /// Opens the export dialog for a format, or closes it.
+    ShowExport(Option<Format>),
+    /// Whether to export just the document (its size set), not all there is.
+    ToPage(bool),
     /// How large the PNG is (pixels to a unit), and on what.
     PngScale(f32),
     PngBackdrop(raster::Backdrop),
-    /// Exports the PNG as chosen: asks where.
+    /// Exports as chosen: asks where.
+    ExportSvg,
     ExportPng,
     Exported(Result<Option<PathBuf>, String>),
 }
 
 impl Tessera {
+    /// What's exported: the document, if its size is set and that's chosen.
+    pub(crate) fn export_page(&self) -> Option<page::Page> {
+        self.layers.page().filter(|_| self.export_to_page)
+    }
+
     pub(crate) fn update_export(&mut self, message: ExportMessage) -> Task<Message> {
         match message {
-            ExportMessage::ExportSvg => {
+            ExportMessage::ShowExport(format) => {
                 self.menu = None;
-                let svg = svg::export(&self.layers);
-                Task::perform(save_svg(svg), |value| {
-                    Message::Export(ExportMessage::Exported(value))
-                })
+                self.export_open = format;
+                Task::none()
             }
-            ExportMessage::ShowExportPng(open) => {
-                self.menu = None;
-                self.png_open = open;
+            ExportMessage::ToPage(to_page) => {
+                self.export_to_page = to_page;
                 Task::none()
             }
             ExportMessage::PngScale(scale) => {
@@ -38,9 +50,17 @@ impl Tessera {
                 self.png_backdrop = backdrop;
                 Task::none()
             }
+            ExportMessage::ExportSvg => {
+                self.menu = None;
+                self.export_open = None;
+                let svg = svg::export(&self.layers, self.export_page());
+                Task::perform(save_svg(svg), |value| {
+                    Message::Export(ExportMessage::Exported(value))
+                })
+            }
             ExportMessage::ExportPng => {
-                self.png_open = false;
-                let svg = svg::export(&self.layers);
+                self.export_open = None;
+                let svg = svg::export(&self.layers, self.export_page());
                 Task::perform(
                     save_png(svg, self.png_scale.max(0.1), self.png_backdrop),
                     |value| Message::Export(ExportMessage::Exported(value)),

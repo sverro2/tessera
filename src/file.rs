@@ -1,7 +1,8 @@
 //! The `.tessera` file format: a zip of the drawing, as JSON, and the
 //! background images it uses.
 //!
-//! - `drawing.json`: the layers (in groups), the view, and the paint used.
+//! - `drawing.json`: the layers (in groups), the view, the paint used, and
+//!   the document size (if one's set).
 //!   Colours and edge styles are kept once, in tables, and referred to by
 //!   their place in them. Each layer's geometry is compact: its points as
 //!   `[x0, y0, x1, y1, …]`, its faces as `[a, b, c, colour]` (`[a, b, c]` if
@@ -30,6 +31,7 @@ use crate::background::Background;
 use crate::camera::Camera;
 use crate::document::{Document, EdgeStyle, Mirror};
 use crate::layers::{Crossfade, Group, Layer, Layers, Node, NodeId};
+use crate::page::Page;
 use crate::paint;
 
 /// The file name extension.
@@ -68,6 +70,16 @@ struct Drawing {
     edge_styles: Vec<SavedEdgeStyle>,
     /// Front first.
     layers: Vec<SavedNode>,
+    /// The document size, if one's set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page: Option<SavedPage>,
+}
+
+/// The document size: its centre and size (world units).
+#[derive(Serialize, Deserialize)]
+struct SavedPage {
+    center: [f32; 2],
+    size: [f32; 2],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -193,6 +205,10 @@ pub fn save(
         colors: saving.colors,
         edge_styles: saving.edge_styles,
         layers: nodes,
+        page: layers.page().map(|page| SavedPage {
+            center: [page.center.x, page.center.y],
+            size: [page.size.width, page.size.height],
+        }),
     };
 
     // In memory: nothing to go wrong but running out of it.
@@ -472,7 +488,16 @@ pub fn open(bytes: &[u8]) -> Result<Contents, String> {
         .into_iter()
         .map(|node| opening.node(node))
         .collect::<Result<_, _>>()?;
-    let layers = Layers::from_nodes(nodes);
+    let mut layers = Layers::from_nodes(nodes);
+    // One that makes no sense is left out.
+    let page = drawing.page.and_then(|SavedPage { center, size }| {
+        let page = Page {
+            center: Point::new(center[0], center[1]),
+            size: iced::Size::new(size[0], size[1]),
+        };
+        (center.iter().all(|n| n.is_finite()) && Page::fits(page.size)).then_some(page)
+    });
+    layers.set_page(page);
     // Laid out as the layers are: their ids now theirs.
     let ids: Vec<_> = layers.layers().iter().map(|layer| layer.id).collect();
     let backgrounds = ids
@@ -736,6 +761,11 @@ mod tests {
         layers.set_mirror(first, Some(mirror));
         let group = layers.group(first).unwrap();
         layers.rename(group, "Back".into());
+        let page = Page {
+            center: Point::new(40.0, -25.5),
+            size: iced::Size::new(2480.0, 3508.0),
+        };
+        layers.set_page(Some(page));
         let camera = Camera {
             pan: Vector::new(12.5, -3.0),
             zoom: 1.75,
@@ -753,6 +783,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(rows(&opened.layers), rows(&layers));
+        assert_eq!(opened.layers.page(), Some(page));
         let settings = |layers: &Layers| {
             layers
                 .layers()

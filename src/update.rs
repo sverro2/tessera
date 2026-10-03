@@ -8,15 +8,17 @@ mod file;
 mod keys;
 mod layers;
 mod menu;
+mod page;
 mod paint;
 mod shape;
 
 pub use background::BackgroundMessage;
-pub use export::ExportMessage;
+pub use export::{ExportMessage, Format};
 pub use file::Dropped;
 pub use file::FileMessage;
 pub use keys::KeysMessage;
 pub use layers::LayerAction;
 pub use menu::MenuMessage;
+pub use page::{PageDialog, PageMessage};
 pub use paint::PaintMessage;
 pub use shape::ShapeMessage;
