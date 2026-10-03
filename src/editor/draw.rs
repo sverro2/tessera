@@ -687,6 +687,63 @@ impl Editor<'_> {
         View { min, max }
     }
 
+    /// The outlines (world) of `document`'s painted edges `ends` (see
+    /// [`joints`]), their widths as drawn at this zoom. Remembered per
+    /// drawing and zoom, so panning needn't work them out again; those not
+    /// yet are, with the edges they meet, so they join up as they should.
+    fn edge_outlines(
+        &self,
+        document: &Document,
+        ends: &[(VertexId, VertexId)],
+    ) -> Vec<Vec<Point>> {
+        let zoom = self.camera.zoom;
+        let width = |a, b| {
+            let style = document.edge_style(a, b).unwrap_or(doc::DEFAULT_EDGE);
+            self.edge_width(style.width) / zoom
+        };
+        let mut memo = self.caches.outlines.borrow_mut();
+        // Only a few drawings at a time (those drawn lately).
+        if memo.len() > 64 && !memo.contains_key(&document.revision()) {
+            memo.clear();
+        }
+        let known = memo.entry(document.revision()).or_default();
+        if known.zoom != zoom {
+            known.zoom = zoom;
+            known.outlines.clear();
+        }
+        let missing: Vec<(VertexId, VertexId)> = ends
+            .iter()
+            .copied()
+            .filter(|edge| !known.outlines.contains_key(edge))
+            .collect();
+        if !missing.is_empty() {
+            if known.around.is_empty() {
+                for (a, b, _) in document.edge_styles() {
+                    known.around.entry(a).or_default().push((a, b));
+                    known.around.entry(b).or_default().push((a, b));
+                }
+            }
+            // With the painted edges they meet, each once.
+            let mut list = missing.clone();
+            let mut listed: std::collections::HashSet<_> = missing.iter().copied().collect();
+            for &(a, b) in &missing {
+                for v in [a, b] {
+                    for &edge in known.around.get(&v).into_iter().flatten() {
+                        if listed.insert(edge) {
+                            list.push(edge);
+                        }
+                    }
+                }
+            }
+            let widths: Vec<_> = list.iter().map(|&(a, b)| (a, b, width(a, b))).collect();
+            let outlines = joints::outlines(&widths, |v| document.vertex(v));
+            for (edge, outline) in list.into_iter().zip(outlines).take(missing.len()) {
+                known.outlines.insert(edge, outline);
+            }
+        }
+        ends.iter().map(|edge| known.outlines[edge].clone()).collect()
+    }
+
     /// How far (screen px) `document`'s painted edges may reach past what
     /// they join: the widest of them, and some.
     fn edge_reach(&self, document: &Document) -> f32 {
@@ -794,17 +851,29 @@ impl Editor<'_> {
 
         // Unpainted edges dashed, thin: not exported either. Each edge's
         // dashes its own (see `dashes`).
-        let unpainted = Path::new(|p| {
-            for (a, b) in document.unique_edges() {
-                if document.edge_style(a, b).is_none() && shows(a, b) {
-                    for (from, to) in dashes(screen(a), screen(b), 4.0, 4.0) {
+        let dashed = Color { a: 0.5, ..EDGE };
+        let unpainted = document
+            .unique_edges()
+            .into_iter()
+            .filter(|&(a, b)| document.edge_style(a, b).is_none() && shows(a, b))
+            .flat_map(|(a, b)| dashes(screen(a), screen(b), 4.0, 4.0));
+        match meshes.as_deref_mut() {
+            // Over the faces, under the painted edges.
+            Some(meshes) => {
+                for (from, to) in unpainted {
+                    meshes.under.line(from, to, 1.0, dashed);
+                }
+            }
+            None => {
+                let path = Path::new(|p| {
+                    for (from, to) in unpainted {
                         p.move_to(from);
                         p.line_to(to);
                     }
-                }
+                });
+                frame.stroke(&path, stroke(dashed, 1.0));
             }
-        });
-        frame.stroke(&unpainted, stroke(Color { a: 0.5, ..EDGE }, 1.0));
+        }
 
         // The painted edges, each its own outline, so edges of different
         // widths meet without lying over each other.
@@ -813,13 +882,12 @@ impl Editor<'_> {
             .filter(|&(a, b, _)| shows(a, b))
             .map(|(a, b, style)| (a, b, self.edge_width(style.width), style.color))
             .collect();
-        let outlines = joints::outlines(
-            &edges
-                .iter()
-                .map(|&(a, b, width, _)| (a, b, width))
-                .collect::<Vec<_>>(),
-            screen,
-        );
+        let ends: Vec<(VertexId, VertexId)> = edges.iter().map(|&(a, b, ..)| (a, b)).collect();
+        let outlines: Vec<Vec<Point>> = self
+            .edge_outlines(document, &ends)
+            .into_iter()
+            .map(|outline| outline.into_iter().map(|p| self.camera.to_screen(p)).collect())
+            .collect();
         let path = |outlines: &[&Vec<Point>]| {
             Path::new(|p| {
                 for outline in outlines {
@@ -902,9 +970,13 @@ impl Editor<'_> {
         };
         // Only what may show.
         let seen = self.view(frame, width + 2.0);
-        let mesh = self.mesh(document.triangles().filter(|t| seen.shows(t)));
         match meshes {
             Some(meshes) => {
+                let visible: Vec<[Point; 3]> = document
+                    .triangles()
+                    .filter(|t| seen.shows(t))
+                    .map(|t| t.map(|p| self.camera.to_screen(p)))
+                    .collect();
                 for (t, color) in document.triangles().zip(document.colors()) {
                     if seen.shows(&t) {
                         let t = t.map(|p| self.camera.to_screen(p));
@@ -914,15 +986,23 @@ impl Editor<'_> {
                         }
                     }
                 }
+                // Each triangle outlined, over all the faces (shared edges
+                // twice, as stroking the triangles does).
+                for [a, b, c] in visible {
+                    for (from, to) in [(a, b), (b, c), (c, a)] {
+                        meshes.under.line(from, to, width, faint(EDGE, 1.0));
+                    }
+                }
             }
             None => {
+                let mesh = self.mesh(document.triangles().filter(|t| seen.shows(t)));
                 frame.fill(&mesh, faint(FILL, 1.0));
                 for (color, triangles) in painted_faces(document, &seen) {
                     frame.fill(&self.mesh(triangles.into_iter()), faint(color, 0.25));
                 }
+                frame.stroke(&mesh, stroke(faint(EDGE, 1.0), width));
             }
         }
-        frame.stroke(&mesh, stroke(faint(EDGE, 1.0), width));
         let screen = |v| self.camera.to_screen(document.vertex(v));
         // Each colour's edges as one path.
         let mut by_color = ByColor::default();

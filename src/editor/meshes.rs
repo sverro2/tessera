@@ -71,6 +71,24 @@ impl Builder {
         self.indices.extend([a, b, c]);
     }
 
+    /// A line from `a` to `b`, `width` wide, `color`: a thin rectangle,
+    /// reaching half its width past each end (as a round cap does, near
+    /// enough at the widths lines are).
+    pub(super) fn line(&mut self, a: Point, b: Point, width: f32, color: Color) {
+        let d = b - a;
+        let length = d.x.hypot(d.y);
+        if length == 0.0 {
+            return;
+        }
+        let h = width / 2.0;
+        let along = d * (h / length);
+        let across = Vector::new(-along.y, along.x);
+        let (a, b) = (a - along, b + along);
+        let packed = color::pack(color);
+        let [p, q, r, s] = [a + across, b + across, b - across, a - across].map(|p| self.vertex(p, packed));
+        self.indices.extend([p, q, r, p, r, s]);
+    }
+
     /// The polygon through `outline`, `color`, as a fan of triangles round
     /// `centre` (from where all of it is seen).
     pub(super) fn fan(&mut self, centre: Point, outline: &[Point], color: Color) {

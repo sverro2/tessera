@@ -220,6 +220,17 @@ pub struct Caches {
     pub grid: canvas::Cache,
     /// Each layer's drawing.
     layers: RefCell<HashMap<NodeId, LayerCache>>,
+    /// Painted edges' outlines worked out, by drawing (its revision).
+    outlines: RefCell<HashMap<u64, EdgeOutlines>>,
+}
+
+/// A drawing's painted edges' outlines (world), as at `zoom`, and around
+/// each vertex its painted edges (to work out more).
+#[derive(Default)]
+struct EdgeOutlines {
+    zoom: f32,
+    outlines: HashMap<(VertexId, VertexId), Vec<Point>>,
+    around: HashMap<VertexId, Vec<(VertexId, VertexId)>>,
 }
 
 /// A layer as last drawn, and what that depended on.
