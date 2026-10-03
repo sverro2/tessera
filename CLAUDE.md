@@ -32,11 +32,16 @@ to try are in `testdata/` (`generate_test_drawings` writes them).
 The iced (Elm) architecture throughout: state, messages, `update`, `view`.
 
 - `main.rs`: `Tessera`, the app's state; its `Message` (one variant per
-  area); `update`/`handle`, `view`, and undo (a stack of whole `Layers`,
-  drawings shared until changed).
+  area); `update`/`handle`, `view`, and undo (`History`: a stack of whole
+  `Layers`, drawings shared until changed). Besides the drawing itself
+  (layers, current layer, camera), its state is grouped by area: `paint`
+  (`Painting`), `shape` (`Shaping`), `layers_panel`, `backgrounds`,
+  `files`, `export`, and `dialogs` (what's open over the canvas).
 - `update/<area>.rs`: each area's own message enum (`PaintMessage`,
-  `LayerAction`, ...) and its handler `Tessera::update_<area>`. New app
-  behaviour goes here: a message, and its arm in the handler.
+  `LayerAction`, ...), its handler `Tessera::update_<area>`, and its state
+  group (with its `Default`, the state it starts out in). New app
+  behaviour goes here: a message, its arm in the handler, and any state in
+  the area's group.
 - `panels.rs`, `dialogs.rs`: the `view` around the canvas (menus, toolbars,
   layers panel) and over it (dialogs).
 - `editor.rs` + `editor/`: the canvas, a `canvas::Program` drawn by its own
@@ -48,8 +53,10 @@ The iced (Elm) architecture throughout: state, messages, `update`, `view`.
   - `drag.rs`: following a drag to a valid edit (snapping via `guides.rs`
     and `grid.rs`, limiting moves; slow cases on other threads via
     `Worker`).
-  - `draw.rs`: the scene: each layer from its cache, those changed drawn
-    side by side (rayon); over them what a drag would do, highlights.
+  - `draw.rs`: the scene (`draw_scene`): the layers (`draw_layers`), each
+    from its cache, those changed drawn side by side (rayon); over them the
+    overlay for the tool in hand (in the shape mode `draw_shaping`:
+    highlights, lining up, what the drag would do).
   - `painter.rs`: drawing one layer (`Painter`, which can go to other
     threads): only what's in view, thinning out what crowds when zoomed
     out; what it works out from a drawing is remembered by its revision
