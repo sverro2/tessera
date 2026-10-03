@@ -271,7 +271,7 @@ fn slash_frames_the_shape_pointed_at_else_the_layer() {
             .update(&mut state, &slash(), bounds, cursor)
             .and_then(|action| action.into_inner().0);
         match published {
-            Some(Message::Frame(points)) => {
+            Some(Message::Frame { points, layer: None }) => {
                 let mut points: Vec<_> = points.iter().map(|p| (p.x, p.y)).collect();
                 points.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 points.dedup();
@@ -287,6 +287,40 @@ fn slash_frames_the_shape_pointed_at_else_the_layer() {
     assert_eq!(framed(150.0, 280.0), left);
     // Off the drawing: all of it.
     assert_eq!(framed(700.0, 550.0).len(), 6);
+}
+
+#[test]
+fn slash_over_another_layer_frames_its_shape_and_switches_to_it() {
+    let doc = one();
+    let other = two_apart();
+    let cache = Caches::default();
+    let mut editor = editor(&doc, &cache);
+    editor.below = vec![SceneLayer {
+        id: 7,
+        document: &other,
+        crossfade: Crossfade::default(),
+        show_edges: true,
+        mirrors: &[],
+    }];
+    let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+    let slash = press(letter('/'), keyboard::Modifiers::empty());
+    let framed = |x: f32, y: f32| {
+        let cursor = mouse::Cursor::Available(Point::new(x, y));
+        let published = editor
+            .update(&mut State::default(), &slash, bounds, cursor)
+            .and_then(|action| action.into_inner().0);
+        match published {
+            Some(Message::Frame { points, layer }) => (points.len(), layer),
+            other => panic!("{other:?}"),
+        }
+    };
+    // Over this layer's triangle: it, here (though the other's is there
+    // too).
+    assert_eq!(framed(200.0, 250.0), (3, None));
+    // Over only the other layer's right triangle: it, there.
+    assert_eq!(framed(320.0, 280.0), (3, Some(7)));
+    // Over neither: all of this layer.
+    assert_eq!(framed(700.0, 550.0), (3, None));
 }
 
 #[test]

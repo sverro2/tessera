@@ -1095,6 +1095,23 @@ mod tests {
     }
 
     #[test]
+    fn framing_a_shape_on_another_layer_switches_to_it() {
+        let mut app = Tessera::default();
+        let back = app.current();
+        let _ = app.update(Message::Layers(LayerAction::Add));
+        let front = app.current();
+        let points = vec![iced::Point::ORIGIN, iced::Point::new(100.0, 100.0)];
+        let frame = |layer| Message::Editor(editor::Message::Frame {
+            points: points.clone(),
+            layer,
+        });
+        let _ = app.update(frame(None));
+        assert_eq!(app.current(), front);
+        let _ = app.update(frame(Some(back)));
+        assert_eq!((app.current(), app.selected), (back, back));
+    }
+
+    #[test]
     fn dragging_a_layer_moves_it() {
         let mut app = Tessera::default();
         let back = app.current();

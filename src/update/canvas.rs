@@ -30,7 +30,10 @@ impl Tessera {
                 }
                 Task::none()
             }
-            editor::Message::Frame(points) => {
+            editor::Message::Frame { points, layer } => {
+                if let Some(layer) = layer {
+                    self.select_layer(layer);
+                }
                 // Clear of the edges, and of the panels over the canvas.
                 const MARGIN: f32 = 60.0;
                 let canvas = Self::canvas_size(self.window_size.unwrap_or(WINDOW_SIZE));

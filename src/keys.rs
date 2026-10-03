@@ -142,7 +142,7 @@ impl Action {
             Redo => "Redo",
             Mirror => "Place a mirror on the layer",
             DuplicateLayer => "Duplicate the selected layer (or group)",
-            FrameShape => "Fit the shape in view (the selection, else the one pointed at)",
+            FrameShape => "Fit the shape in view (the selection, else the one pointed at, on any layer)",
             ShowKeys => "Show these shortcuts",
             CutEdge => "Cut the hovered edge",
             Delete => "Delete the hovered face (or the selection)",

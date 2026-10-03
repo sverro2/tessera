@@ -189,8 +189,12 @@ pub enum Message {
         anchor: Point,
         angle: f32,
     },
-    /// Fit these points (world) in view: the shape to frame.
-    Frame(Vec<Point>),
+    /// Fit these points (world) in view: the shape to frame; on another
+    /// layer (the one pointed at), switching to it.
+    Frame {
+        points: Vec<Point>,
+        layer: Option<NodeId>,
+    },
     /// Move the background image by this much (world).
     MoveBackground(Vector),
     /// Scale the background image by `factor` around `anchor` (world).
@@ -846,14 +850,23 @@ impl Editor<'_> {
         }
     }
 
-    /// The shape to frame (world, as seen: with its mirror images): the
-    /// selection; else the shape under the cursor (at `inside`); else the
-    /// one last highlighted; else all of the layer.
-    fn shape_to_frame(&self, state: &State, inside: Option<Point>) -> Vec<Point> {
+    /// The shape to frame (world, as seen: with its mirror images), and the
+    /// layer it's on if not this one: the selection; else the shape under
+    /// the cursor (at `inside`), on this layer or else the one in view
+    /// it's over (frontmost first); else the one last highlighted; else
+    /// all of the layer.
+    fn shape_to_frame(&self, state: &State, inside: Option<Point>) -> (Vec<Point>, Option<NodeId>) {
         let document = self.document;
+        let hover = inside.filter(|_| self.shown).and_then(|pos| self.hit_test(pos));
+        if state.selection.is_empty()
+            && hover.is_none()
+            && let Some((points, layer)) = inside.and_then(|pos| self.shape_elsewhere(pos))
+        {
+            return (points, Some(layer));
+        }
         let vertices: Vec<VertexId> = if !state.selection.is_empty() {
             state.selection.clone()
-        } else if let Some(hover) = inside.and_then(|pos| self.hit_test(pos)) {
+        } else if let Some(hover) = hover {
             document
                 .connected(self.hover_vertex(hover))
                 .into_iter()
@@ -868,15 +881,23 @@ impl Editor<'_> {
         } else {
             document.unique_vertices()
         };
-        let images = doc::images(self.mirrors);
-        vertices
-            .iter()
-            .flat_map(|&v| {
-                images
-                    .iter()
-                    .map(move |image| image.apply(document.vertex(v)))
-            })
-            .collect()
+        (as_seen(document, &vertices, self.mirrors), None)
+    }
+
+    /// The shape of another layer in view under `screen` (frontmost
+    /// first, as the pipette picks), as [`Self::shape_to_frame`] has it,
+    /// and that layer.
+    fn shape_elsewhere(&self, screen: Point) -> Option<(Vec<Point>, NodeId)> {
+        // The other layers as they are, even working through the current
+        // layer's mirror image.
+        let world = self.plain_camera().to_world(screen);
+        self.above.iter().rev().chain(self.below.iter().rev()).find_map(|layer| {
+            let document = layer.document;
+            let t = document.triangle_at(world)?;
+            let shape = document.connected(document.triangle_ids()[t][0]);
+            let vertices: Vec<VertexId> = shape.into_iter().flatten().collect();
+            Some((as_seen(document, &vertices, layer.mirrors), layer.id))
+        })
     }
 
     /// Keeping up with what changed since the last event: the shapes
@@ -1125,15 +1146,17 @@ impl Editor<'_> {
                 state.pending = pending;
                 Some(canvas::Action::request_redraw().and_capture())
             }
-            // Framing (/): the shape, as seen (mirrored too), in view.
+            // Framing (/): the shape, as seen (mirrored too), in view; one
+            // of another layer pointed at (even with this one hidden),
+            // switching to that layer.
             keyboard::Event::KeyPressed { .. }
                 if pressed == Some(Action::FrameShape)
-                    && self.shown
                     && matches!(state.interaction, Interaction::Idle) =>
             {
-                let points = self.shape_to_frame(state, inside);
-                (!points.is_empty())
-                    .then(|| canvas::Action::publish(Message::Frame(points)).and_capture())
+                let (points, layer) = self.shape_to_frame(state, inside);
+                (!points.is_empty() && (self.shown || layer.is_some())).then(|| {
+                    canvas::Action::publish(Message::Frame { points, layer }).and_capture()
+                })
             }
             // Lasso (Q, or Shift+Q to take out of the selection): the next
             // drag draws one (the same again: not).
@@ -2734,4 +2757,14 @@ fn equilateral(from: Point, to: Point) -> [Point; 3] {
     let mid = Point::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
     let h = 3f32.sqrt() / 2.0;
     [from, to, mid + Vector::new(d.y * h, -d.x * h)]
+}
+
+/// The points of `vertices` of `document` as seen: with their mirror
+/// images across `mirrors`.
+fn as_seen(document: &Document, vertices: &[VertexId], mirrors: &[Mirror]) -> Vec<Point> {
+    let images = doc::images(mirrors);
+    vertices
+        .iter()
+        .flat_map(|&v| images.iter().map(move |image| image.apply(document.vertex(v))))
+        .collect()
 }
