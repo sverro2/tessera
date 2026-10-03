@@ -167,8 +167,8 @@ impl Tessera {
                         .zip(self.layers.layers_of(copy))
                         .collect();
                     for (original, copied) in pairs {
-                        if let Some(background) = self.backgrounds.get(&original).cloned() {
-                            self.backgrounds.insert(copied, background);
+                        if let Some(background) = self.backgrounds.images.get(&original).cloned() {
+                            self.backgrounds.images.insert(copied, background);
                         }
                     }
                     self.layers_panel.selected = copy;

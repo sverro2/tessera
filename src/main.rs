@@ -55,9 +55,9 @@ use layers::{Layers, NodeId, Place, Signature};
 use paint::{Brush, Hsv, Target};
 use panels::{joined, tip};
 use update::{
-    BackgroundMessage, ExportMessage, ExportSettings, FileMessage, Format, KeysMessage,
-    LayerAction, LayersPanel, MenuMessage, PageDialog, PageMessage, PaintMessage, Painting,
-    ShapeMessage, SnapMessage,
+    BackgroundMessage, Backgrounds, ExportMessage, ExportSettings, Field, Fields, FileMessage,
+    Format, KeysMessage, LayerAction, LayersPanel, MenuMessage, PageDialog, PageMessage,
+    PaintMessage, Painting, ShapeMessage, SnapMessage,
 };
 
 pub fn main() -> iced::Result {
@@ -118,19 +118,6 @@ struct Tessera {
     saved: Option<Signature>,
     /// A short message about what just happened, fading out.
     notice: Option<Notice>,
-    /// An image to draw over, kept with the document (not part of undo).
-    /// The layers' background images (each layer's own), by layer: kept
-    /// apart from the layers, so undoing edits doesn't move them.
-    backgrounds: HashMap<NodeId, Background>,
-    /// Counts changes to the background, like the document's revision.
-    background_version: u64,
-    /// The background version last saved or opened.
-    saved_background: u64,
-    /// Whether the background mode is on: its panel is open and the canvas
-    /// adjusts the image rather than edits the drawing.
-    editing_background: bool,
-    /// The background panel's number fields as typed.
-    fields: Fields,
     /// What dragging on the canvas does.
     mode: Mode,
     /// Files opened or saved lately, most recent first.
@@ -168,26 +155,8 @@ struct Tessera {
     paint: Painting,
     /// The layers panel: what's selected, named, dragged, pointed at and isolated in it.
     layers_panel: LayersPanel,
-}
-
-/// The background panel's number fields, as typed (so half-typed numbers
-/// aren't overwritten).
-#[derive(Default)]
-struct Fields {
-    x: String,
-    y: String,
-    scale: String,
-    rotation: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Field {
-    X,
-    Y,
-    /// In percent.
-    Scale,
-    /// In degrees.
-    Rotation,
+    /// The layers' background images, and adjusting them.
+    backgrounds: Backgrounds,
 }
 
 /// A short message shown at the bottom right for a while, then fading out.
@@ -299,7 +268,7 @@ impl Tessera {
             .saved
             .as_ref()
             .is_some_and(|saved| *saved != self.layers.signature());
-        (edited && !self.layers.is_empty()) || self.background_version != self.saved_background
+        (edited && !self.layers.is_empty()) || self.backgrounds.version != self.backgrounds.saved
     }
 
     /// Nothing drawn, no background: nothing a new document would change.
@@ -309,7 +278,7 @@ impl Tessera {
                 .layers
                 .layers()
                 .iter()
-                .any(|layer| self.backgrounds.contains_key(&layer.id))
+                .any(|layer| self.backgrounds.images.contains_key(&layer.id))
     }
 
     /// The layer being edited: `current`, or (if that's gone, e.g. after an
@@ -324,12 +293,12 @@ impl Tessera {
 
     /// The current layer's background image, if it has one.
     fn background(&self) -> Option<&Background> {
-        self.backgrounds.get(&self.current())
+        self.backgrounds.images.get(&self.current())
     }
 
     fn background_mut(&mut self) -> Option<&mut Background> {
         let current = self.current();
-        self.backgrounds.get_mut(&current)
+        self.backgrounds.images.get_mut(&current)
     }
 
     /// The current layer's drawing.
@@ -595,7 +564,7 @@ impl Tessera {
         }
         if escape {
             self.dialogs = Dialogs::default();
-            self.editing_background = false;
+            self.backgrounds.editing = false;
             self.paint.picking = false;
             self.placing_mirror = false;
             return Task::none();
@@ -637,13 +606,13 @@ impl Tessera {
     fn versions(&self) -> Versions {
         Versions {
             layers: self.layers.signature(),
-            background: self.background_version,
+            background: self.backgrounds.version,
         }
     }
 
     /// After the background changed: it's unsaved, and needs drawing.
     fn background_changed(&mut self) {
-        self.background_version += 1;
+        self.backgrounds.version += 1;
         self.caches.grid.clear();
         self.refresh_fields();
     }
@@ -651,10 +620,10 @@ impl Tessera {
     /// Fills the background panel's fields in from the background.
     fn refresh_fields(&mut self) {
         let Some(background) = self.background() else {
-            self.fields = Fields::default();
+            self.backgrounds.fields = Fields::default();
             return;
         };
-        self.fields = Fields {
+        self.backgrounds.fields = Fields {
             x: format!("{:.1}", background.center.x),
             y: format!("{:.1}", background.center.y),
             scale: format!("{:.2}", background.scale * 100.0),
@@ -703,7 +672,12 @@ impl Tessera {
     /// Saves to where the document came from, or (if `choose`, or it never
     /// was saved) to a file picked first; then does `then`.
     fn save(&mut self, choose: bool, then: Option<Replace>) -> Task<Message> {
-        let text = file::save(&self.layers, self.camera, &self.backgrounds, self.current());
+        let text = file::save(
+            &self.layers,
+            self.camera,
+            &self.backgrounds.images,
+            self.current(),
+        );
         let versions = self.versions();
         let path = self.path.clone().filter(|_| !choose);
         let name = match &self.path {
@@ -870,7 +844,7 @@ impl Tessera {
     /// while it's on.
     fn tool(&self) -> Tool {
         match self.mode {
-            _ if self.editing_background => Tool::Background {
+            _ if self.backgrounds.editing => Tool::Background {
                 painted: self.mode == Mode::Paint,
             },
             _ if self.placing_mirror => Tool::Mirror,

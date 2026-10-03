@@ -22,7 +22,7 @@ impl Tessera {
     pub(crate) fn update_background(&mut self, message: BackgroundMessage) -> Task<Message> {
         match message {
             BackgroundMessage::ToggleBackgroundMode => {
-                self.editing_background = !self.editing_background;
+                self.backgrounds.editing = !self.backgrounds.editing;
                 self.refresh_fields();
                 Task::none()
             }
@@ -42,11 +42,11 @@ impl Tessera {
                 // the view.
                 let first = self.background().is_none();
                 let current = self.current();
-                let background = match self.backgrounds.remove(&current) {
+                let background = match self.backgrounds.images.remove(&current) {
                     Some(old) => old.replaced_by(picked),
                     None => picked,
                 };
-                self.backgrounds.insert(current, background);
+                self.backgrounds.images.insert(current, background);
                 self.background_changed();
                 if first {
                     return Task::done(Message::Background(BackgroundMessage::FitBackground));
@@ -78,7 +78,7 @@ impl Tessera {
             }
             BackgroundMessage::RemoveBackground => {
                 let current = self.current();
-                if self.backgrounds.remove(&current).is_some() {
+                if self.backgrounds.images.remove(&current).is_some() {
                     self.background_changed();
                 }
                 Task::none()
@@ -93,10 +93,10 @@ impl Tessera {
             BackgroundMessage::BackgroundField(field, typed) => {
                 let value = typed.trim().replace(',', ".").parse::<f32>().ok();
                 let draft = match field {
-                    Field::X => &mut self.fields.x,
-                    Field::Y => &mut self.fields.y,
-                    Field::Scale => &mut self.fields.scale,
-                    Field::Rotation => &mut self.fields.rotation,
+                    Field::X => &mut self.backgrounds.fields.x,
+                    Field::Y => &mut self.backgrounds.fields.y,
+                    Field::Scale => &mut self.backgrounds.fields.scale,
+                    Field::Rotation => &mut self.backgrounds.fields.rotation,
                 };
                 *draft = typed;
                 if let (Some(background), Some(value)) = (self.background_mut(), value)
@@ -115,11 +115,48 @@ impl Tessera {
                         }
                     }
                     // Not `background_changed`: that would retype the field.
-                    self.background_version += 1;
+                    self.backgrounds.version += 1;
                     self.caches.grid.clear();
                 }
                 Task::none()
             }
         }
     }
+}
+
+/// The background panel's number fields, as typed (so half-typed numbers
+/// aren't overwritten).
+#[derive(Default)]
+pub struct Fields {
+    pub x: String,
+    pub y: String,
+    pub scale: String,
+    pub rotation: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Field {
+    X,
+    Y,
+    /// In percent.
+    Scale,
+    /// In degrees.
+    Rotation,
+}
+
+/// The layers' background images, and adjusting them.
+#[derive(Default)]
+pub struct Backgrounds {
+    /// The layers' background images (each layer's own), by layer: kept
+    /// apart from the layers, so undoing edits doesn't move them.
+    pub images: HashMap<NodeId, Background>,
+    /// Counts changes to the background, like the document's revision.
+    pub version: u64,
+    /// The background version last saved or opened.
+    pub saved: u64,
+    /// Whether the background mode is on: its panel is open and the canvas
+    /// adjusts the image rather than edits the drawing.
+    pub editing: bool,
+    /// The background panel's number fields as typed.
+    pub fields: Fields,
 }

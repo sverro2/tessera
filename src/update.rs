@@ -13,7 +13,7 @@ mod paint;
 mod shape;
 mod snap;
 
-pub use background::BackgroundMessage;
+pub use background::{BackgroundMessage, Backgrounds, Field, Fields};
 pub use export::{ExportMessage, ExportSettings, Format};
 pub use file::Dropped;
 pub use file::FileMessage;

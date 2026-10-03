@@ -92,11 +92,11 @@ impl Tessera {
                 self.path = None;
                 self.saved = None;
                 self.notice = None;
-                self.backgrounds.clear();
+                self.backgrounds.images.clear();
                 // Their ids start over.
                 self.layers_panel.isolated.clear();
-                self.editing_background = false;
-                self.saved_background = self.background_version;
+                self.backgrounds.editing = false;
+                self.backgrounds.saved = self.backgrounds.version;
                 self.view_changed()
             }
             FileMessage::Replace(Replace::Open) => Task::perform(open_file(), |value| {
@@ -135,12 +135,12 @@ impl Tessera {
                         self.current = layer;
                         self.layers_panel.selected = layer;
                     }
-                    self.backgrounds = contents.backgrounds;
+                    self.backgrounds.images = contents.backgrounds;
                     // Their ids start over.
                     self.layers_panel.isolated.clear();
-                    self.editing_background = false;
-                    self.background_version += 1;
-                    self.saved_background = self.background_version;
+                    self.backgrounds.editing = false;
+                    self.backgrounds.version += 1;
+                    self.backgrounds.saved = self.backgrounds.version;
                     self.refresh_fields();
                     // Where the user left off there, if remembered.
                     if let Some(place) = self.places.get(&path) {
@@ -183,7 +183,7 @@ impl Tessera {
                         self.remember_place();
                         self.notify(format!("Saved {}", self.name()), false);
                         self.saved = Some(versions.layers);
-                        self.saved_background = versions.background;
+                        self.backgrounds.saved = versions.background;
                         if let Some(then) = then {
                             return Task::done(Message::File(FileMessage::Replace(then)));
                         }

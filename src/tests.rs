@@ -291,7 +291,12 @@ fn opening_a_file_again_picks_up_where_it_was_left() {
     let mut app = Tessera::new();
     edit(&mut app, 0.0);
     let _ = app.update(Message::Layers(LayerAction::Add));
-    let text = file::save(&app.layers, app.camera, &app.backgrounds, app.current());
+    let text = file::save(
+        &app.layers,
+        app.camera,
+        &app.backgrounds.images,
+        app.current(),
+    );
     let path = PathBuf::from("/drawings/flower.tessera");
     let _ = app.update(Message::File(FileMessage::Opened(Ok(Some((
         path.clone(),
@@ -454,7 +459,12 @@ fn the_fade_width_and_hiding_edges_are_undoable() {
 #[test]
 fn recent_files() {
     let mut app = Tessera::default();
-    let text = file::save(&app.layers, app.camera, &app.backgrounds, app.current());
+    let text = file::save(
+        &app.layers,
+        app.camera,
+        &app.backgrounds.images,
+        app.current(),
+    );
     let path = PathBuf::from("/drawings/flower.tessera");
     let _ = app.update(Message::File(FileMessage::Opened(Ok(Some((
         path.clone(),
@@ -844,15 +854,18 @@ fn each_layer_has_its_own_background_image() {
     let _ = app.update(Message::Layers(LayerAction::Duplicate));
     let copy = app.current();
     assert_ne!(copy, first);
-    let (a, b) = (&app.backgrounds[&first], &app.backgrounds[&copy]);
+    let (a, b) = (
+        &app.backgrounds.images[&first],
+        &app.backgrounds.images[&copy],
+    );
     assert!(a.same_image(b));
     // Moving the copy's leaves the original's be.
     let _ = app.update(Message::Editor(editor::Message::MoveBackground(
         iced::Vector::new(5.0, 0.0),
     )));
     assert_ne!(
-        app.backgrounds[&first].center,
-        app.backgrounds[&copy].center
+        app.backgrounds.images[&first].center,
+        app.backgrounds.images[&copy].center
     );
 }
 
@@ -875,8 +888,8 @@ fn a_background_image_fills_the_view() {
 fn the_background_panel_adjusts_the_image() {
     let mut app = with_background();
     let _ = app.update(Message::Background(BackgroundMessage::ToggleBackgroundMode));
-    assert!(app.editing_background);
-    assert_eq!(app.fields.scale, "100.00");
+    assert!(app.backgrounds.editing);
+    assert_eq!(app.backgrounds.fields.scale, "100.00");
 
     let _ = app.update(Message::Background(BackgroundMessage::BackgroundField(
         Field::X,
@@ -899,14 +912,14 @@ fn the_background_panel_adjusts_the_image() {
     assert_eq!(background.center, Point::new(12.5, 0.0));
     assert_eq!(background.scale, 0.5);
     assert!((background.rotation - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
-    assert_eq!(app.fields.y, "-");
+    assert_eq!(app.backgrounds.fields.y, "-");
 
     // Dragging on the canvas updates the fields.
     let _ = app.update(Message::Editor(editor::Message::MoveBackground(
         iced::Vector::new(1.0, 2.0),
     )));
-    assert_eq!(app.fields.x, "13.5");
-    assert_eq!(app.fields.y, "2.0");
+    assert_eq!(app.backgrounds.fields.x, "13.5");
+    assert_eq!(app.backgrounds.fields.y, "2.0");
 
     let _ = app.update(Message::Background(
         BackgroundMessage::ToggleBackgroundVisible,
@@ -1021,7 +1034,7 @@ fn opening_restores_the_document_and_view() {
     let text = file::save(
         &source.layers,
         source.camera,
-        &source.backgrounds,
+        &source.backgrounds.images,
         source.current(),
     );
 

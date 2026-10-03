@@ -40,7 +40,7 @@ impl Tessera {
             .layers
             .layer(self.current())
             .is_some_and(|layer| layer.mirror.is_some());
-        let bar = if self.editing_background {
+        let bar = if self.backgrounds.editing {
             return space().into();
         } else if self.placing_mirror {
             row![
@@ -93,7 +93,7 @@ impl Tessera {
     /// In the shape mode: proportional editing, on or off, and how far it
     /// reaches.
     pub(super) fn shape_panel(&self) -> Element<'_, Message> {
-        if self.mode != Mode::Shape || self.editing_background {
+        if self.mode != Mode::Shape || self.backgrounds.editing {
             return space().into();
         }
         let mut body =
@@ -575,7 +575,7 @@ impl Tessera {
         // The background button, joined on its left by the eye to show or
         // hide the image without opening the panel: one control, split in
         // two, styled alike.
-        let base = if self.editing_background {
+        let base = if self.backgrounds.editing {
             button::primary
         } else {
             button::secondary
@@ -627,7 +627,7 @@ impl Tessera {
         .spacing(6)
         .align_x(iced::Right);
 
-        if self.editing_background {
+        if self.backgrounds.editing {
             let body: Element<'_, Message> = match self.background() {
                 None => column![
                     small("This layer has no background image yet."),
@@ -645,10 +645,10 @@ impl Tessera {
                 Some(background) => {
                     let field = |label, field| {
                         let value = match field {
-                            Field::X => &self.fields.x,
-                            Field::Y => &self.fields.y,
-                            Field::Scale => &self.fields.scale,
-                            Field::Rotation => &self.fields.rotation,
+                            Field::X => &self.backgrounds.fields.x,
+                            Field::Y => &self.backgrounds.fields.y,
+                            Field::Scale => &self.backgrounds.fields.scale,
+                            Field::Rotation => &self.backgrounds.fields.rotation,
                         };
                         row![
                             small(label).width(80),
