@@ -1178,3 +1178,85 @@ fn bench_grid() {
         });
     }
 }
+
+/// Moving and pasting a whole shape (the first of the layer, in the
+/// drawing in `TESSERA_BENCH`; see [`Drawing`]), as the editor follows the
+/// cursor: each frame's work, and how often it can be put down. Run with
+/// `cargo test --release bench_whole_shape -- --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark: needs a drawing"]
+fn bench_whole_shape() {
+    use canvas::Program;
+    let Some(drawing) = Drawing::open() else {
+        return;
+    };
+    let cache = Caches::default();
+    let mut editor = drawing.editor(&cache);
+    let doc = editor.document;
+    let shape: Vec<VertexId> = {
+        let mut shape: Vec<_> = doc
+            .connected(doc.triangle_ids()[0][0])
+            .into_iter()
+            .flatten()
+            .collect();
+        shape.sort_unstable();
+        shape.dedup();
+        shape
+    };
+    let piece = doc.piece(&shape);
+    editor.clipboard = Some(&piece);
+    let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(1600.0, 1000.0));
+    let points: Vec<Point> = shape.iter().map(|&v| doc.vertex(v)).collect();
+    editor.camera = Camera::default().framing(&points, bounds.size(), 300.0);
+    println!(
+        "BENCH whole shape: {} triangles of {}",
+        piece.triangles.len(),
+        doc.triangle_ids().len()
+    );
+    let key = |c: &str, modifiers| {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(c.into()),
+            modified_key: keyboard::Key::Character(c.into()),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    };
+    let middle = Point::new(800.0, 500.0);
+    for (what, start) in [
+        ("grab", key("g", keyboard::Modifiers::empty())),
+        ("paste", key("v", keyboard::Modifiers::CTRL)),
+    ] {
+        let mut state = State {
+            selection: shape.clone(),
+            selected_in: doc.revision(),
+            selected_layer: drawing.current,
+            ..State::default()
+        };
+        let cursor = mouse::Cursor::Available(middle);
+        let _ = editor.update(&mut state, &start, bounds, cursor);
+        let (mut times, mut placed) = (Vec::new(), 0);
+        // Across the view, a step a frame.
+        for step in 0..40 {
+            let p = Point::new(100.0 + step as f32 * 35.0, 100.0 + step as f32 * 20.0);
+            let cursor = mouse::Cursor::Available(p);
+            let moved = Event::Mouse(mouse::Event::CursorMoved { position: p });
+            let _ = editor.update(&mut state, &moved, bounds, cursor);
+            let start = std::time::Instant::now();
+            let frame = Event::Window(window::Event::RedrawRequested(start));
+            let _ = editor.update(&mut state, &frame, bounds, cursor);
+            times.push(start.elapsed());
+            placed += usize::from(state.pending.is_some());
+        }
+        times.sort();
+        println!(
+            "BENCH whole shape {what}: median {:?}, max {:?}; could be put down {placed} of 40",
+            times[times.len() / 2],
+            times.last().unwrap()
+        );
+    }
+}

@@ -2,7 +2,7 @@
 //! transforming), snapped and kept valid, worked out on other threads
 //! where that's slow.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 
@@ -24,6 +24,88 @@ pub(super) struct Worker<'a> {
     keys: Option<&'a Keymap>,
     grid: Grid,
     deadline: Option<std::time::Instant>,
+}
+
+/// What dragged points may snap onto, on screen (see
+/// [`Editor::snap_targets`]).
+pub(super) struct SnapTargets {
+    vertices: Vec<(VertexId, Point)>,
+    edges: Vec<(VertexId, VertexId, Point, Point)>,
+    /// Each by the cells (squares as wide as grabbing reaches) it's in, to
+    /// look only at those around a point: vertices, then edges.
+    cells: HashMap<(i32, i32), (Vec<usize>, Vec<usize>)>,
+    /// Edges to look at wherever: whole lines, and ones too long to sort.
+    everywhere: Vec<usize>,
+}
+
+impl SnapTargets {
+    /// How wide (screen px) a cell is: as far as anything snaps.
+    const CELL: f32 = if VERTEX_HIT > EDGE_HIT {
+        VERTEX_HIT
+    } else {
+        EDGE_HIT
+    };
+    /// How many cells an edge may cover before it's looked at wherever.
+    const MAX_CELLS: i32 = 64;
+
+    fn new(
+        vertices: Vec<(VertexId, Point)>,
+        edges: Vec<(VertexId, VertexId, Point, Point)>,
+        lines: &[(VertexId, VertexId)],
+    ) -> SnapTargets {
+        let cell = |p: Point| {
+            (
+                (p.x / Self::CELL).floor() as i32,
+                (p.y / Self::CELL).floor() as i32,
+            )
+        };
+        let mut cells: HashMap<(i32, i32), (Vec<usize>, Vec<usize>)> = HashMap::new();
+        let mut everywhere = Vec::new();
+        for (i, &(_, p)) in vertices.iter().enumerate() {
+            cells.entry(cell(p)).or_default().0.push(i);
+        }
+        for (i, &(u, v, p, q)) in edges.iter().enumerate() {
+            let (x0, y0) = cell(Point::new(p.x.min(q.x), p.y.min(q.y)));
+            let (x1, y1) = cell(Point::new(p.x.max(q.x), p.y.max(q.y)));
+            if lines.contains(&(u, v)) || (x1 - x0 + 1) * (y1 - y0 + 1) > Self::MAX_CELLS {
+                everywhere.push(i);
+                continue;
+            }
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    cells.entry((x, y)).or_default().1.push(i);
+                }
+            }
+        }
+        SnapTargets {
+            vertices,
+            edges,
+            cells,
+            everywhere,
+        }
+    }
+
+    /// Those that may be in reach of `at` (screen): its vertices and its
+    /// edges, each once.
+    fn around(&self, at: Point) -> (Vec<usize>, Vec<usize>) {
+        let (cx, cy) = (
+            (at.x / Self::CELL).floor() as i32,
+            (at.y / Self::CELL).floor() as i32,
+        );
+        let (mut vertices, mut edges) = (Vec::new(), self.everywhere.clone());
+        for y in cy - 1..=cy + 1 {
+            for x in cx - 1..=cx + 1 {
+                if let Some((v, e)) = self.cells.get(&(x, y)) {
+                    vertices.extend(v);
+                    edges.extend(e);
+                }
+            }
+        }
+        vertices.sort_unstable();
+        edges.sort_unstable();
+        edges.dedup();
+        (vertices, edges)
+    }
 }
 
 impl<'a> Worker<'a> {
@@ -376,34 +458,85 @@ impl Editor<'_> {
         skip_edge: impl Fn(VertexId, VertexId) -> bool,
         lines: &[(VertexId, VertexId)],
     ) -> Vec<(Target, Point)> {
-        let camera = self.camera;
-        let at = |v| camera.to_screen(self.document.vertex(v));
+        let targets = self.snap_targets((screen, screen), skip_vertex, skip_edge, lines);
+        self.snaps_among(&targets, screen, lines)
+    }
 
-        let mut vertices: Vec<_> = self
+    /// What points within `min`–`max` (screen) may snap onto: the
+    /// drawing's vertices and edges in reach of there (and the edges in
+    /// `lines`, which count as whole lines), on screen, but those
+    /// `skip_vertex` and `skip_edge` leave out. Gathered once for many
+    /// points (a whole shape moved, say).
+    pub(super) fn snap_targets(
+        &self,
+        (min, max): (Point, Point),
+        skip_vertex: impl Fn(VertexId) -> bool,
+        skip_edge: impl Fn(VertexId, VertexId) -> bool,
+        lines: &[(VertexId, VertexId)],
+    ) -> SnapTargets {
+        let reach = VERTEX_HIT.max(EDGE_HIT);
+        let (min, max) = (
+            Point::new(min.x - reach, min.y - reach),
+            Point::new(max.x + reach, max.y + reach),
+        );
+        let near = |p: Point, q: Point| {
+            p.x.max(q.x) >= min.x
+                && p.x.min(q.x) <= max.x
+                && p.y.max(q.y) >= min.y
+                && p.y.min(q.y) <= max.y
+        };
+        let at = |v| self.camera.to_screen(self.document.vertex(v));
+        let vertices = self
             .document
             .unique_vertices()
             .into_iter()
             .filter(|&v| !skip_vertex(v))
-            .map(|v| {
+            .map(|v| (v, at(v)))
+            .filter(|&(_, p)| near(p, p))
+            .collect();
+        let edges = self
+            .document
+            .unique_edges()
+            .into_iter()
+            .filter(|&(u, v)| !skip_edge(u, v))
+            .map(|(u, v)| (u, v, at(u), at(v)))
+            .filter(|&(u, v, p, q)| near(p, q) || lines.contains(&(u, v)))
+            .collect();
+        SnapTargets::new(vertices, edges, lines)
+    }
+
+    /// As [`Self::snaps`], among `targets` (see [`Self::snap_targets`]).
+    pub(super) fn snaps_among(
+        &self,
+        targets: &SnapTargets,
+        screen: Point,
+        lines: &[(VertexId, VertexId)],
+    ) -> Vec<(Target, Point)> {
+        let camera = self.camera;
+        let at = |v| camera.to_screen(self.document.vertex(v));
+        let (near_vertices, near_edges) = targets.around(screen);
+
+        let mut vertices: Vec<_> = near_vertices
+            .into_iter()
+            .map(|i| targets.vertices[i])
+            .map(|(v, p)| {
                 (
                     Target::Vertex(v),
                     self.document.vertex(v),
-                    at(v).distance(screen),
+                    p.distance(screen),
                 )
             })
             .filter(|&(_, _, d)| d <= VERTEX_HIT)
             .collect();
 
-        let mut edges: Vec<_> = self
-            .document
-            .unique_edges()
+        let mut edges: Vec<_> = near_edges
             .into_iter()
-            .filter(|&(u, v)| !skip_edge(u, v))
-            .filter_map(|(u, v)| {
+            .map(|i| targets.edges[i])
+            .filter_map(|(u, v, pu, pv)| {
                 let (closest, d) = if lines.contains(&(u, v)) {
-                    closest_on_line(screen, at(u), at(v))
+                    closest_on_line(screen, pu, pv)
                 } else {
-                    closest_on_segment(screen, at(u), at(v))
+                    closest_on_segment(screen, pu, pv)
                 };
                 (d <= EDGE_HIT).then(|| (Target::Edge(u, v), camera.to_world(closest), d))
             })
@@ -498,23 +631,32 @@ impl Editor<'_> {
         let height = |document: &Document, t: [VertexId; 3]| {
             min_height(t.map(|v| self.camera.to_screen(document.vertex(v))))
         };
+        // Only those new, or with a corner moved, can have got thinner.
+        let sorted = |mut t: [VertexId; 3]| {
+            t.sort_unstable();
+            t
+        };
+        let before: Option<HashSet<[VertexId; 3]>> =
+            (result.triangle_ids() != self.document.triangle_ids()).then(|| {
+                let triangles = self.document.triangle_ids();
+                triangles.iter().map(|&t| sorted(t)).collect()
+            });
+        let existed = |t: [VertexId; 3]| {
+            before
+                .as_ref()
+                .is_none_or(|before| before.contains(&sorted(t)))
+        };
+        let moved = |v: VertexId| {
+            v >= self.document.vertex_slots() || self.document.vertex(v) != result.vertex(v)
+        };
         let thin: Vec<[VertexId; 3]> = result
             .triangle_ids()
             .iter()
             .copied()
+            .filter(|&t| t.iter().any(|&v| moved(v)) || !existed(t))
             .filter(|&t| height(&result, t) < MIN_THICKNESS)
             .collect();
         if !thin.is_empty() {
-            let sorted = |mut t: [VertexId; 3]| {
-                t.sort_unstable();
-                t
-            };
-            let before: HashSet<[VertexId; 3]> = self
-                .document
-                .triangle_ids()
-                .iter()
-                .map(|&t| sorted(t))
-                .collect();
             let pasted: HashSet<[(u32, u32); 3]> = edits
                 .iter()
                 .filter_map(|edit| match edit {
@@ -525,14 +667,14 @@ impl Editor<'_> {
                     piece
                         .triangles
                         .iter()
-                        .map(|t| corners_key(t.map(|v| piece.vertices[v])))
+                        .map(|t| doc::corners_key(t.map(|v| piece.vertices[v])))
                 })
                 .collect();
             let sliver = thin.iter().any(|&t| {
-                if before.contains(&sorted(t)) {
+                if existed(t) {
                     height(&result, t) < height(self.document, t) - 1e-3
                 } else {
-                    !pasted.contains(&corners_key(t.map(|v| result.vertex(v))))
+                    !pasted.contains(&doc::corners_key(t.map(|v| result.vertex(v))))
                 }
             });
             if sliver {
@@ -1058,11 +1200,4 @@ pub(super) fn equilateral(from: Point, to: Point) -> [Point; 3] {
     let mid = Point::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
     let h = 3f32.sqrt() / 2.0;
     [from, to, mid + Vector::new(d.y * h, -d.x * h)]
-}
-
-/// A triangle's corners, in a fixed order, to tell it by where it is.
-fn corners_key(corners: [Point; 3]) -> [(u32, u32); 3] {
-    let mut key = corners.map(|p| (p.x.to_bits(), p.y.to_bits()));
-    key.sort_unstable();
-    key
 }

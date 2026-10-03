@@ -322,9 +322,19 @@ impl Editor<'_> {
         moving: &dyn Fn(VertexId) -> bool,
     ) -> Vec<Vector> {
         let mut found: Vec<(bool, f32, Vector)> = Vec::new();
-        for &p in points {
-            let at = self.camera.to_screen(p);
-            for (target, q) in self.snaps(at, moving, |u, v| moving(u) || moving(v), &[]) {
+        let screen: Vec<Point> = points.iter().map(|&p| self.camera.to_screen(p)).collect();
+        let Some(&first) = screen.first() else {
+            return Vec::new();
+        };
+        let area = screen.iter().fold((first, first), |(min, max), p| {
+            (
+                Point::new(min.x.min(p.x), min.y.min(p.y)),
+                Point::new(max.x.max(p.x), max.y.max(p.y)),
+            )
+        });
+        let targets = self.snap_targets(area, moving, |u, v| moving(u) || moving(v), &[]);
+        for (&p, &at) in points.iter().zip(&screen) {
+            for (target, q) in self.snaps_among(&targets, at, &[]) {
                 let distance = self.camera.to_screen(q).distance(at);
                 found.push((!matches!(target, Target::Vertex(_)), distance, q - p));
             }
