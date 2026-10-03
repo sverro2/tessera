@@ -785,7 +785,7 @@ impl Tessera {
                     ),
                 ];
                 // The recent files: their names, their folders dimmed.
-                let recent = self.recent_files.paths();
+                let recent = self.files.recent.paths();
                 if !recent.is_empty() {
                     items = items.push(
                         container(text("Recent").size(11).style(text::secondary)).padding(

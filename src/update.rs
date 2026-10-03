@@ -16,7 +16,7 @@ mod snap;
 pub use background::{BackgroundMessage, Backgrounds, Field, Fields};
 pub use export::{ExportMessage, ExportSettings, Format};
 pub use file::Dropped;
-pub use file::FileMessage;
+pub use file::{FileMessage, Files};
 pub use keys::KeysMessage;
 pub use layers::{LayerAction, LayersPanel};
 pub use menu::MenuMessage;

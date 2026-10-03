@@ -339,9 +339,9 @@ fn files_dropped_on_the_window_open_or_go_behind_the_layer() {
     // Dragged over, and off again: the hint comes and goes.
     let path = PathBuf::from("/a/flower.tessera");
     let _ = app.update(Message::File(FileMessage::Hovered(Some(path.clone()))));
-    assert_eq!(app.dropping, Some(path.clone()));
+    assert_eq!(app.files.dropping, Some(path.clone()));
     let _ = app.update(Message::File(FileMessage::Hovered(None)));
-    assert_eq!(app.dropping, None);
+    assert_eq!(app.files.dropping, None);
 
     // A drawing dropped with changes unsaved: asked first.
     edit(&mut app, 0.0);
@@ -470,7 +470,7 @@ fn recent_files() {
         path.clone(),
         text,
     ))))));
-    assert_eq!(app.recent_files.paths(), std::slice::from_ref(&path));
+    assert_eq!(app.files.recent.paths(), std::slice::from_ref(&path));
 
     // With unsaved changes, opening a recent file asks first.
     edit(&mut app, 0.0);
@@ -482,7 +482,7 @@ fn recent_files() {
         path,
         "No such file".into(),
     )));
-    assert!(app.recent_files.paths().is_empty());
+    assert!(app.files.recent.paths().is_empty());
     assert!(app.notice.as_ref().unwrap().error);
 
     // Saving (as) remembers it too.
@@ -492,7 +492,7 @@ fn recent_files() {
         app.versions(),
         None,
     )));
-    assert_eq!(app.recent_files.paths(), [saved]);
+    assert_eq!(app.files.recent.paths(), [saved]);
 }
 
 #[test]
@@ -1047,6 +1047,6 @@ fn opening_restores_the_document_and_view() {
 
     assert_eq!(app.document().to_parts(), source.document().to_parts());
     assert_eq!(app.camera.zoom, 3.0);
-    assert_eq!(app.path, Some(path));
+    assert_eq!(app.files.path, Some(path));
     assert!(!app.is_unsaved());
 }

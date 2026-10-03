@@ -56,7 +56,7 @@ use paint::{Brush, Hsv, Target};
 use panels::{joined, tip};
 use update::{
     BackgroundMessage, Backgrounds, ExportMessage, ExportSettings, Field, Fields, FileMessage,
-    Format, KeysMessage, LayerAction, LayersPanel, MenuMessage, PageDialog, PageMessage,
+    Files, Format, KeysMessage, LayerAction, LayersPanel, MenuMessage, PageDialog, PageMessage,
     PaintMessage, Painting, ShapeMessage, SnapMessage,
 };
 
@@ -110,20 +110,10 @@ struct Tessera {
     /// What's drawn on the canvas; see `editor::Caches` for when to clear
     /// which.
     caches: editor::Caches,
-    /// Where the document was last saved to or opened from.
-    path: Option<PathBuf>,
-    /// The layers as last saved or opened; `None` for a new document
-    /// (which starts out saved). Anything else has unsaved changes; moving
-    /// the view doesn't count.
-    saved: Option<Signature>,
     /// A short message about what just happened, fading out.
     notice: Option<Notice>,
     /// What dragging on the canvas does.
     mode: Mode,
-    /// Files opened or saved lately, most recent first.
-    recent_files: recent::Recent,
-    /// Where the user left off in each file lately.
-    places: places::Places,
     /// Proportional editing (shape mode): moving vertices takes those within
     /// `reach` (screen px, so zoomed out it reaches further) along, the less
     /// the further.
@@ -131,8 +121,6 @@ struct Tessera {
     reach: f32,
     /// Placing a mirror on the current layer (Ctrl+M).
     placing_mirror: bool,
-    /// A file dragged over the window: what dropping it would do is shown.
-    dropping: Option<PathBuf>,
     /// What was copied (Ctrl+C), to paste on any layer (Ctrl+V).
     clipboard: Option<document::Piece>,
     /// Which keys do what (kept in the config folder).
@@ -157,6 +145,8 @@ struct Tessera {
     layers_panel: LayersPanel,
     /// The layers' background images, and adjusting them.
     backgrounds: Backgrounds,
+    /// The drawing's file, and files met lately.
+    files: Files,
 }
 
 /// A short message shown at the bottom right for a while, then fading out.
@@ -254,7 +244,8 @@ impl Tessera {
 
     /// The document's file name.
     fn name(&self) -> String {
-        self.path
+        self.files
+            .path
             .as_deref()
             .and_then(Path::file_name)
             .map_or("Untitled".into(), |name| {
@@ -265,6 +256,7 @@ impl Tessera {
     /// Whether there's something that would be lost.
     fn is_unsaved(&self) -> bool {
         let edited = self
+            .files
             .saved
             .as_ref()
             .is_some_and(|saved| *saved != self.layers.signature());
@@ -313,7 +305,7 @@ impl Tessera {
     /// Before changing the layers: `before` becomes an undo step.
     fn push_undo(&mut self, before: Layers) {
         // A new document starts out saved.
-        self.saved.get_or_insert_with(|| before.signature());
+        self.files.saved.get_or_insert_with(|| before.signature());
         self.history.push(before);
     }
 
@@ -426,8 +418,11 @@ impl Tessera {
             reach: 100.0,
             keys: Keymap::load(),
             snap: snap::Snap::load(),
-            recent_files: recent::Recent::load(),
-            places: places::Places::load(),
+            files: Files {
+                recent: recent::Recent::load(),
+                places: places::Places::load(),
+                ..Files::default()
+            },
             ..Tessera::default()
         }
     }
@@ -655,7 +650,7 @@ impl Tessera {
     /// Remembers where the user is in the file (the current layer, the
     /// view), for opening it again; if it's a file.
     fn remember_place(&mut self) {
-        let Some(path) = self.path.clone() else {
+        let Some(path) = self.files.path.clone() else {
             return;
         };
         let current = self.current();
@@ -665,7 +660,8 @@ impl Tessera {
             .iter()
             .position(|layer| layer.id == current)
             .unwrap_or(0);
-        self.places
+        self.files
+            .places
             .remember(path, places::Place::new(layer, self.camera));
     }
 
@@ -679,8 +675,8 @@ impl Tessera {
             self.current(),
         );
         let versions = self.versions();
-        let path = self.path.clone().filter(|_| !choose);
-        let name = match &self.path {
+        let path = self.files.path.clone().filter(|_| !choose);
+        let name = match &self.files.path {
             Some(_) => self.name(),
             None => format!("untitled.{}", file::EXTENSION),
         };
@@ -831,7 +827,7 @@ impl Tessera {
         if let Some(step) = &self.dialogs.snap_dialog {
             screen = screen.push(self.snap_dialog(step));
         }
-        if let Some(path) = &self.dropping {
+        if let Some(path) = &self.files.dropping {
             screen = screen.push(dropping_hint(path));
         }
         if self.dialogs.confirming.is_some() {

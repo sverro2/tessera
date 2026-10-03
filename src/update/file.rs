@@ -49,11 +49,11 @@ impl Tessera {
                 self.replace(Replace::OpenPath(path))
             }
             FileMessage::Hovered(path) => {
-                self.dropping = path;
+                self.files.dropping = path;
                 Task::none()
             }
             FileMessage::Dropped(path) => {
-                self.dropping = None;
+                self.files.dropping = None;
                 match Dropped::of(&path) {
                     Dropped::Drawing => self.replace(Replace::OpenPath(path)),
                     Dropped::Image => Task::perform(
@@ -76,12 +76,12 @@ impl Tessera {
             FileMessage::RecentFailed(path, error) => {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 self.notify(format!("Could not open {name}: {error}"), true);
-                self.recent_files.remove(&path);
+                self.files.recent.remove(&path);
                 Task::none()
             }
             FileMessage::ClearRecent => {
                 self.dialogs.menu = None;
-                self.recent_files.clear();
+                self.files.recent.clear();
                 Task::none()
             }
             FileMessage::Replace(Replace::New) => {
@@ -89,8 +89,8 @@ impl Tessera {
                 self.layers_replaced();
                 self.history = History::default();
                 self.camera = Camera::default();
-                self.path = None;
-                self.saved = None;
+                self.files.path = None;
+                self.files.saved = None;
                 self.notice = None;
                 self.backgrounds.images.clear();
                 // Their ids start over.
@@ -116,7 +116,7 @@ impl Tessera {
             FileMessage::Opened(Ok(None)) => Task::none(),
             FileMessage::Opened(Ok(Some((path, bytes)))) => match file::open(&bytes) {
                 Ok(contents) => {
-                    self.saved = Some(contents.layers.signature());
+                    self.files.saved = Some(contents.layers.signature());
                     // Its colours, to pick again.
                     let colors: Vec<_> = contents
                         .layers
@@ -143,7 +143,7 @@ impl Tessera {
                     self.backgrounds.saved = self.backgrounds.version;
                     self.refresh_fields();
                     // Where the user left off there, if remembered.
-                    if let Some(place) = self.places.get(&path) {
+                    if let Some(place) = self.files.places.get(&path) {
                         if let Some(camera) = place.camera() {
                             self.camera = camera;
                         }
@@ -152,8 +152,8 @@ impl Tessera {
                             self.layers_panel.selected = layer.id;
                         }
                     }
-                    self.recent_files.add(path.clone());
-                    self.path = Some(path);
+                    self.files.recent.add(path.clone());
+                    self.files.path = Some(path);
                     self.notify(format!("Opened {}", self.name()), false);
                     self.view_changed()
                 }
@@ -178,11 +178,11 @@ impl Tessera {
             FileMessage::Saved(result, versions, then) => {
                 match result {
                     Ok(Some(path)) => {
-                        self.recent_files.add(path.clone());
-                        self.path = Some(path);
+                        self.files.recent.add(path.clone());
+                        self.files.path = Some(path);
                         self.remember_place();
                         self.notify(format!("Saved {}", self.name()), false);
-                        self.saved = Some(versions.layers);
+                        self.files.saved = Some(versions.layers);
                         self.backgrounds.saved = versions.background;
                         if let Some(then) = then {
                             return Task::done(Message::File(FileMessage::Replace(then)));
@@ -223,4 +223,21 @@ impl Dropped {
             Dropped::Other
         }
     }
+}
+
+/// The drawing's file, and files met lately.
+#[derive(Default)]
+pub struct Files {
+    /// Where the document was last saved to or opened from.
+    pub path: Option<PathBuf>,
+    /// The layers as last saved or opened; `None` for a new document
+    /// (which starts out saved). Anything else has unsaved changes; moving
+    /// the view doesn't count.
+    pub saved: Option<Signature>,
+    /// Files opened or saved lately, most recent first.
+    pub recent: recent::Recent,
+    /// Where the user left off in each file lately.
+    pub places: places::Places,
+    /// A file dragged over the window: what dropping it would do is shown.
+    pub dropping: Option<PathBuf>,
 }
