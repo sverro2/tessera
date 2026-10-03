@@ -143,7 +143,9 @@ impl Action {
             Grab => "Grab the selection (click to put down)",
             Rotate => "Rotate the selection",
             Scale => "Scale the selection",
-            Extrude => "Extrude the selection's outer edges (click to put down)",
+            Extrude => {
+                "Extrude the selection's outer edges, or the hovered one (click to put down)"
+            }
             SelectShape => "Select the whole shape",
             SelectAll => "Select every vertex of the layer",
             Copy => "Copy the selected faces",

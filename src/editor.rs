@@ -1069,6 +1069,29 @@ impl Editor<'_> {
                 state.selected_in = self.document.revision();
                 Some(canvas::Action::request_redraw().and_capture())
             }
+            // Without a selection, extrude (E) over an outer edge extrudes
+            // it, as if its ends were selected.
+            keyboard::Event::KeyPressed { .. }
+                if pressed == Some(Action::Extrude)
+                    && state.selection.is_empty()
+                    && self.tool == Tool::Shape
+                    && self.shown
+                    && matches!(state.interaction, Interaction::Idle) =>
+            {
+                let pos = inside?;
+                let Hover::Edge { a, b, .. } = self.hit_test(pos)? else {
+                    return None;
+                };
+                if self.extruded_ends(&[a, b]).is_empty() {
+                    return None;
+                }
+                let at = self.camera.to_world(pos);
+                state.selection = vec![a, b];
+                state.selected_in = self.document.revision();
+                state.interaction = Interaction::Extruding { from: at, to: at };
+                state.pending = None;
+                Some(canvas::Action::request_redraw().and_capture())
+            }
             // With a selection: grab (G), rotate (R), scale (T), extrude (E);
             // Esc lets go of that, or else of the selection.
             keyboard::Event::KeyPressed { key, .. }

@@ -2244,3 +2244,26 @@ fn with_shift_a_new_triangle_lines_up_by_its_third_corner_and_far_side() {
             .any(|guide| matches!(guide, Guide::Across { edge: None, .. }))
     );
 }
+
+#[test]
+fn e_over_an_outer_edge_extrudes_it() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+
+    // Over the bottom edge (0 1), nothing selected.
+    run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 300.0);
+    run(&editor, &mut state, key('e'), 200.0, 300.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 380.0);
+    let edits = run(&editor, &mut state, Event::Mouse(PRESS), 200.0, 380.0);
+    assert_eq!(extruded(&edits), 2);
+    // The new edge selected, to go on from.
+    assert_eq!(state.selection.len(), 2);
+    assert!(!state.selection.contains(&0) && !state.selection.contains(&1));
+
+    // Over the face, nothing.
+    let mut state = State::default();
+    run(&editor, &mut state, key('e'), 200.0, 250.0);
+    assert!(matches!(state.interaction, Interaction::Idle));
+}
