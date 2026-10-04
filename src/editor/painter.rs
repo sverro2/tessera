@@ -353,9 +353,10 @@ impl Editor<'_> {
         style: Style,
         mirrors: &[Mirror],
         meshes: Option<&mut LayerMeshes>,
+        beneath: &mut Vec<[Point; 3]>,
     ) {
         self.painter()
-            .draw_layer(frame, document, style, mirrors, meshes);
+            .draw_layer(frame, document, style, mirrors, meshes, beneath);
     }
 
     pub(super) fn edge_width(&self, width: f32) -> f32 {
@@ -463,6 +464,10 @@ impl Painter<'_> {
         2.0 * widest + 4.0
     }
 
+    /// Draws a layer on `frame` (and, with them, into `meshes`); in the
+    /// painted look, what's translucent of it goes into `beneath` (as it's
+    /// seen, in triangles), for the checkerboard behind it (see
+    /// `meshes::checker`).
     pub(super) fn draw_layer(
         &self,
         frame: &mut Frame,
@@ -470,6 +475,7 @@ impl Painter<'_> {
         style: Style,
         mirrors: &[Mirror],
         mut meshes: Option<&mut LayerMeshes>,
+        beneath: &mut Vec<[Point; 3]>,
     ) {
         let Style {
             look,
@@ -482,7 +488,7 @@ impl Painter<'_> {
             let unseen = seen.inverse();
             if look == Look::Painted {
                 let mirrored = document.with_mirrors(mirrors).transformed(unseen);
-                self.draw_layer(frame, &mirrored, style, &[], meshes);
+                self.draw_layer(frame, &mirrored, style, &[], meshes, beneath);
             } else {
                 let strength = if look == Look::Faded { 0.35 } else { 1.0 };
                 for image in doc::images(mirrors) {
@@ -491,7 +497,7 @@ impl Painter<'_> {
                         self.draw_hinted(frame, &ghost, strength * 0.4, 1.0, meshes.as_deref_mut());
                     }
                 }
-                self.draw_layer(frame, document, style, &[], meshes);
+                self.draw_layer(frame, document, style, &[], meshes, beneath);
             }
             return;
         }
@@ -530,6 +536,12 @@ impl Painter<'_> {
             .filter(|&&t| colors[t].is_none())
             .map(|&t| corners(t))
             .collect();
+        // What's see-through shows the checkerboard behind it.
+        for &t in &visible {
+            if colors[t].is_some_and(|color| color.a < 1.0) {
+                beneath.push(corners(t).map(|p| self.camera.to_screen(p)));
+            }
+        }
         let unpainted_tint = Color { a: 0.05, ..EDGE };
         match meshes.as_deref_mut() {
             Some(meshes) => {
@@ -646,7 +658,19 @@ impl Painter<'_> {
         };
         let mut by_color = ByColor::default();
         for (&(a, b, _, color), outline) in edges.iter().zip(&outlines) {
-            if let Some(stops) = fades.get(&(a, b)) {
+            // The edge's middle, which sees all its outline.
+            let middle = Point::new(
+                (screen(a).x + screen(b).x) / 2.0,
+                (screen(a).y + screen(b).y) / 2.0,
+            );
+            // See-through (or fading into what is): the checkerboard behind.
+            let fading = fades.get(&(a, b));
+            if color.a < 1.0
+                || fading.is_some_and(|stops| stops.iter().any(|&(_, color)| color.a < 1.0))
+            {
+                fan_triangles(middle, outline, beneath);
+            }
+            if let Some(stops) = fading {
                 let (pa, pb) = (screen(a), screen(b));
                 let length = stops[3].0;
                 let gradient = stops.iter().fold(
@@ -657,14 +681,8 @@ impl Painter<'_> {
                 continue;
             }
             match meshes.as_deref_mut() {
-                // A fan round the edge's middle, which sees all its outline.
-                Some(meshes) => {
-                    let middle = Point::new(
-                        (screen(a).x + screen(b).x) / 2.0,
-                        (screen(a).y + screen(b).y) / 2.0,
-                    );
-                    meshes.over.fan(middle, outline, color);
-                }
+                // A fan round the edge's middle.
+                Some(meshes) => meshes.over.fan(middle, outline, color),
                 None => by_color.add(color, outline),
             }
         }
@@ -893,6 +911,14 @@ impl Painter<'_> {
                 p.close();
             }
         })
+    }
+}
+
+/// The polygon through `outline` (screen) as a fan of triangles round
+/// `centre` (from where all of it is seen), into `out`.
+fn fan_triangles(centre: Point, outline: &[Point], out: &mut Vec<[Point; 3]>) {
+    for (i, &p) in outline.iter().enumerate() {
+        out.push([centre, p, outline[(i + 1) % outline.len()]]);
     }
 }
 

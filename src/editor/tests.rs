@@ -4,6 +4,7 @@
 use super::*;
 use canvas::Program;
 
+mod checker;
 mod drags;
 mod extrude;
 mod grid;
@@ -54,6 +55,7 @@ pub(super) fn editor<'a>(doc: &'a Document, caches: &'a Caches) -> Editor<'a> {
         clipboard: None,
         keys: Some(crate::keys::defaults()),
         lit: Vec::new(),
+        page: None,
         grid: Grid::default(),
         deadline: Cell::new(None),
     }

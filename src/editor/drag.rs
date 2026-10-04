@@ -129,6 +129,7 @@ impl<'a> Worker<'a> {
             clipboard: self.clipboard,
             keys: self.keys,
             lit: Vec::new(),
+            page: None,
             grid: self.grid,
             deadline: Cell::new(self.deadline),
         }
@@ -944,6 +945,7 @@ impl Editor<'_> {
             clipboard: self.clipboard,
             keys: self.keys,
             lit: self.lit.clone(),
+            page: self.page,
             grid: self.grid,
             deadline: self.deadline.clone(),
         }

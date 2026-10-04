@@ -54,7 +54,9 @@ The iced (Elm) architecture throughout: state, messages, `update`, `view`.
     and `grid.rs`, limiting moves; slow cases on other threads via
     `Worker`).
   - `draw.rs`: the scene (`draw_scene`): the layers (`draw_layers`), each
-    from its cache, those changed drawn side by side (rayon); over them the
+    from its cache, those changed drawn side by side (rayon); under them,
+    in the backdrop (`draw_backdrop`: sheet, image, grid), the checkerboard
+    behind what's see-through (`Editor::render` layers it); over them the
     overlay for the tool in hand (in the shape mode `draw_shaping`:
     highlights, lining up, what the drag would do).
   - `painter.rs`: drawing one layer (`Painter`, which can go to other

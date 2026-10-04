@@ -33,7 +33,7 @@ impl Tessera {
                 if step.is_some_and(|step| self.snap.set_grid(step)) {
                     self.dialogs.snap_dialog = None;
                     // The dot grid goes with it.
-                    self.caches.grid.clear();
+                    self.caches.backdrop.clear();
                 }
             }
         }

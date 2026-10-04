@@ -316,7 +316,7 @@ impl Tessera {
         self.layers_panel.naming = None;
         self.layers_panel.dragging = None;
         // The document size may be another.
-        self.caches.grid.clear();
+        self.caches.backdrop.clear();
     }
 
     /// Paints every face (or edge) of the current layer, or of all layers,
@@ -427,7 +427,7 @@ impl Tessera {
         let task = self.handle(message);
         // Another layer, another background image.
         if self.current() != current {
-            self.caches.grid.clear();
+            self.caches.backdrop.clear();
         }
         task
     }
@@ -521,7 +521,7 @@ impl Tessera {
     /// After the view (or the drawing as a whole) changed: the backdrop
     /// (background image and grid) is drawn anew.
     fn view_changed(&mut self) -> Task<Message> {
-        self.caches.grid.clear();
+        self.caches.backdrop.clear();
         Task::none()
     }
 
@@ -603,7 +603,7 @@ impl Tessera {
     /// After the background changed: it's unsaved, and needs drawing.
     fn background_changed(&mut self) {
         self.backgrounds.version += 1;
-        self.caches.grid.clear();
+        self.caches.backdrop.clear();
         self.refresh_fields();
     }
 

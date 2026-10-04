@@ -36,11 +36,10 @@ use iced::keyboard;
 use iced::mouse;
 use iced::time::{Duration, Instant};
 use iced::widget::canvas::{
-    self, Canvas, Event, Frame, Geometry, LineCap, LineDash, LineJoin, Path, Stroke,
+    self, Event, Frame, Geometry, LineCap, LineDash, LineJoin, Path, Stroke,
 };
-use iced::widget::stack;
 use iced::window;
-use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Size, Theme, Vector};
+use iced::{Color, Element, Point, Rectangle, Renderer, Size, Theme, Vector};
 
 use crate::background::Background;
 use crate::camera::Camera;
@@ -126,6 +125,10 @@ const REMOVED: Color = Color::from_rgb8(0xf7, 0x76, 0x8e);
 const JOINED: Color = Color::from_rgb8(0xe0, 0xaf, 0x68);
 /// The hovered vertex or edge.
 pub const HOVER: Color = Color::from_rgb8(0x7d, 0xcf, 0xff);
+/// The checkerboard behind what's see-through: its two greys, a step
+/// either side of the page's.
+const CHECKER_DARK: Color = Color::from_rgb8(0x2a, 0x2c, 0x3e);
+const CHECKER_LIGHT: Color = Color::from_rgb8(0x3c, 0x3f, 0x56);
 
 /// What dragging (and the wheel) on the canvas does.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -229,12 +232,28 @@ pub enum Message {
 /// current layer afresh.
 #[derive(Default)]
 pub struct Caches {
-    /// The background image and grid; cleared when either changes.
-    pub grid: canvas::Cache,
+    /// The backdrop: cleared when it changes (the background image, the
+    /// grid, the document size).
+    pub backdrop: BackdropCache,
     /// Each layer's drawing.
     layers: RefCell<HashMap<NodeId, LayerCache>>,
     /// What's remembered of drawings to draw them (see `draw::Memos`).
     memos: painter::Memos,
+}
+
+/// The backdrop as last drawn: what goes under the checkerboard (behind
+/// what's see-through) and what over it (see `Editor::draw_backdrop`).
+#[derive(Default)]
+pub struct BackdropCache {
+    under: canvas::Cache,
+    over: canvas::Cache,
+}
+
+impl BackdropCache {
+    pub fn clear(&self) {
+        self.under.clear();
+        self.over.clear();
+    }
 }
 
 /// A layer as last drawn, and what that depended on.
@@ -250,6 +269,25 @@ struct LayerCache {
         iced::advanced::graphics::mesh::Cache,
         iced::advanced::graphics::mesh::Cache,
     )>,
+    /// The checkerboard behind what's see-through of it, if anything is: to
+    /// draw under all the layers.
+    beneath: Option<Beneath>,
+}
+
+/// A layer's checkerboard (see `meshes::checker`), kept: as a mesh, or on
+/// the canvas without meshes.
+enum Beneath {
+    Meshes(iced::advanced::graphics::mesh::Cache),
+    Geometry(<Geometry as Cached>::Cache),
+}
+
+impl Beneath {
+    fn drawn(&self) -> Drawn {
+        match self {
+            Beneath::Meshes(mesh) => Drawn::Meshes(mesh.clone()),
+            Beneath::Geometry(geometry) => Drawn::Geometry(Cached::load(geometry)),
+        }
+    }
 }
 
 /// What a layer's drawing depends on.
@@ -322,7 +360,7 @@ pub struct Settings<'a> {
 }
 
 /// The canvas for editing the current layer of `scene`, over the backdrop
-/// (background image and grid).
+/// (the document's sheet, the background image and grid).
 pub fn view<'a>(
     scene: Scene<'a>,
     camera: Camera,
@@ -345,14 +383,7 @@ pub fn view<'a>(
         page,
         grid,
     } = settings;
-    let backdrop = Canvas::new(Backdrop {
-        cache: &caches.grid,
-        background,
-        camera,
-        page,
-        grid,
-    });
-    let editor = EditorView::new(Editor {
+    EditorView::new(Editor {
         document: current.document,
         current: current.id,
         crossfade: current.crossfade,
@@ -369,73 +400,11 @@ pub fn view<'a>(
         clipboard,
         keys,
         lit,
+        page,
         grid,
         deadline: Cell::new(None),
-    });
-    // Apart, as images (the background) are drawn after shapes within a
-    // canvas: the stack draws the drawing in a pass of its own, over it.
-    stack![backdrop.width(Fill).height(Fill), Element::from(editor)].into()
-}
-
-/// The background colour, the document (its size set), the background
-/// image and the grid.
-struct Backdrop<'a> {
-    cache: &'a canvas::Cache,
-    background: Option<&'a Background>,
-    camera: Camera,
-    page: Option<Page>,
-    /// The snapping grid, the dot grid shows sparser.
-    grid: Grid,
-}
-
-impl canvas::Program<Message> for Backdrop<'_> {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &(),
-        renderer: &Renderer,
-        _theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<Geometry> {
-        vec![self.cache.draw(renderer, bounds.size(), |frame| {
-            frame.fill_rectangle(Point::ORIGIN, frame.size(), BACKGROUND);
-            let sheet = self.page.map(|page| {
-                let [first, rest @ ..] = page.corners().map(|p| self.camera.to_screen(p));
-                Path::new(|path| {
-                    path.move_to(first);
-                    for p in rest {
-                        path.line_to(p);
-                    }
-                    path.close();
-                })
-            });
-            if let Some(sheet) = &sheet {
-                frame.fill(sheet, PAGE);
-            }
-            if let Some(background) = self.background {
-                background.draw(frame, self.camera);
-            }
-            draw_grid(frame, self.camera, self.grid);
-            if let (Some(sheet), Some(page)) = (&sheet, self.page) {
-                frame.stroke(sheet, stroke(PAGE_EDGE, 1.0));
-                // Its size, above its top left corner, turned with it.
-                let corner = self.camera.to_screen(page.min());
-                frame.with_save(|frame| {
-                    frame.translate(corner - Point::ORIGIN);
-                    frame.rotate(self.camera.rotation);
-                    frame.fill_text(canvas::Text {
-                        content: format!("{:.0} × {:.0}", page.size.width, page.size.height),
-                        position: Point::new(0.0, -18.0),
-                        color: PAGE_EDGE,
-                        size: 12.0.into(),
-                        ..canvas::Text::default()
-                    });
-                });
-            }
-        })]
-    }
+    })
+    .into()
 }
 
 struct Editor<'a> {
@@ -471,6 +440,8 @@ struct Editor<'a> {
     /// Layers to light up, whatever the mode (pointed at in the layers
     /// panel): to see what's on them. Back to front.
     lit: Vec<SceneLayer<'a>>,
+    /// The document size, if one's set: shown as a sheet behind it all.
+    page: Option<Page>,
     /// When working out what a drag does should give up, so a heavy case
     /// (e.g. a fill through crowded geometry) can't make it crawl.
     /// The grid points snap to, holding Ctrl.
@@ -777,14 +748,18 @@ impl canvas::Program<Message> for Editor<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
-        // All on the canvas: no meshes.
-        self.draw_parts(state, renderer, bounds, cursor, false)
+        // All on the canvas: no meshes. (`EditorView` draws the editor:
+        // this, without its layers, puts the backdrop's image over all.)
+        let Parts { beneath, drawing } = self.draw_parts(state, renderer, bounds, cursor, false);
+        let [under, over] = self.draw_backdrop(renderer, bounds.size());
+        let parts = beneath
             .into_iter()
+            .chain(drawing)
             .filter_map(|part| match part {
                 Drawn::Geometry(geometry) => Some(geometry),
                 Drawn::Meshes(_) => None,
-            })
-            .collect()
+            });
+        [under].into_iter().chain(parts).chain([over]).collect()
     }
 
     fn mouse_interaction(
@@ -819,7 +794,7 @@ impl Editor<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
         meshes: bool,
-    ) -> Vec<Drawn> {
+    ) -> Parts {
         match self.flipped(state) {
             Some(flipped) => flipped.draw_scene(state, renderer, bounds, cursor, self, meshes),
             None => self.draw_scene(state, renderer, bounds, cursor, self, meshes),

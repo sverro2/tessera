@@ -206,6 +206,7 @@ fn bench_editor() {
                 clipboard: None,
                 keys: Some(crate::keys::defaults()),
                 lit: Vec::new(),
+                page: None,
                 grid: Grid::default(),
                 deadline: Cell::new(None),
             };
@@ -687,19 +688,10 @@ fn draw_frame(
     cursor: mouse::Cursor,
     meshes: bool,
 ) -> Vec<u8> {
-    use iced::advanced::graphics::geometry::Renderer as _;
-    use iced::advanced::graphics::mesh::Renderer as _;
     use iced::advanced::renderer::{Headless as _, Renderer as _};
     // A new frame, as the app starts each.
     renderer.reset(bounds);
-    renderer.with_translation(Vector::ZERO, |renderer| {
-        for part in editor.draw_parts(state, renderer, bounds, cursor, meshes) {
-            match part {
-                meshes::Drawn::Geometry(geometry) => renderer.draw_geometry(geometry),
-                meshes::Drawn::Meshes(cache) => renderer.draw_mesh_cache(cache),
-            }
-        }
-    });
+    editor.render(renderer, state, bounds, cursor, meshes);
     let size = bounds.size();
     renderer.screenshot(
         iced::Size::new(size.width as u32, size.height as u32),
@@ -880,7 +872,7 @@ fn bench_face_meshes() {
             let mut editor = super::tests::editor(doc, &cache);
             editor.camera = camera;
             let style = Style::of(Look::Painted, Crossfade::default(), false);
-            editor.draw_layer(&mut frame, doc, style, &[], None);
+            editor.draw_layer(&mut frame, doc, style, &[], None, &mut Vec::new());
         }
         frame.into_geometry()
     });
@@ -890,7 +882,7 @@ fn bench_face_meshes() {
             let mut editor = super::tests::editor(doc, &cache);
             editor.camera = camera;
             let style = Style::of(Look::Painted, Crossfade::default(), true);
-            editor.draw_layer(&mut frame, doc, style, &[], None);
+            editor.draw_layer(&mut frame, doc, style, &[], None, &mut Vec::new());
         }
         frame.into_geometry()
     });
@@ -900,7 +892,7 @@ fn bench_face_meshes() {
             let mut editor = super::tests::editor(doc, &cache);
             editor.camera = camera;
             let style = Style::of(Look::Faded, Crossfade::default(), true);
-            editor.draw_layer(&mut frame, doc, style, &[], None);
+            editor.draw_layer(&mut frame, doc, style, &[], None, &mut Vec::new());
         }
         frame.into_geometry()
     });

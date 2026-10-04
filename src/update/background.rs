@@ -116,7 +116,7 @@ impl Tessera {
                     }
                     // Not `background_changed`: that would retype the field.
                     self.backgrounds.version += 1;
-                    self.caches.grid.clear();
+                    self.caches.backdrop.clear();
                 }
                 Task::none()
             }

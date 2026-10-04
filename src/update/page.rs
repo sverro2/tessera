@@ -120,7 +120,7 @@ impl Tessera {
                 const MARGIN: f32 = 60.0;
                 let canvas = Self::canvas_size(self.window_size.unwrap_or(WINDOW_SIZE));
                 self.camera = self.camera.framing(&page.corners(), canvas, MARGIN);
-                self.caches.grid.clear();
+                self.caches.backdrop.clear();
             }
             PageMessage::Remove => {
                 self.dialogs.page_dialog = None;
@@ -154,7 +154,7 @@ impl Tessera {
         let before = self.layers.clone();
         self.layers.set_page(page);
         self.push_undo(before);
-        self.caches.grid.clear();
+        self.caches.backdrop.clear();
     }
 }
 

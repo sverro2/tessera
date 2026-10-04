@@ -137,6 +137,52 @@ pub(super) fn push_layer(
     }
 }
 
+/// The checkerboard behind `triangles` (screen; see `meshes::checker`):
+/// as a mesh, or on the canvas without `meshes`. None if there's nothing
+/// see-through.
+pub(super) fn draw_checker(
+    renderer: &Renderer,
+    size: Size,
+    triangles: &[[Point; 3]],
+    meshes: bool,
+) -> Option<Drawn> {
+    if triangles.is_empty() {
+        return None;
+    }
+    if meshes {
+        return Some(Drawn::Meshes(
+            meshes::checker(triangles, size).into_cache(size),
+        ));
+    }
+    let mut frame = Frame::new(renderer, size);
+    let mesh = |triangles: &mut dyn Iterator<Item = &[Point]>| {
+        Path::new(|p| {
+            for polygon in triangles {
+                p.move_to(polygon[0]);
+                for &q in &polygon[1..] {
+                    p.line_to(q);
+                }
+                p.close();
+            }
+        })
+    };
+    frame.fill(&mesh(&mut triangles.iter().map(|t| &t[..])), CHECKER_DARK);
+    let light: Vec<Vec<Point>> = triangles
+        .iter()
+        .flat_map(|&t| meshes::light_squares(t, size))
+        .collect();
+    frame.fill(&mesh(&mut light.iter().map(|p| &p[..])), CHECKER_LIGHT);
+    Some(Drawn::Geometry(frame.into_geometry()))
+}
+
+/// The scene: the checkerboard behind what's see-through (drawn into the
+/// backdrop, under its image and grid), and the drawing (the layers and
+/// what's going on over them).
+pub(super) struct Parts {
+    pub(super) beneath: Vec<Drawn>,
+    pub(super) drawing: Vec<Drawn>,
+}
+
 /// Why nothing can be edited: the current layer is out of view.
 pub(super) fn draw_out_of_view(overlay: &mut Frame, bounds: Rectangle) {
     overlay.fill_text(canvas::Text {
@@ -179,7 +225,6 @@ pub(super) struct Wanted<'a> {
 }
 
 impl Editor<'_> {
-    /// What to draw: the layers and, over them, what's going on.
     /// What to draw: the layers and, over them, what's going on. The
     /// other layers as `others` sees them (not mirrored, when this works
     /// through the mirror image).
@@ -191,7 +236,7 @@ impl Editor<'_> {
         cursor: mouse::Cursor,
         others_view: &Editor,
         meshes: bool,
-    ) -> Vec<Drawn> {
+    ) -> Parts {
         // While dragging, draw the document as it will be after release.
         let pending = match state.interaction {
             Interaction::Idle
@@ -210,7 +255,7 @@ impl Editor<'_> {
             _ => None,
         };
 
-        let layers = self.draw_layers(
+        let (beneath, layers) = self.draw_layers(
             state,
             renderer,
             bounds.size(),
@@ -236,14 +281,64 @@ impl Editor<'_> {
                 self.draw_shaping(&mut overlay, state, bounds, cursor_pos, pending, source)
             }
         }
-        with_overlay(layers, overlay)
+        Parts {
+            beneath,
+            drawing: with_overlay(layers, overlay),
+        }
+    }
+
+    /// The backdrop: the background colour and the document's sheet,
+    /// under the checkerboard; the background image, the grid and the
+    /// sheet's outline and size, over it (see-through, they're seen).
+    pub(super) fn draw_backdrop(&self, renderer: &Renderer, size: Size) -> [Geometry; 2] {
+        let sheet = self.page.map(|page| {
+            let [first, rest @ ..] = page.corners().map(|p| self.camera.to_screen(p));
+            Path::new(|path| {
+                path.move_to(first);
+                for p in rest {
+                    path.line_to(p);
+                }
+                path.close();
+            })
+        });
+        let cache = &self.caches.backdrop;
+        let under = cache.under.draw(renderer, size, |frame| {
+            frame.fill_rectangle(Point::ORIGIN, frame.size(), BACKGROUND);
+            if let Some(sheet) = &sheet {
+                frame.fill(sheet, PAGE);
+            }
+        });
+        let over = cache.over.draw(renderer, size, |frame| {
+            if let Some(background) = self.background {
+                background.draw(frame, self.camera);
+            }
+            draw_grid(frame, self.camera, self.grid);
+            if let (Some(sheet), Some(page)) = (&sheet, self.page) {
+                frame.stroke(sheet, stroke(PAGE_EDGE, 1.0));
+                // Its size, above its top left corner, turned with it.
+                let corner = self.camera.to_screen(page.min());
+                frame.with_save(|frame| {
+                    frame.translate(corner - Point::ORIGIN);
+                    frame.rotate(self.camera.rotation);
+                    frame.fill_text(canvas::Text {
+                        content: format!("{:.0} × {:.0}", page.size.width, page.size.height),
+                        position: Point::new(0.0, -18.0),
+                        color: PAGE_EDGE,
+                        size: 12.0.into(),
+                        ..canvas::Text::default()
+                    });
+                });
+            }
+        });
+        [under, over]
     }
 
     /// The layers: in the paint mode as they are, in their order;
     /// otherwise the others faded, and the current layer over them all, so
     /// it's always seen whole; while dragging (`pending`) or tweaking an
     /// edge, the current one as it will be. Then those pointed at in the
-    /// layers panel, lit up. The others as `others_view` sees them.
+    /// layers panel, lit up. The others as `others_view` sees them. Apart,
+    /// the checkerboard behind what's see-through of them.
     #[allow(clippy::too_many_arguments)]
     fn draw_layers(
         &self,
@@ -254,7 +349,7 @@ impl Editor<'_> {
         meshes: bool,
         pending: Option<&Pending>,
         source: Option<(VertexId, VertexId)>,
-    ) -> Vec<Drawn> {
+    ) -> (Vec<Drawn>, Vec<Drawn>) {
         let look = self.look();
         let others = if look == Look::Painted {
             Look::Painted
@@ -291,9 +386,12 @@ impl Editor<'_> {
                 look,
             }))
             .collect();
-        let mut drawn = self
-            .draw_cached(renderer, size, &wanted, meshes)
-            .into_iter();
+        let drawn = self.draw_cached(renderer, size, &wanted, meshes);
+        // What's see-through shows a checkerboard behind it, under all
+        // the layers: where nothing opaque lies between.
+        let (checkers, drawn): (Vec<_>, Vec<_>) = drawn.into_iter().unzip();
+        let mut beneath: Vec<Drawn> = checkers.into_iter().flatten().collect();
+        let mut drawn = drawn.into_iter();
         let mut layers: Vec<Drawn> = drawn.by_ref().take(self.below.len()).flatten().collect();
         let mut above: Vec<Drawn> = drawn.by_ref().take(self.above.len()).flatten().collect();
         if look != Look::Painted {
@@ -304,7 +402,14 @@ impl Editor<'_> {
                 Some(pending) => {
                     let mut sink = meshes.then(LayerMeshes::default);
                     let mut frame = Frame::new(renderer, size);
-                    self.draw_document(&mut frame, &pending.result, sink.as_mut());
+                    let mut see_through = Vec::new();
+                    self.draw_document(
+                        &mut frame,
+                        &pending.result,
+                        sink.as_mut(),
+                        &mut see_through,
+                    );
+                    beneath.extend(draw_checker(renderer, size, &see_through, meshes));
                     push_layer(&mut layers, frame, sink, size);
                     let mut changes = Frame::new(renderer, size);
                     self.draw_changes(&mut changes, pending, source);
@@ -318,7 +423,16 @@ impl Editor<'_> {
                     let mut sink = meshes.then(LayerMeshes::default);
                     let mut frame = Frame::new(renderer, size);
                     let style = Style::of(look, self.crossfade, self.show_edges);
-                    self.draw_layer(&mut frame, tweaked, style, self.mirrors, sink.as_mut());
+                    let mut see_through = Vec::new();
+                    self.draw_layer(
+                        &mut frame,
+                        tweaked,
+                        style,
+                        self.mirrors,
+                        sink.as_mut(),
+                        &mut see_through,
+                    );
+                    beneath.extend(draw_checker(renderer, size, &see_through, meshes));
                     push_layer(&mut layers, frame, sink, size);
                 }
                 None => layers.extend(drawn.flatten()),
@@ -361,10 +475,10 @@ impl Editor<'_> {
             layers.extend(
                 self.draw_cached(renderer, size, &lit, meshes)
                     .into_iter()
-                    .flatten(),
+                    .flat_map(|(_, parts)| parts),
             );
         }
-        layers
+        (beneath, layers)
     }
 
     /// Adjusting the background: its outline, dashed.
@@ -688,9 +802,10 @@ impl Editor<'_> {
         frame: &mut Frame,
         document: &Document,
         meshes: Option<&mut LayerMeshes>,
+        beneath: &mut Vec<[Point; 3]>,
     ) {
         let style = Style::plain(self.look());
-        self.draw_layer(frame, document, style, self.mirrors, meshes);
+        self.draw_layer(frame, document, style, self.mirrors, meshes, beneath);
     }
 
     /// The drawings of the `wanted` layers, each from its cache if what
@@ -702,7 +817,7 @@ impl Editor<'_> {
         size: Size,
         wanted: &[Wanted<'_>],
         meshes: bool,
-    ) -> Vec<Vec<Drawn>> {
+    ) -> Vec<(Option<Drawn>, Vec<Drawn>)> {
         let mut caches = self.caches.layers.borrow_mut();
         // What each depends on, and a frame for those to draw anew.
         let mut jobs = Vec::new();
@@ -733,14 +848,27 @@ impl Editor<'_> {
         let draw = |(i, mut frame, style): (usize, Frame, Style)| {
             let Wanted { painter, layer, .. } = wanted[i];
             let mut sink = meshes.then(LayerMeshes::default);
+            let mut beneath = Vec::new();
             painter.draw_layer(
                 &mut frame,
                 layer.document,
                 style,
                 layer.mirrors,
                 sink.as_mut(),
+                &mut beneath,
             );
-            (i, frame.into_geometry(), sink.map(|sink| sink.finish(size)))
+            // Its checkerboard: as a mesh here; without, on the canvas
+            // below (frames are made on this thread).
+            let checker = (meshes && !beneath.is_empty())
+                .then(|| meshes::checker(&beneath, size).into_cache(size));
+            let geometry = frame.into_geometry();
+            (
+                i,
+                geometry,
+                sink.map(|sink| sink.finish(size)),
+                checker,
+                beneath,
+            )
         };
         // One alone isn't worth handing to another thread.
         let drawn: Vec<_> = if jobs.len() > 1 {
@@ -748,8 +876,17 @@ impl Editor<'_> {
         } else {
             jobs.into_iter().map(draw).collect()
         };
-        for (i, geometry, built) in drawn {
+        for (i, geometry, built, checker, beneath) in drawn {
             let id = wanted[i].layer.id;
+            let beneath = match checker {
+                Some(mesh) => Some(Beneath::Meshes(mesh)),
+                None => draw_checker(renderer, size, &beneath, false).map(|drawn| match drawn {
+                    Drawn::Geometry(geometry) => {
+                        Beneath::Geometry(geometry.cache(Group::unique(), None))
+                    }
+                    Drawn::Meshes(mesh) => Beneath::Meshes(mesh),
+                }),
+            };
             let previous = caches.remove(&id);
             let group = previous
                 .as_ref()
@@ -763,6 +900,7 @@ impl Editor<'_> {
                     group,
                     geometry,
                     meshes: built,
+                    beneath,
                 },
             );
         }
@@ -772,14 +910,15 @@ impl Editor<'_> {
             .map(|wanted| {
                 let cache = &caches[&wanted.layer.id];
                 let geometry = Drawn::Geometry(Cached::load(&cache.geometry));
-                match &cache.meshes {
+                let parts = match &cache.meshes {
                     Some((under, over)) => vec![
                         Drawn::Meshes(under.clone()),
                         geometry,
                         Drawn::Meshes(over.clone()),
                     ],
                     None => vec![geometry],
-                }
+                };
+                (cache.beneath.as_ref().map(Beneath::drawn), parts)
             })
             .collect()
     }
