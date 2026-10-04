@@ -197,11 +197,14 @@ pub enum Message {
         anchor: Point,
         angle: f32,
     },
-    /// Fit these points (world) in view: the shape to frame; on another
-    /// layer (the one pointed at), switching to it.
+    /// Fit these points (world) in view: the shape to frame (/), its layer
+    /// isolated; on another layer (the one pointed at), switching to it.
+    /// `pointed`: a shape pointed at (or the selection), rather than the
+    /// layer's.
     Frame {
         points: Vec<Point>,
         layer: Option<NodeId>,
+        pointed: bool,
     },
     /// Move the background image by this much (world).
     MoveBackground(Vector),

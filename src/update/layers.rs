@@ -119,6 +119,7 @@ impl Tessera {
             },
             // A way of looking, not a change to the drawing.
             LayerAction::ToggleIsolated(id) => {
+                self.layers_panel.focus = None;
                 if !self.layers_panel.isolated.remove(&id) {
                     self.layers_panel.isolated.insert(id);
                 }
@@ -232,4 +233,29 @@ pub struct LayersPanel {
     /// The layers and groups isolated in the layers panel: while any are,
     /// only they (and what's in them) are in view. Not part of the drawing.
     pub isolated: HashSet<NodeId>,
+    /// The shape framed with /, its layer isolated by it: until / is
+    /// pressed again (but over another shape), or isolating's changed.
+    pub focus: Option<Focus>,
+}
+
+/// A shape framed with / (see `LayersPanel::focus`).
+pub struct Focus {
+    /// Its layer, and its points (as framed): to tell it from another.
+    pub layer: NodeId,
+    pub points: Vec<iced::Point>,
+    /// What was isolated before, to go back to.
+    pub isolated: HashSet<NodeId>,
+}
+
+impl Focus {
+    /// Whether `points` are its (in whatever order: framed from wherever
+    /// in it the cursor was).
+    pub fn is(&self, points: &[iced::Point]) -> bool {
+        let sorted = |points: &[iced::Point]| {
+            let mut points: Vec<(f32, f32)> = points.iter().map(|p| (p.x, p.y)).collect();
+            points.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            points
+        };
+        sorted(&self.points) == sorted(points)
+    }
 }

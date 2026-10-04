@@ -2,6 +2,7 @@
 //! view, the brush, the clipboard, the mirror or the background as it
 //! goes.
 
+use super::layers::Focus;
 use crate::*;
 
 impl Tessera {
@@ -30,8 +31,31 @@ impl Tessera {
                 }
                 Task::none()
             }
-            editor::Message::Frame { points, layer } => {
-                if let Some(layer) = layer {
+            editor::Message::Frame {
+                points,
+                layer,
+                pointed,
+            } => {
+                let layer = layer.unwrap_or(self.current());
+                // Again (but over another shape): back to as it was.
+                let isolated = match self.layers_panel.focus.take() {
+                    Some(focus) => {
+                        let same = focus.layer == layer && focus.is(&points);
+                        if same || !pointed {
+                            self.layers_panel.isolated = focus.isolated;
+                            return Task::none();
+                        }
+                        focus.isolated
+                    }
+                    None => std::mem::take(&mut self.layers_panel.isolated),
+                };
+                self.layers_panel.focus = Some(Focus {
+                    layer,
+                    points: points.clone(),
+                    isolated,
+                });
+                self.layers_panel.isolated = HashSet::from([layer]);
+                if layer != self.current() {
                     self.select_layer(layer);
                 }
                 // Clear of the edges, and of the panels over the canvas.

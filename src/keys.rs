@@ -145,7 +145,8 @@ impl Action {
             Mirror => "Place a mirror on the layer",
             DuplicateLayer => "Duplicate the selected layer (or group)",
             FrameShape => {
-                "Fit the shape in view (the selection, else the one pointed at, on any layer)"
+                "Focus on a shape: fit it in view, its layer isolated (the selection, else the \
+                 one pointed at, frontmost as drawn); again, back (but over another shape: on that)"
             }
             ShowKeys => "Show these shortcuts",
             CutEdge => "Cut the hovered edge",

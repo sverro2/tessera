@@ -5,26 +5,36 @@
 use super::*;
 
 impl Editor<'_> {
-    /// The shape to frame (world, as seen: with its mirror images), and the
-    /// layer it's on if not this one: the selection; else the shape under
-    /// the cursor (at `inside`), on this layer or else the one in view
-    /// it's over (frontmost first); else the one last highlighted; else
-    /// all of the layer.
+    /// The shape to frame (world, as seen: with its mirror images), the
+    /// layer it's on if not this one, and whether it's one pointed at: the
+    /// selection; else the frontmost shape under the cursor (at `inside`),
+    /// on whichever layer in view, as they're drawn: painted, in their
+    /// order (one on a layer in front over this layer's behind it);
+    /// otherwise this layer over all; else (not pointed at) the one last
+    /// highlighted; else all of the layer.
     pub(super) fn shape_to_frame(
         &self,
         state: &State,
         inside: Option<Point>,
-    ) -> (Vec<Point>, Option<NodeId>) {
+    ) -> (Vec<Point>, Option<NodeId>, bool) {
         let document = self.document;
         let hover = inside
             .filter(|_| self.shown)
             .and_then(|pos| self.hit_test(pos));
         if state.selection.is_empty()
-            && hover.is_none()
-            && let Some((points, layer)) = inside.and_then(|pos| self.shape_elsewhere(pos))
+            && let Some(pos) = inside
         {
-            return (points, Some(layer));
+            let elsewhere = |layers: &[SceneLayer]| self.shape_elsewhere(layers, pos);
+            let found = match hover {
+                Some(_) if self.look() != Look::Painted => None,
+                Some(_) => elsewhere(&self.above),
+                None => elsewhere(&self.above).or_else(|| elsewhere(&self.below)),
+            };
+            if let Some((points, layer)) = found {
+                return (points, Some(layer), true);
+            }
         }
+        let pointed = !state.selection.is_empty() || hover.is_some();
         let vertices: Vec<VertexId> = if !state.selection.is_empty() {
             state.selection.clone()
         } else if let Some(hover) = hover {
@@ -42,27 +52,27 @@ impl Editor<'_> {
         } else {
             document.unique_vertices()
         };
-        (as_seen(document, &vertices, self.mirrors), None)
+        (as_seen(document, &vertices, self.mirrors), None, pointed)
     }
 
-    /// The shape of another layer in view under `screen` (frontmost
-    /// first, as the pipette picks), as [`Self::shape_to_frame`] has it,
-    /// and that layer.
-    pub(super) fn shape_elsewhere(&self, screen: Point) -> Option<(Vec<Point>, NodeId)> {
+    /// The shape of one of `layers` (others in view, back to front) under
+    /// `screen`, frontmost first (as the pipette picks), as
+    /// [`Self::shape_to_frame`] has it, and that layer.
+    pub(super) fn shape_elsewhere(
+        &self,
+        layers: &[SceneLayer],
+        screen: Point,
+    ) -> Option<(Vec<Point>, NodeId)> {
         // The other layers as they are, even working through the current
         // layer's mirror image.
         let world = self.plain_camera().to_world(screen);
-        self.above
-            .iter()
-            .rev()
-            .chain(self.below.iter().rev())
-            .find_map(|layer| {
-                let document = layer.document;
-                let t = document.triangle_at(world)?;
-                let shape = document.connected(document.triangle_ids()[t][0]);
-                let vertices: Vec<VertexId> = shape.into_iter().flatten().collect();
-                Some((as_seen(document, &vertices, layer.mirrors), layer.id))
-            })
+        layers.iter().rev().find_map(|layer| {
+            let document = layer.document;
+            let t = document.triangle_at(world)?;
+            let shape = document.connected(document.triangle_ids()[t][0]);
+            let vertices: Vec<VertexId> = shape.into_iter().flatten().collect();
+            Some((as_seen(document, &vertices, layer.mirrors), layer.id))
+        })
     }
 
     /// Keeping up with what changed since the last event: the shapes
@@ -255,9 +265,14 @@ impl Editor<'_> {
                 self.clipboard_key(state, action, inside)
             }
             Action::FrameShape if matches!(state.interaction, Interaction::Idle) => {
-                let (points, layer) = self.shape_to_frame(state, inside);
+                let (points, layer, pointed) = self.shape_to_frame(state, inside);
                 (!points.is_empty() && (self.shown || layer.is_some())).then(|| {
-                    canvas::Action::publish(Message::Frame { points, layer }).and_capture()
+                    canvas::Action::publish(Message::Frame {
+                        points,
+                        layer,
+                        pointed,
+                    })
+                    .and_capture()
                 })
             }
             // Lasso (Q, or Shift+Q to take out of the selection): the next

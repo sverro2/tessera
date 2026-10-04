@@ -144,12 +144,67 @@ fn framing_a_shape_on_another_layer_switches_to_it() {
         Message::Editor(editor::Message::Frame {
             points: points.clone(),
             layer,
+            pointed: true,
         })
     };
     let _ = app.update(frame(None));
     assert_eq!(app.current(), front);
     let _ = app.update(frame(Some(back)));
     assert_eq!((app.current(), app.layers_panel.selected), (back, back));
+}
+
+#[test]
+fn slash_isolates_the_layer_and_again_goes_back_unless_over_another_shape() {
+    let mut app = Tessera::default();
+    let back = app.current();
+    let _ = app.update(Message::Layers(LayerAction::Add));
+    let front = app.current();
+    let shape = |x: f32| vec![iced::Point::new(x, 0.0), iced::Point::new(x + 10.0, 10.0)];
+    let frame = |app: &mut Tessera, points: Vec<iced::Point>, layer, pointed| -> Vec<NodeId> {
+        let _ = app.update(Message::Editor(editor::Message::Frame {
+            points,
+            layer,
+            pointed,
+        }));
+        let mut isolated: Vec<_> = app.layers_panel.isolated.iter().copied().collect();
+        isolated.sort();
+        isolated
+    };
+
+    // A shape: its layer isolated; the same again (from elsewhere in it,
+    // its points in another order): not.
+    assert_eq!(frame(&mut app, shape(0.0), None, true), [front]);
+    let mut again = shape(0.0);
+    again.reverse();
+    assert_eq!(frame(&mut app, again, None, true), Vec::<NodeId>::new());
+    // A shape, then another: still isolated, framing that; then that
+    // again: not.
+    assert_eq!(frame(&mut app, shape(0.0), None, true), [front]);
+    assert_eq!(frame(&mut app, shape(50.0), None, true), [front]);
+    assert_eq!(app.layers_panel.focus.as_ref().unwrap().points, shape(50.0));
+    assert_eq!(
+        frame(&mut app, shape(50.0), None, true),
+        Vec::<NodeId>::new()
+    );
+    // Again over nothing (framing the layer): not.
+    assert_eq!(frame(&mut app, shape(0.0), None, true), [front]);
+    assert_eq!(
+        frame(&mut app, shape(99.0), None, false),
+        Vec::<NodeId>::new()
+    );
+
+    // On another layer: switching to it, isolated; back, as isolated
+    // before.
+    let _ = app.update(Message::Layers(LayerAction::ToggleIsolated(front)));
+    assert_eq!(frame(&mut app, shape(0.0), Some(back), true), [back]);
+    assert_eq!(app.current(), back);
+    assert_eq!(frame(&mut app, shape(0.0), None, true), [front]);
+
+    // Isolating by hand ends it: / then starts anew.
+    assert_eq!(frame(&mut app, shape(0.0), None, true), [back]);
+    let _ = app.update(Message::Layers(LayerAction::ToggleIsolated(front)));
+    assert!(app.layers_panel.focus.is_none());
+    assert_eq!(frame(&mut app, shape(0.0), None, true), [back]);
 }
 
 #[test]

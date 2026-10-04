@@ -19,11 +19,12 @@ fn slash_frames_the_shape_pointed_at_else_the_layer() {
             Some(Message::Frame {
                 points,
                 layer: None,
+                pointed,
             }) => {
                 let mut points: Vec<_> = points.iter().map(|p| (p.x, p.y)).collect();
                 points.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 points.dedup();
-                points
+                (points, pointed)
             }
             other => panic!("{other:?}"),
         }
@@ -32,9 +33,25 @@ fn slash_frames_the_shape_pointed_at_else_the_layer() {
     let left = [0, 1, 2].map(|v| (doc.vertex(v).x, doc.vertex(v).y));
     let mut left = left.to_vec();
     left.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    assert_eq!(framed(150.0, 280.0), left);
-    // Off the drawing: all of it.
-    assert_eq!(framed(700.0, 550.0).len(), 6);
+    assert_eq!(framed(150.0, 280.0), (left, true));
+    // Off the drawing: all of it (not pointed at).
+    let (all, pointed) = framed(700.0, 550.0);
+    assert_eq!((all.len(), pointed), (6, false));
+}
+
+/// What / frames over `(x, y)` with `editor`: how many points, and on
+/// which other layer.
+fn slash_frames(editor: &Editor, x: f32, y: f32) -> (usize, Option<NodeId>) {
+    let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+    let slash = press(letter('/'), keyboard::Modifiers::empty());
+    let cursor = mouse::Cursor::Available(Point::new(x, y));
+    let published = editor
+        .update(&mut State::default(), &slash, bounds, cursor)
+        .and_then(|action| action.into_inner().0);
+    match published {
+        Some(Message::Frame { points, layer, .. }) => (points.len(), layer),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -49,25 +66,34 @@ fn slash_over_another_layer_frames_its_shape_and_switches_to_it() {
         show_edges: true,
         mirrors: &[],
     }];
-    let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
-    let slash = press(letter('/'), keyboard::Modifiers::empty());
-    let framed = |x: f32, y: f32| {
-        let cursor = mouse::Cursor::Available(Point::new(x, y));
-        let published = editor
-            .update(&mut State::default(), &slash, bounds, cursor)
-            .and_then(|action| action.into_inner().0);
-        match published {
-            Some(Message::Frame { points, layer }) => (points.len(), layer),
-            other => panic!("{other:?}"),
-        }
-    };
-    // Over this layer's triangle: it, here (though the other's is there
-    // too).
-    assert_eq!(framed(200.0, 250.0), (3, None));
+    // Over this layer's triangle: it, here (though the other's is there,
+    // behind).
+    assert_eq!(slash_frames(&editor, 150.0, 280.0), (3, None));
     // Over only the other layer's right triangle: it, there.
-    assert_eq!(framed(320.0, 280.0), (3, Some(7)));
+    assert_eq!(slash_frames(&editor, 320.0, 280.0), (3, Some(7)));
     // Over neither: all of this layer.
-    assert_eq!(framed(700.0, 550.0), (3, None));
+    assert_eq!(slash_frames(&editor, 700.0, 550.0), (3, None));
+}
+
+#[test]
+fn slash_frames_the_shape_in_front_as_drawn() {
+    let doc = one();
+    let other = two_apart();
+    let cache = Caches::default();
+    let mut editor = editor(&doc, &cache);
+    editor.above = vec![SceneLayer {
+        id: 7,
+        document: &other,
+        show_edges: true,
+        mirrors: &[],
+    }];
+    // Over the other layer's left triangle, in front of this layer's:
+    // shaping, this layer's (drawn over all); painting, the other's.
+    assert_eq!(slash_frames(&editor, 150.0, 280.0), (3, None));
+    editor.tool = painting_faces();
+    assert_eq!(slash_frames(&editor, 150.0, 280.0), (3, Some(7)));
+    // Over this layer's alone: it.
+    assert_eq!(slash_frames(&editor, 230.0, 200.0), (3, None));
 }
 
 #[test]
