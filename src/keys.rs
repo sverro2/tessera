@@ -394,7 +394,10 @@ pub fn defaults() -> &'static Keymap {
 
 impl Keymap {
     /// The keys as kept in the config folder, the defaults for what isn't
-    /// there; written there if it wasn't yet, so it can be found to edit.
+    /// there. Written there if it wasn't yet (so it can be found to edit),
+    /// or if it holds more than the keys changed (written by an older
+    /// version, with all of them): so keys changed out of the box reach
+    /// whoever didn't change them.
     pub fn load() -> Self {
         // Tests keep to the defaults, and leave the user's file be.
         if cfg!(test) {
@@ -406,7 +409,10 @@ impl Keymap {
             .and_then(|store| std::fs::read_to_string(store).ok());
         let mut keymap = text.as_deref().map(Keymap::from_json).unwrap_or_default();
         keymap.store = store;
-        if text.is_none() {
+        // (One that can't be read is left for its writer to put right.)
+        let read = |text: &str| serde_json::from_str::<serde_json::Value>(text).ok();
+        let slimmer = |text: &str| read(text).is_some_and(|v| Some(v) != read(&keymap.to_json()));
+        if text.as_deref().is_none_or(slimmer) {
             keymap.save();
         }
         keymap
@@ -429,10 +435,13 @@ impl Keymap {
         keymap
     }
 
+    /// Only the keys changed: the rest follow the defaults, even as those
+    /// change.
     fn to_json(&self) -> String {
         let saved: BTreeMap<String, Vec<String>> = self
             .keys
             .iter()
+            .filter(|&(&action, _)| !self.is_default(action))
             .map(|(action, chords)| {
                 let name = serde_json::to_value(action)
                     .ok()
@@ -644,6 +653,13 @@ mod tests {
         );
         let read = Keymap::from_json(&text);
         assert_eq!(read.keys(Action::Grab), [chord("Shift+G")]);
+        // Only what's changed: not the rest.
+        assert!(!text.contains("rotate"), "{text}");
+        assert_eq!(Keymap::default().to_json(), "{}");
+        // A key taken from another action changes that one too.
+        keys.bind(Action::Grab, None, chord("R"));
+        let read = Keymap::from_json(&keys.to_json());
+        assert_eq!(read.keys(Action::Rotate), []);
 
         // Unknown actions and keys left out; actions not there, defaults.
         let read = Keymap::from_json(r#"{"grab": ["Hyper+X", "Q"], "teleport": ["P"]}"#);
