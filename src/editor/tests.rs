@@ -4,6 +4,7 @@
 use super::*;
 use canvas::Program;
 
+mod backdrop;
 mod checker;
 mod drags;
 mod extrude;
@@ -20,6 +21,58 @@ fn triangle(doc: &mut Document, corners: [(f32, f32); 3]) {
         corners: corners.map(|(x, y)| Point::new(x, y)),
         snap: 0.0
     }));
+}
+
+/// A layer of triangles, each `color`.
+fn painted(triangles: &[[(f32, f32); 3]], color: Color) -> Document {
+    let mut doc = Document::default();
+    for &t in triangles {
+        triangle(&mut doc, t);
+    }
+    assert!(doc.apply(Edit::PaintAll { color: Some(color) }));
+    doc
+}
+
+/// Painting faces with the default brush.
+fn painting_faces() -> Tool {
+    Tool::Paint {
+        target: paint::Target::Faces,
+        brush: Brush::default(),
+        width: 2.0,
+        picking: false,
+    }
+}
+
+/// The renderer the app falls back on without a GPU: to draw whole frames
+/// in tests, anywhere.
+fn software_renderer() -> Renderer {
+    use iced::advanced::renderer::Headless;
+    iced::futures::executor::block_on(<Renderer as Headless>::new(
+        iced_renderer::core::renderer::Settings::default(),
+        Some("tiny-skia"),
+    ))
+    .unwrap()
+}
+
+/// `editor` drawn whole on a canvas `size` big (without a GPU): its pixels'
+/// colours, by position.
+fn rendered(editor: &Editor, size: Size) -> impl Fn(u32, u32) -> [u8; 3] + use<> {
+    use iced::advanced::renderer::Headless;
+    let mut renderer = software_renderer();
+    let bounds = Rectangle::new(Point::ORIGIN, size);
+    editor.render(
+        &mut renderer,
+        &State::default(),
+        bounds,
+        mouse::Cursor::Unavailable,
+        false,
+    );
+    let width = size.width as u32;
+    let pixels = renderer.screenshot(iced::Size::new(width, size.height as u32), 1.0, BACKGROUND);
+    move |x, y| {
+        let at = ((y * width + x) * 4) as usize;
+        [pixels[at], pixels[at + 1], pixels[at + 2]]
+    }
 }
 
 /// One triangle, 0–1 along the bottom and 2 at the top.

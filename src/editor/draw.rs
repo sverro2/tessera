@@ -289,8 +289,10 @@ impl Editor<'_> {
 
     /// The backdrop: the background colour and the document's sheet,
     /// under the checkerboard; the background image, the grid and the
-    /// sheet's outline and size, over it (see-through, they're seen).
-    pub(super) fn draw_backdrop(&self, renderer: &Renderer, size: Size) -> [Geometry; 2] {
+    /// sheet's outline, over it (see-through, they're seen). And the
+    /// sheet's size, to go over the drawing, so wide edges along the
+    /// sheet's top (zoomed in) don't hide it.
+    pub(super) fn draw_backdrop(&self, renderer: &Renderer, size: Size) -> [Geometry; 3] {
         let sheet = self.page.map(|page| {
             let [first, rest @ ..] = page.corners().map(|p| self.camera.to_screen(p));
             Path::new(|path| {
@@ -313,9 +315,13 @@ impl Editor<'_> {
                 background.draw(frame, self.camera);
             }
             draw_grid(frame, self.camera, self.grid);
-            if let (Some(sheet), Some(page)) = (&sheet, self.page) {
+            if let Some(sheet) = &sheet {
                 frame.stroke(sheet, stroke(PAGE_EDGE, 1.0));
-                // Its size, above its top left corner, turned with it.
+            }
+        });
+        let label = cache.label.draw(renderer, size, |frame| {
+            if let Some(page) = self.page {
+                // Above its top left corner, turned with it.
                 let corner = self.camera.to_screen(page.min());
                 frame.with_save(|frame| {
                     frame.translate(corner - Point::ORIGIN);
@@ -330,7 +336,7 @@ impl Editor<'_> {
                 });
             }
         });
-        [under, over]
+        [under, over, label]
     }
 
     /// The layers: in the paint mode as they are, in their order;

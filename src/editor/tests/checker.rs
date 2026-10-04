@@ -2,27 +2,6 @@
 //! the backdrop's image, over the background colour.
 
 use super::*;
-use iced::advanced::renderer::Headless;
-
-/// The renderer the app falls back on without a GPU: to draw whole frames
-/// in tests, anywhere.
-fn software_renderer() -> Renderer {
-    iced::futures::executor::block_on(<Renderer as Headless>::new(
-        iced_renderer::core::renderer::Settings::default(),
-        Some("tiny-skia"),
-    ))
-    .unwrap()
-}
-
-/// A layer of triangles, each `color`.
-fn painted(triangles: &[[(f32, f32); 3]], color: Color) -> Document {
-    let mut doc = Document::default();
-    for &t in triangles {
-        triangle(&mut doc, t);
-    }
-    assert!(doc.apply(Edit::PaintAll { color: Some(color) }));
-    doc
-}
 
 const SEE_THROUGH: Color = Color {
     a: 0.3,
@@ -111,30 +90,8 @@ fn see_through_shows_the_checkerboard_unless_something_lies_between() {
         mirrors: &[],
     }];
     editor.background = Some(&background);
-    editor.tool = Tool::Paint {
-        target: paint::Target::Faces,
-        brush: Brush::default(),
-        width: 2.0,
-        picking: false,
-    };
-    let mut renderer = software_renderer();
-    let bounds = Rectangle::new(Point::ORIGIN, size);
-    editor.render(
-        &mut renderer,
-        &State::default(),
-        bounds,
-        mouse::Cursor::Unavailable,
-        false,
-    );
-    let pixels = renderer.screenshot(
-        iced::Size::new(size.width as u32, size.height as u32),
-        1.0,
-        BACKGROUND,
-    );
-    let pixel = |x: u32, y: u32| {
-        let at = ((y * size.width as u32 + x) * 4) as usize;
-        [pixels[at], pixels[at + 1], pixels[at + 2]]
-    };
+    editor.tool = painting_faces();
+    let pixel = rendered(&editor, size);
     // Two neighbouring squares of the board: told apart, or not.
     let differ = |x: u32, y: u32| {
         let (p, q) = (pixel(x, y), pixel(x + 8, y));

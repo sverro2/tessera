@@ -341,7 +341,8 @@ impl Widget<Message, Theme, Renderer> for EditorView<'_> {
 impl Editor<'_> {
     /// Draws all of the editor at `bounds`: the backdrop, the checkerboard
     /// in it, then the drawing over them, in a layer of its own (images,
-    /// the background, are drawn after shapes within one).
+    /// the background, are drawn after shapes within one), and over it
+    /// the document's size.
     pub(super) fn render(
         &self,
         renderer: &mut Renderer,
@@ -351,7 +352,7 @@ impl Editor<'_> {
         meshes: bool,
     ) {
         let Parts { beneath, drawing } = self.draw_parts(state, renderer, bounds, cursor, meshes);
-        let [under, over] = self.draw_backdrop(renderer, bounds.size());
+        let [under, over, label] = self.draw_backdrop(renderer, bounds.size());
         let draw = |renderer: &mut Renderer, parts: Vec<Drawn>| {
             renderer.with_translation(Vector::new(bounds.x, bounds.y), |renderer| {
                 for part in parts {
@@ -370,7 +371,8 @@ impl Editor<'_> {
             .chain(beneath)
             .chain([Drawn::Geometry(over)]);
         draw(renderer, backdrop.collect());
-        renderer.with_layer(bounds, |renderer| draw(renderer, drawing));
+        let drawing = drawing.into_iter().chain([Drawn::Geometry(label)]);
+        renderer.with_layer(bounds, |renderer| draw(renderer, drawing.collect()));
     }
 }
 

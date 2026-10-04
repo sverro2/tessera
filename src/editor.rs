@@ -241,17 +241,20 @@ pub struct Caches {
 }
 
 /// The backdrop as last drawn: what goes under the checkerboard (behind
-/// what's see-through) and what over it (see `Editor::draw_backdrop`).
+/// what's see-through), what over it, and the document's size over all
+/// (see `Editor::draw_backdrop`).
 #[derive(Default)]
 pub struct BackdropCache {
     under: canvas::Cache,
     over: canvas::Cache,
+    label: canvas::Cache,
 }
 
 impl BackdropCache {
     pub fn clear(&self) {
         self.under.clear();
         self.over.clear();
+        self.label.clear();
     }
 }
 
@@ -745,7 +748,7 @@ impl canvas::Program<Message> for Editor<'_> {
         // All on the canvas: no meshes. (`EditorView` draws the editor:
         // this, without its layers, puts the backdrop's image over all.)
         let Parts { beneath, drawing } = self.draw_parts(state, renderer, bounds, cursor, false);
-        let [under, over] = self.draw_backdrop(renderer, bounds.size());
+        let [under, over, label] = self.draw_backdrop(renderer, bounds.size());
         let parts = beneath
             .into_iter()
             .chain(drawing)
@@ -753,7 +756,11 @@ impl canvas::Program<Message> for Editor<'_> {
                 Drawn::Geometry(geometry) => Some(geometry),
                 Drawn::Meshes(_) => None,
             });
-        [under].into_iter().chain(parts).chain([over]).collect()
+        [under]
+            .into_iter()
+            .chain(parts)
+            .chain([over, label])
+            .collect()
     }
 
     fn mouse_interaction(
