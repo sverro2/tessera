@@ -7,6 +7,11 @@
 //! begins, so their outlines share it instead of lying over each other.
 //! Where the gap between two neighbours is half a turn or more, their sides
 //! don't meet: each edge ends in a round cap up to halfway into the gap.
+//!
+//! Where an edge runs on into one other edge alone (along a line), the two
+//! are as wide where they meet: halfway between their widths, each tapering
+//! to it from its far end. So a line changes width smoothly, without a
+//! step; where three or more meet, each keeps its own width.
 
 use std::f32::consts::PI;
 
@@ -26,13 +31,24 @@ pub fn outlines(edges: &[(usize, usize, f32)], at: impl Fn(usize) -> Point) -> V
     for list in around.values_mut() {
         list.sort_by(|x, y| x.0.total_cmp(&y.0));
     }
+    // Each edge's half width at either end: where it runs on into one
+    // other edge alone, the two meet halfway between their widths (each
+    // tapering to it), so a line thinning or thickening does so smoothly;
+    // elsewhere, its own.
+    let half = |i: usize, v: usize| {
+        let own = edges[i].2 / 2.0;
+        match around[&v][..] {
+            [(_, j), (_, k)] => (edges[j].2 + edges[k].2) / 4.0,
+            _ => own,
+        }
+    };
 
     edges
         .iter()
         .enumerate()
         .map(|(i, &(a, b, _))| {
-            let mut outline = end(i, a, b, edges, &around, &at);
-            outline.extend(end(i, b, a, edges, &around, &at));
+            let mut outline = end(i, a, b, edges, &around, &at, &half);
+            outline.extend(end(i, b, a, edges, &around, &at, &half));
             outline
         })
         .collect()
@@ -47,10 +63,12 @@ fn end(
     edges: &[(usize, usize, f32)],
     around: &std::collections::BTreeMap<usize, Vec<(f32, usize)>>,
     at: &impl Fn(usize) -> Point,
+    half: &impl Fn(usize, usize) -> f32,
 ) -> Vec<Point> {
     let p = at(v);
-    let length = p.distance(at(u));
-    let h = edges[i].2 / 2.0;
+    let q = at(u);
+    let length = p.distance(q);
+    let h = half(i, v);
     let list = &around[&v];
     let k = list
         .iter()
@@ -81,14 +99,16 @@ fn end(
         let (other_angle, j) = neighbour;
         let e = direction(other_angle);
         let m = Vector::new(-e.y, e.x);
-        let other_h = edges[j].2 / 2.0;
-        let other_length = p.distance(at(other(edges[j], v)));
-        // This side: p + n·h·side + t·d; the neighbour's facing side:
-        // p − m·h'·side + s·e.
-        let offset = m * (-other_h * side) - n * (h * side);
-        let den = cross(d, e);
-        let t = cross(offset, e) / den;
-        let corner = p + n * (h * side) + d * t;
+        let w = other(edges[j], v);
+        let other_length = p.distance(at(w));
+        // This side: from p + n·h·side to its far end (tapering, maybe);
+        // the neighbour's facing side likewise, on the other side of it.
+        let from = p + n * (h * side);
+        let along = q + n * (half(i, u) * side) - from;
+        let other_from = p - m * (half(j, v) * side);
+        let other_along = at(w) - m * (half(j, w) * side) - other_from;
+        let t = cross(other_from - from, other_along) / cross(along, other_along);
+        let corner = from + along * t;
         let limit = 0.5 * length.min(other_length);
         let reach = corner.distance(p);
         if reach > limit {
@@ -176,6 +196,42 @@ mod tests {
         let outline = &outlines(&[(0, 1, 2.0)], |v| points[v])[0];
         let expected = 10.0 * 2.0 + PI;
         assert!((area(outline) - expected).abs() < 0.1, "{}", area(outline));
+    }
+
+    #[test]
+    fn a_line_changes_width_smoothly_where_two_edges_meet() {
+        // A thin edge running on into a thick one, a little turned.
+        let points = [
+            Point::new(0.0, 0.0),
+            Point::new(10.0, 0.0),
+            Point::new(20.0, 1.0),
+        ];
+        let outlines = outlines(&[(0, 1, 1.0), (1, 2, 3.0)], |v| points[v]);
+        // Where they meet, both as wide (halfway between): no step.
+        let across = |outline: &[Point], x: f32| {
+            let ys: Vec<f32> = (-30..=30)
+                .map(|k| k as f32 * 0.05)
+                .filter(|&y| inside(outline, Point::new(x, y)))
+                .collect();
+            ys.last().unwrap() - ys.first().unwrap()
+        };
+        let (thin, thick) = (across(&outlines[0], 9.8), across(&outlines[1], 10.2));
+        assert!(
+            (thin - 2.0).abs() < 0.2 && (thick - 2.0).abs() < 0.2,
+            "{thin} {thick}"
+        );
+        // Each its own width at its far end.
+        assert!((across(&outlines[0], 0.2) - 1.0).abs() < 0.2);
+        // Still not over each other.
+        for x in 80..=120 {
+            for y in -30..=30 {
+                let p = Point::new(x as f32 * 0.1 + 0.013, y as f32 * 0.1 + 0.017);
+                assert!(
+                    outlines.iter().filter(|o| inside(o, p)).count() <= 1,
+                    "{p:?}"
+                );
+            }
+        }
     }
 
     #[test]
