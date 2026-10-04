@@ -231,8 +231,7 @@ impl Tessera {
             ]),
             {
                 let layer = self.layers.layer(self.current()).expect("current layer");
-                // Showing the edges first: it matters more than how they fade.
-                let mut options = column![tooltip(
+                tooltip(
                     checkbox(layer.show_edges)
                         .label("Show edges")
                         .size(14)
@@ -240,38 +239,7 @@ impl Tessera {
                         .on_toggle(|value| Message::Paint(PaintMessage::ShowEdges(value))),
                     tip("Hide this layer's edges when painting and exporting; their paint is kept"),
                     tooltip::Position::Bottom,
-                )]
-                .spacing(6);
-                // Painting edges: whether they fade into each other at their
-                // ends, and how far.
-                let crossfade = layer.crossfade;
-                if self.paint.target == Target::Edges {
-                    options = options.push(tooltip(
-                        checkbox(crossfade.edges)
-                            .label("Crossfade")
-                            .size(14)
-                            .text_size(13)
-                            .on_toggle(|value| Message::Paint(PaintMessage::Crossfade(value))),
-                        tip("Fade the ends of this layer's painted edges into the edges they meet"),
-                        tooltip::Position::Bottom,
-                    ));
-                    if crossfade.edges {
-                        options = options.push(
-                            row![
-                                small("Fade").width(44),
-                                slider(1.0..=40.0, crossfade.width, |value| Message::Paint(
-                                    PaintMessage::FadeWidth(value)
-                                ))
-                                .step(0.5)
-                                .on_release(Message::Paint(PaintMessage::FadeWidthDone)),
-                                text(format!("{:.1}", crossfade.width)).size(13).width(28),
-                            ]
-                            .spacing(8)
-                            .align_y(Center),
-                        );
-                    }
-                }
-                options
+                )
             },
             row![
                 current,

@@ -47,7 +47,7 @@ fn only_whats_see_through_goes_behind_a_layer() {
     let renderer = software_renderer();
     let behind = |doc: &Document| {
         let mut frame = Frame::new(&renderer, Size::new(800.0, 600.0));
-        let style = Style::of(Look::Painted, Crossfade::default(), true);
+        let style = Style::of(Look::Painted, true);
         let mut beneath = Vec::new();
         editor.draw_layer(&mut frame, doc, style, &[], None, &mut beneath);
         beneath
@@ -107,7 +107,6 @@ fn see_through_shows_the_checkerboard_unless_something_lies_between() {
     editor.below = vec![SceneLayer {
         id: 1,
         document: &below,
-        crossfade: Crossfade::default(),
         show_edges: true,
         mirrors: &[],
     }];

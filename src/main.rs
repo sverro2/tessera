@@ -13,7 +13,6 @@ mod dialogs;
 mod disk;
 mod document;
 mod editor;
-mod fade;
 mod file;
 mod geometry;
 mod icons;

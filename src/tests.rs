@@ -415,45 +415,15 @@ fn the_pipette_picks_up_a_brush() {
 }
 
 #[test]
-fn crossfading_edges_is_per_layer_and_undoable() {
-    let mut app = Tessera::default();
-    let back = app.current();
-    let _ = app.update(Message::Layers(LayerAction::Add));
-    let front = app.current();
-    let crossfade = |app: &Tessera, id| app.layers.layer(id).unwrap().crossfade;
-
-    let _ = app.update(Message::Paint(PaintMessage::SetTarget(Target::Edges)));
-    let _ = app.update(Message::Paint(PaintMessage::Crossfade(true)));
-    assert!(crossfade(&app, front).edges);
-    assert_eq!(crossfade(&app, back), layers::Crossfade::default());
-
-    let _ = app.update(Message::Undo);
-    assert!(!crossfade(&app, front).edges);
-}
-
-#[test]
-fn the_fade_width_and_hiding_edges_are_undoable() {
+fn hiding_edges_is_undoable() {
     let mut app = Tessera::default();
     let layer = app.current();
-    let look = |app: &Tessera| {
-        let layer = app.layers.layer(layer).unwrap();
-        (layer.crossfade.width, layer.show_edges)
-    };
+    let shown = |app: &Tessera| app.layers.layer(layer).unwrap().show_edges;
     let _ = app.update(Message::Paint(PaintMessage::SetTarget(Target::Edges)));
-    let _ = app.update(Message::Paint(PaintMessage::Crossfade(true)));
-    // Dragging the slider: one step.
-    for width in [8.0, 12.0, 20.0] {
-        let _ = app.update(Message::Paint(PaintMessage::FadeWidth(width)));
-    }
-    let _ = app.update(Message::Paint(PaintMessage::FadeWidthDone));
-    assert_eq!(look(&app), (20.0, true));
     let _ = app.update(Message::Paint(PaintMessage::ShowEdges(false)));
-    assert_eq!(look(&app), (20.0, false));
-
+    assert!(!shown(&app));
     let _ = app.update(Message::Undo);
-    assert_eq!(look(&app), (20.0, true));
-    let _ = app.update(Message::Undo);
-    assert_eq!(look(&app), (layers::Crossfade::WIDTH, true));
+    assert!(shown(&app));
 }
 
 #[test]

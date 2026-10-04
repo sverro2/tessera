@@ -46,7 +46,6 @@ fn slash_over_another_layer_frames_its_shape_and_switches_to_it() {
     editor.below = vec![SceneLayer {
         id: 7,
         document: &other,
-        crossfade: Crossfade::default(),
         show_edges: true,
         mirrors: &[],
     }];

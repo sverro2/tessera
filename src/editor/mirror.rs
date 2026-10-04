@@ -60,7 +60,6 @@ impl Editor<'_> {
         Some(Editor {
             document: self.document,
             current: self.current,
-            crossfade: self.crossfade,
             show_edges: self.show_edges,
             mirrors: self.mirrors,
             shown: self.shown,

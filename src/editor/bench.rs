@@ -189,7 +189,6 @@ fn bench_editor() {
             let editor = Editor {
                 document: &doc,
                 current: 0,
-                crossfade: Crossfade::default(),
                 show_edges: true,
                 mirrors: &[],
                 shown: true,
@@ -640,7 +639,6 @@ impl Drawing {
         let (below, above) = layers.around(self.current, &Default::default());
         let mut editor = super::tests::editor(&layer.document, cache);
         editor.current = self.current;
-        editor.crossfade = layer.crossfade;
         editor.show_edges = layer.show_edges;
         editor.mirrors = layer.mirror.as_slice();
         editor.below = below.into_iter().map(SceneLayer::of).collect();
@@ -871,7 +869,7 @@ fn bench_face_meshes() {
         for doc in &docs {
             let mut editor = super::tests::editor(doc, &cache);
             editor.camera = camera;
-            let style = Style::of(Look::Painted, Crossfade::default(), false);
+            let style = Style::of(Look::Painted, false);
             editor.draw_layer(&mut frame, doc, style, &[], None, &mut Vec::new());
         }
         frame.into_geometry()
@@ -881,7 +879,7 @@ fn bench_face_meshes() {
         for doc in &docs {
             let mut editor = super::tests::editor(doc, &cache);
             editor.camera = camera;
-            let style = Style::of(Look::Painted, Crossfade::default(), true);
+            let style = Style::of(Look::Painted, true);
             editor.draw_layer(&mut frame, doc, style, &[], None, &mut Vec::new());
         }
         frame.into_geometry()
@@ -891,7 +889,7 @@ fn bench_face_meshes() {
         for doc in &docs {
             let mut editor = super::tests::editor(doc, &cache);
             editor.camera = camera;
-            let style = Style::of(Look::Faded, Crossfade::default(), true);
+            let style = Style::of(Look::Faded, true);
             editor.draw_layer(&mut frame, doc, style, &[], None, &mut Vec::new());
         }
         frame.into_geometry()

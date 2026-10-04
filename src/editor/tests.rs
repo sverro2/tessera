@@ -41,7 +41,6 @@ pub(super) fn editor<'a>(doc: &'a Document, caches: &'a Caches) -> Editor<'a> {
     Editor {
         document: doc,
         current: 0,
-        crossfade: Crossfade::default(),
         show_edges: true,
         mirrors: &[],
         shown: true,

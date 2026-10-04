@@ -362,7 +362,6 @@ impl Editor<'_> {
         let current = SceneLayer {
             id: self.current,
             document: self.document,
-            crossfade: self.crossfade,
             show_edges: self.show_edges,
             mirrors: self.mirrors,
         };
@@ -422,7 +421,7 @@ impl Editor<'_> {
                 None if let Some(tweaked) = &tweaked => {
                     let mut sink = meshes.then(LayerMeshes::default);
                     let mut frame = Frame::new(renderer, size);
-                    let style = Style::of(look, self.crossfade, self.show_edges);
+                    let style = Style::of(look, self.show_edges);
                     let mut see_through = Vec::new();
                     self.draw_layer(
                         &mut frame,
@@ -828,7 +827,7 @@ impl Editor<'_> {
                 layer,
                 look,
             } = *wanted;
-            let style = Style::of(look, layer.crossfade, layer.show_edges);
+            let style = Style::of(look, layer.show_edges);
             let camera = painter.camera;
             let key = LayerKey {
                 revision: layer.document.revision(),

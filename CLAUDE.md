@@ -78,7 +78,7 @@ The iced (Elm) architecture throughout: state, messages, `update`, `view`.
 - `file.rs` (the format), `svg.rs`/`raster.rs` (export), `disk.rs`,
   `recent.rs`, `places.rs`, `snap.rs`: files and settings kept between runs.
 - `camera.rs` (world <-> screen), `geometry.rs`, `joints.rs` (painted
-  edges of different widths meeting), `fade.rs` (crossfaded edges).
+  edges of different widths meeting).
 
 ## Things to keep true
 

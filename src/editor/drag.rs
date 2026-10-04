@@ -12,7 +12,6 @@ use super::*;
 pub(super) struct Worker<'a> {
     document: &'a Document,
     current: NodeId,
-    crossfade: Crossfade,
     show_edges: bool,
     mirrors: &'a [Mirror],
     shown: bool,
@@ -115,7 +114,6 @@ impl<'a> Worker<'a> {
         Editor {
             document: self.document,
             current: self.current,
-            crossfade: self.crossfade,
             show_edges: self.show_edges,
             mirrors: self.mirrors,
             shown: self.shown,
@@ -931,7 +929,6 @@ impl Editor<'_> {
         Editor {
             document,
             current: self.current,
-            crossfade: self.crossfade,
             show_edges: self.show_edges,
             mirrors: self.mirrors,
             shown: self.shown,
@@ -1124,7 +1121,6 @@ impl Editor<'_> {
         Worker {
             document: self.document,
             current: self.current,
-            crossfade: self.crossfade,
             show_edges: self.show_edges,
             mirrors: self.mirrors,
             shown: self.shown,

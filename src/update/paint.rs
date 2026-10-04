@@ -16,13 +16,6 @@ pub enum PaintMessage {
     /// Turns the pipette on (in the paint mode) or off.
     TogglePicking,
     EdgeWidth(f32),
-    /// Whether the current layer's painted faces or edges (whichever is
-    /// being painted) blend into their neighbours.
-    Crossfade(bool),
-    /// How wide the current layer's faces fade into each other; and the
-    /// slider let go.
-    FadeWidth(f32),
-    FadeWidthDone,
     /// Whether the current layer's edges show when painting (non-destructive).
     ShowEdges(bool),
 }
@@ -66,40 +59,10 @@ impl Tessera {
                 self.paint.target = target;
                 Task::none()
             }
-            PaintMessage::Crossfade(on) => {
-                let current = self.current();
-                let before = self.layers.clone();
-                let crossfade = self.layers.layer(current).expect("current layer").crossfade;
-                self.layers.set_crossfade(
-                    current,
-                    layers::Crossfade {
-                        edges: on,
-                        ..crossfade
-                    },
-                );
-                self.push_undo(before);
-                Task::none()
-            }
-            PaintMessage::FadeWidth(width) => {
-                let current = self.current();
-                if self.paint.fading_from.is_none() {
-                    self.paint.fading_from = Some(self.layers.clone());
-                }
-                let crossfade = self.layers.layer(current).expect("current layer").crossfade;
-                self.layers
-                    .set_crossfade(current, layers::Crossfade { width, ..crossfade });
-                Task::none()
-            }
             PaintMessage::ShowEdges(show) => {
                 let before = self.layers.clone();
                 self.layers.set_show_edges(self.current(), show);
                 self.push_undo(before);
-                Task::none()
-            }
-            PaintMessage::FadeWidthDone => {
-                if let Some(before) = self.paint.fading_from.take() {
-                    self.push_undo(before);
-                }
                 Task::none()
             }
             PaintMessage::EdgeWidth(width) => {
@@ -124,9 +87,6 @@ pub struct Painting {
     pub target: Target,
     /// How wide painted edges are (world units).
     pub edge_width: f32,
-    /// The layers before the fade width slider was dragged: the drag is one
-    /// undo step.
-    pub fading_from: Option<Layers>,
     /// Whether the next click on the canvas picks up a brush (the pipette).
     pub picking: bool,
 }
@@ -142,7 +102,6 @@ impl Default for Painting {
             hsv: Hsv::from_color(color, 0.0),
             target: Target::default(),
             edge_width: 2.0,
-            fading_from: None,
             picking: false,
         }
     }

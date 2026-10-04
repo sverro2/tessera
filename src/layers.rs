@@ -24,9 +24,6 @@ pub struct Layer {
     pub id: NodeId,
     pub name: String,
     pub visible: bool,
-    /// Whether painted edges blend into their neighbours' colours at their
-    /// ends.
-    pub crossfade: Crossfade,
     /// Whether its edges are drawn when painting (and exported); hidden,
     /// their paint is kept.
     pub show_edges: bool,
@@ -43,28 +40,6 @@ impl Layer {
         match self.mirror {
             Some(mirror) => Arc::new(self.document.with_mirror(mirror)),
             None => self.document.clone(),
-        }
-    }
-}
-
-/// Whether a layer's painted edges blend into their neighbours'.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Crossfade {
-    pub edges: bool,
-    /// How far (world units) from its ends an edge fades into the edges
-    /// meeting there; in between, it's its own colour.
-    pub width: f32,
-}
-
-impl Crossfade {
-    pub const WIDTH: f32 = 6.0;
-}
-
-impl Default for Crossfade {
-    fn default() -> Self {
-        Crossfade {
-            edges: false,
-            width: Crossfade::WIDTH,
         }
     }
 }
@@ -602,13 +577,6 @@ impl Layers {
         }
     }
 
-    pub fn set_crossfade(&mut self, id: NodeId, crossfade: Crossfade) {
-        if let Some(layer) = self.layer_mut(id) {
-            layer.crossfade = crossfade;
-            self.changed();
-        }
-    }
-
     pub fn set_mirror(&mut self, id: NodeId, mirror: Option<Mirror>) {
         if let Some(layer) = self.layer_mut(id) {
             layer.mirror = mirror;
@@ -650,7 +618,6 @@ impl Layers {
                 self.count(|node| matches!(node, Node::Layer(_))) + 1
             ),
             visible: true,
-            crossfade: Crossfade::default(),
             show_edges: true,
             document: Arc::new(Document::default()),
             mirror: None,

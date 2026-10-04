@@ -30,7 +30,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 use crate::background::Background;
 use crate::camera::Camera;
 use crate::document::{Document, EdgeStyle, Mirror};
-use crate::layers::{Crossfade, Group, Layer, Layers, Node, NodeId};
+use crate::layers::{Group, Layer, Layers, Node, NodeId};
 use crate::page::Page;
 use crate::paint;
 
@@ -123,9 +123,6 @@ struct SavedLayer {
     /// Its edges hidden when painted and exported (their paint kept).
     #[serde(default, skip_serializing_if = "is_false")]
     edges_hidden: bool,
-    /// How its painted edges blend into each other, if not the default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    crossfade: Option<SavedCrossfade>,
     /// The mirror it's mirrored across (until applied), as two points on
     /// it: `[ax, ay, bx, by]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,13 +139,6 @@ struct SavedLayer {
     /// The painted edges: `[a, b, style]` (an index into `edge_styles`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     edges: Vec<[usize; 3]>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct SavedCrossfade {
-    edges: bool,
-    /// How far (world units) from their ends edges fade.
-    width: f32,
 }
 
 /// A layer's background image, placed.
@@ -283,10 +273,6 @@ impl<'a> Saving<'a> {
             name: layer.name.clone(),
             hidden: !layer.visible,
             edges_hidden: !layer.show_edges,
-            crossfade: (layer.crossfade != Crossfade::default()).then_some(SavedCrossfade {
-                edges: layer.crossfade.edges,
-                width: layer.crossfade.width,
-            }),
             mirror: layer.mirror.map(|Mirror { a, b }| [a.x, a.y, b.x, b.y]),
             background: self
                 .backgrounds
@@ -609,22 +595,11 @@ impl Opening<'_> {
             .transpose()?;
         self.backgrounds.push(background);
 
-        let crossfade = match saved.crossfade {
-            Some(SavedCrossfade { edges, width }) if width.is_finite() && width > 0.0 => {
-                Crossfade { edges, width }
-            }
-            Some(SavedCrossfade { edges, .. }) => Crossfade {
-                edges,
-                ..Crossfade::default()
-            },
-            None => Crossfade::default(),
-        };
         Ok(Layer {
             // Made unique by `Layers::from_nodes`.
             id: 0,
             name: saved.name,
             visible: !saved.hidden,
-            crossfade,
             show_edges: !saved.edges_hidden,
             document: Arc::new(document),
             mirror: saved
@@ -747,13 +722,6 @@ mod tests {
         let front = layers.add_layer(first);
         layers.rename(front, "Front <&>".into());
         layers.set_visible(front, false);
-        layers.set_crossfade(
-            first,
-            Crossfade {
-                edges: true,
-                width: 3.0,
-            },
-        );
         layers.set_show_edges(first, false);
         let mirror = Mirror {
             a: Point::new(1.0, 2.0),
@@ -789,7 +757,7 @@ mod tests {
             layers
                 .layers()
                 .iter()
-                .map(|layer| (layer.crossfade, layer.show_edges, layer.mirror))
+                .map(|layer| (layer.show_edges, layer.mirror))
                 .collect::<Vec<_>>()
         };
         assert_eq!(settings(&opened.layers), settings(&layers));
@@ -857,13 +825,7 @@ mod tests {
             .filter(|face| face.as_array().unwrap().len() == 3)
             .count();
         assert_eq!(erased, 1, "{text}");
-        for unset in [
-            "hidden",
-            "edges_hidden",
-            "crossfade",
-            "mirror",
-            "background",
-        ] {
+        for unset in ["hidden", "edges_hidden", "mirror", "background"] {
             assert!(layer.get(unset).is_none(), "{unset}: {text}");
         }
     }
@@ -928,10 +890,13 @@ mod tests {
 
     #[test]
     fn ignores_fields_it_does_not_know() {
+        // Those of later versions, and those no longer used (edges
+        // crossfading).
         let file = zipped(
             r#"{"format":"tessera","version":1,"style":{"fill":"red"},
             "view":{"pan":[0.0,0.0],"zoom":1.0,"rotation":0.0},
-            "layers":[{"kind":"layer","name":"A","x":1}]}"#,
+            "layers":[{"kind":"layer","name":"A","x":1,
+                "crossfade":{"edges":true,"width":3.0}}]}"#,
         );
         assert!(open(&file).is_ok());
     }

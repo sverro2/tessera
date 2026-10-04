@@ -272,34 +272,26 @@ pub(super) enum Look {
 }
 
 /// How a layer is drawn: its look and, in the painted look (the paint
-/// mode), whether its painted edges crossfade and whether its edges show.
-/// The other looks have neither.
+/// mode), whether its edges show. The other looks show them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Style {
     pub(super) look: Look,
-    pub(super) crossfade: Crossfade,
     pub(super) show_edges: bool,
 }
 
 impl Style {
-    /// A layer's, crossfading as `crossfade` says and showing its edges if
-    /// `show_edges`, in `look`.
-    pub(super) fn of(look: Look, crossfade: Crossfade, show_edges: bool) -> Style {
+    /// A layer's, showing its edges if `show_edges`, in `look`.
+    pub(super) fn of(look: Look, show_edges: bool) -> Style {
         match look {
-            Look::Painted => Style {
-                look,
-                crossfade,
-                show_edges,
-            },
+            Look::Painted => Style { look, show_edges },
             Look::Plain | Look::Faded => Style::plain(look),
         }
     }
 
-    /// In `look`, not crossfading, with its edges.
+    /// In `look`, with its edges.
     pub(super) fn plain(look: Look) -> Style {
         Style {
             look,
-            crossfade: Crossfade::default(),
             show_edges: true,
         }
     }
@@ -369,8 +361,7 @@ impl Editor<'_> {
 }
 
 impl Painter<'_> {
-    /// Draws a layer; in the painted look crossfaded as `crossfade` says,
-    /// and its edges only if `show_edges`. With `mirrors`, mirrored: in the
+    /// Draws a layer; in the painted look its edges only if `show_edges`. With `mirrors`, mirrored: in the
     /// painted look as it will be, otherwise its mirror images faint, so
     /// it's clear they're not there to edit. (Seen through one of them,
     /// that one's drawn as the drawing, and the drawing faint.)
@@ -477,11 +468,7 @@ impl Painter<'_> {
         mut meshes: Option<&mut LayerMeshes>,
         beneath: &mut Vec<[Point; 3]>,
     ) {
-        let Style {
-            look,
-            crossfade,
-            show_edges,
-        } = style;
+        let Style { look, show_edges } = style;
         if !mirrors.is_empty() {
             // Mapped so that, as this sees it, it's where it is.
             let seen = self.camera.image.unwrap_or(Affine::IDENTITY);
@@ -649,13 +636,6 @@ impl Painter<'_> {
                 }
             })
         };
-        // Crossfaded: each painted edge its own colour, fading at its ends
-        // (a gradient along it; see `fade`).
-        let fades = if crossfade.edges {
-            fade::edge_fades(document, crossfade.width * self.camera.zoom, screen)
-        } else {
-            HashMap::new()
-        };
         let mut by_color = ByColor::default();
         for (&(a, b, _, color), outline) in edges.iter().zip(&outlines) {
             // The edge's middle, which sees all its outline.
@@ -663,22 +643,9 @@ impl Painter<'_> {
                 (screen(a).x + screen(b).x) / 2.0,
                 (screen(a).y + screen(b).y) / 2.0,
             );
-            // See-through (or fading into what is): the checkerboard behind.
-            let fading = fades.get(&(a, b));
-            if color.a < 1.0
-                || fading.is_some_and(|stops| stops.iter().any(|&(_, color)| color.a < 1.0))
-            {
+            // See-through: the checkerboard behind.
+            if color.a < 1.0 {
                 fan_triangles(middle, outline, beneath);
-            }
-            if let Some(stops) = fading {
-                let (pa, pb) = (screen(a), screen(b));
-                let length = stops[3].0;
-                let gradient = stops.iter().fold(
-                    canvas::gradient::Linear::new(pa, pb),
-                    |gradient, &(at, color)| gradient.add_stop(at / length, color),
-                );
-                frame.fill(&path(&[outline]), gradient);
-                continue;
             }
             match meshes.as_deref_mut() {
                 // A fan round the edge's middle.

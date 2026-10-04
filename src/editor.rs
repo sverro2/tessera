@@ -45,14 +45,13 @@ use crate::background::Background;
 use crate::camera::Camera;
 use crate::document::{self as doc, EdgeStyle, Mirror, Piece};
 use crate::document::{Changes, Document, Edit, TriangleId, VertexId, opposite};
-use crate::fade;
 use crate::geometry::{
     Affine, area2, closest_on_line, closest_on_segment, inside_polygon, min_height,
 };
 use crate::icons;
 use crate::joints;
 use crate::keys::{Action, Chord, Context, Keymap};
-use crate::layers::{Crossfade, NodeId};
+use crate::layers::NodeId;
 use crate::page::Page;
 use crate::paint::{self, Brush};
 
@@ -308,7 +307,6 @@ struct LayerKey {
 pub struct SceneLayer<'a> {
     pub id: NodeId,
     pub document: &'a Document,
-    pub crossfade: Crossfade,
     /// Whether its edges are drawn in the paint mode.
     pub show_edges: bool,
     /// The mirrors it's shown mirrored across, one after the other (a
@@ -322,7 +320,6 @@ impl<'a> SceneLayer<'a> {
         SceneLayer {
             id: layer.id,
             document: &layer.document,
-            crossfade: layer.crossfade,
             show_edges: layer.show_edges,
             mirrors: layer.mirror.as_slice(),
         }
@@ -386,7 +383,6 @@ pub fn view<'a>(
     EditorView::new(Editor {
         document: current.document,
         current: current.id,
-        crossfade: current.crossfade,
         show_edges: current.show_edges,
         mirrors: current.mirrors,
         shown,
@@ -410,10 +406,8 @@ pub fn view<'a>(
 struct Editor<'a> {
     /// The current layer: the one edited.
     document: &'a Document,
-    /// Its id, whether its paint crossfades, and whether its edges show
-    /// in the paint mode.
+    /// Its id, and whether its edges show in the paint mode.
     current: NodeId,
-    crossfade: Crossfade,
     show_edges: bool,
     /// The mirrors it's mirrored across, one after the other: edits that
     /// would make it overlap a mirror image are turned down.
