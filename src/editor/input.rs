@@ -212,6 +212,7 @@ impl Editor<'_> {
             Tweaking::Opacity => Action::Opacity,
             Tweaking::Width => Action::Width,
             Tweaking::Reach => Action::Reach,
+            Tweaking::LoopTurn => Action::EdgeLoop,
         };
         let chord = Chord::pressed(key, physical_key, keyboard::Modifiers::empty())?;
         if !self.keys?.releases(&chord, action) {
@@ -290,6 +291,7 @@ impl Editor<'_> {
                 Some(canvas::Action::request_redraw().and_capture())
             }
             Action::SelectShape if self.shaping(state) => self.select_shape(state, inside),
+            Action::EdgeLoop if self.shaping(state) => self.edge_loop_key(state, repeat, inside),
             Action::Extrude if state.selection.is_empty() => {
                 if !self.shaping(state) {
                     return None;
@@ -465,6 +467,84 @@ impl Editor<'_> {
         }
         state.selected_in = self.document.revision();
         Some(canvas::Action::request_redraw().and_capture())
+    }
+
+    /// Shift+Q over an edge selects its edge loop (in place of the
+    /// selection); held (over an edge, or with a loop selected), moving
+    /// across tweaks how far the loop may turn at a vertex, the loop found
+    /// again from its edge as it goes.
+    fn edge_loop_key(
+        &self,
+        state: &mut State,
+        repeat: bool,
+        inside: Option<Point>,
+    ) -> Option<canvas::Action<Message>> {
+        if repeat {
+            return state
+                .tweaking
+                .map(|_| canvas::Action::request_redraw().and_capture());
+        }
+        let at = inside?;
+        match self.hit_test(at) {
+            Some(Hover::Edge { a, b, .. }) => {
+                state.edge_loop = Some((a, b, self.document.revision()));
+                self.select_edge_loop(state);
+            }
+            _ if self.edge_loop_selected(state) => {}
+            _ => return None,
+        }
+        state.tweaking = Some(Tweak {
+            what: Tweaking::LoopTurn,
+            at,
+            last: at,
+        });
+        Some(canvas::Action::request_redraw().and_capture())
+    }
+
+    /// How far an edge loop may turn at a vertex (radians).
+    pub(super) fn loop_turn(&self, state: &State) -> f32 {
+        state.loop_turn.unwrap_or(LOOP_TURN)
+    }
+
+    /// The vertices of the edge loop last found (Shift+Q), as far as it
+    /// may turn now; none if the drawing changed since.
+    fn edge_loop_vertices(&self, state: &State) -> Option<Vec<VertexId>> {
+        let (a, b, revision) = state.edge_loop?;
+        if revision != self.document.revision() {
+            return None;
+        }
+        let mut vertices: Vec<VertexId> = self
+            .document
+            .edge_loop(a, b, self.loop_turn(state))
+            .into_iter()
+            .flat_map(|(u, v)| [u, v])
+            .collect();
+        vertices.sort_unstable();
+        vertices.dedup();
+        Some(vertices)
+    }
+
+    /// Whether the selection is still the edge loop last found (not
+    /// changed by hand since, nor the drawing).
+    fn edge_loop_selected(&self, state: &State) -> bool {
+        state.selected_in == self.document.revision()
+            && self.edge_loop_vertices(state).is_some_and(|vertices| {
+                let mut selection = state.selection.clone();
+                selection.sort_unstable();
+                selection == vertices
+            })
+    }
+
+    /// Selects the edge loop from the edge it was found from, as far as it
+    /// may turn now.
+    fn select_edge_loop(&self, state: &mut State) {
+        match self.edge_loop_vertices(state) {
+            Some(vertices) => {
+                state.selection = vertices;
+                state.selected_in = self.document.revision();
+            }
+            None => state.edge_loop = None,
+        }
     }
 
     /// Without a selection, extrude (E) over an outer edge extrudes it, as
@@ -773,11 +853,19 @@ impl Editor<'_> {
         {
             let across = pos.x - tweak.last.x;
             tweak.last = pos;
+            if tweak.what == Tweaking::LoopTurn {
+                let turn = (self.loop_turn(state) + across * 0.2f32.to_radians())
+                    .clamp(0.0, MAX_LOOP_TURN);
+                state.loop_turn = Some(turn);
+                self.select_edge_loop(state);
+                return canvas::Action::request_redraw().and_capture();
+            }
             let message = match tweak.what {
                 Tweaking::Width => Message::TweakWidth(across),
                 Tweaking::Lightness => Message::TweakLightness(across),
                 Tweaking::Opacity => Message::TweakOpacity(across),
                 Tweaking::Reach => Message::TweakReach(across),
+                Tweaking::LoopTurn => unreachable!("tweaked here"),
             };
             return canvas::Action::publish(message).and_capture();
         }

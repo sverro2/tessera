@@ -715,3 +715,85 @@ fn rejects_degenerate_and_duplicate() {
     }));
     assert_eq!(doc.triangle_ids().len(), 1);
 }
+
+/// A grid of `n` by `n` points, `size` apart, each square two triangles
+/// (split from top right to bottom left).
+fn grid(n: usize, size: f32) -> Document {
+    let mut doc = Document::default();
+    let p = |i: usize, j: usize| Point::new(i as f32 * size, j as f32 * size);
+    for i in 0..n - 1 {
+        for j in 0..n - 1 {
+            for corners in [
+                [p(i, j), p(i + 1, j), p(i, j + 1)],
+                [p(i + 1, j), p(i + 1, j + 1), p(i, j + 1)],
+            ] {
+                assert!(doc.apply(Edit::AddTriangle { corners, snap: 0.0 }));
+            }
+        }
+    }
+    doc
+}
+
+/// The vertex at `(x, y)`.
+fn at(doc: &Document, x: f32, y: f32) -> VertexId {
+    doc.unique_vertices()
+        .into_iter()
+        .find(|&v| doc.vertex(v) == Point::new(x, y))
+        .unwrap()
+}
+
+/// An edge loop's vertices, each once, by position.
+fn loop_points(doc: &Document, edges: &[(VertexId, VertexId)]) -> Vec<(f32, f32)> {
+    let mut points: Vec<_> = edges
+        .iter()
+        .flat_map(|&(a, b)| [a, b])
+        .map(|v| (doc.vertex(v).x, doc.vertex(v).y))
+        .collect();
+    points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    points.dedup();
+    points
+}
+
+#[test]
+fn an_edge_loop_runs_on_straight_as_far_as_it_goes() {
+    let doc = grid(4, 10.0);
+    let (a, b) = (at(&doc, 10.0, 10.0), at(&doc, 20.0, 10.0));
+    // Along the row, both ways, to the sides: not round the corners (a
+    // quarter turn), nor down the diagonals (an eighth).
+    let row = doc.edge_loop(a, b, 30f32.to_radians());
+    assert_eq!(row.len(), 3);
+    assert_eq!(
+        loop_points(&doc, &row),
+        [(0.0, 10.0), (10.0, 10.0), (20.0, 10.0), (30.0, 10.0)]
+    );
+    // Turning further allowed, still the straightest way on.
+    assert_eq!(doc.edge_loop(a, b, 50f32.to_radians()), row);
+    // Not an edge: nothing.
+    assert!(doc.edge_loop(a, at(&doc, 30.0, 30.0), 1.0).is_empty());
+}
+
+#[test]
+fn an_edge_loop_round_a_ring_stops_where_it_started() {
+    // A hexagon fanned round its centre: its rim turns a sixth at each
+    // corner.
+    let mut doc = Document::default();
+    let corner = |k: usize| {
+        let angle = k as f32 * std::f32::consts::TAU / 6.0;
+        Point::new(100.0 * angle.cos(), 100.0 * angle.sin())
+    };
+    for k in 0..6 {
+        let corners = [Point::ORIGIN, corner(k), corner(k + 1)];
+        assert!(doc.apply(Edit::AddTriangle { corners, snap: 0.0 }));
+    }
+    let rim = |doc: &Document, k| at(doc, corner(k).x, corner(k).y);
+    let (a, b) = (rim(&doc, 0), rim(&doc, 1));
+    // Turning a sixth allowed: all the way round, each edge once.
+    let ring = doc.edge_loop(a, b, 70f32.to_radians());
+    assert_eq!(ring.len(), 6);
+    let mut edges: Vec<_> = ring.iter().map(|&(u, v)| (u.min(v), u.max(v))).collect();
+    edges.sort();
+    edges.dedup();
+    assert_eq!(edges.len(), 6);
+    // Less: the edge alone.
+    assert_eq!(doc.edge_loop(a, b, 50f32.to_radians()), [(a, b)]);
+}

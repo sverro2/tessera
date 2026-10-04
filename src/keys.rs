@@ -66,6 +66,7 @@ pub enum Action {
     Extrude,
     Lasso,
     LassoRemove,
+    EdgeLoop,
     SelectShape,
     SelectAll,
     Copy,
@@ -83,7 +84,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 32] = [
+    pub const ALL: [Action; 33] = [
         Action::ToggleMode,
         Action::New,
         Action::Open,
@@ -103,6 +104,7 @@ impl Action {
         Action::Extrude,
         Action::Lasso,
         Action::LassoRemove,
+        Action::EdgeLoop,
         Action::SelectShape,
         Action::SelectAll,
         Action::Copy,
@@ -123,7 +125,7 @@ impl Action {
         match self {
             ToggleMode | New | Open | Save | SaveAs | Undo | Redo | Mirror | DuplicateLayer
             | FrameShape | ShowKeys => Context::Global,
-            CutEdge | Delete | Grab | Rotate | Scale | Extrude | Lasso | LassoRemove
+            CutEdge | Delete | Grab | Rotate | Scale | Extrude | Lasso | LassoRemove | EdgeLoop
             | SelectShape | SelectAll | Copy | CutFaces | Paste | Proportional | Reach => {
                 Context::Shape
             }
@@ -159,6 +161,9 @@ impl Action {
             }
             Lasso => "Lasso: then drag around vertices to add them to the selection",
             LassoRemove => "Lasso: then drag around vertices to take them out of the selection",
+            EdgeLoop => {
+                "Select the edge loop pointed at; hold and move: how far it may turn at a vertex"
+            }
             SelectShape => "Select the whole shape",
             SelectAll => "Select every vertex of the layer",
             Copy => "Copy the selected faces",
@@ -197,7 +202,8 @@ impl Action {
             Scale => &["T"],
             Extrude => &["E"],
             Lasso => &["Q"],
-            LassoRemove => &["Shift+Q"],
+            LassoRemove => &["Alt+Q"],
+            EdgeLoop => &["Shift+Q"],
             SelectShape => &["Ctrl+L"],
             SelectAll => &["Ctrl+A"],
             Copy => &["Ctrl+C"],

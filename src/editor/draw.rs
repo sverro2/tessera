@@ -530,6 +530,22 @@ impl Editor<'_> {
         self.draw_highlights(overlay, state, pending);
         self.draw_lining_up(overlay, state, bounds, cursor_pos, hover, pending);
         self.draw_drag(overlay, state, cursor_pos, hover, pending, source);
+
+        // Tweaking the edge loop: how far it may turn, by where it began.
+        if let Some(tweak) = state.tweaking
+            && tweak.what == Tweaking::LoopTurn
+        {
+            let content = format!("{:.0}°", self.loop_turn(state).to_degrees());
+            for (offset, color) in [(1.0, BACKGROUND), (0.0, EDGE)] {
+                overlay.fill_text(canvas::Text {
+                    content: content.clone(),
+                    position: tweak.at + Vector::new(12.0 + offset, -22.0 + offset),
+                    color,
+                    size: 13.0.into(),
+                    ..canvas::Text::default()
+                });
+            }
+        }
     }
 
     /// The outline of the shape last hovered, so it's clear what hangs

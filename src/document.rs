@@ -30,6 +30,7 @@ use crate::geometry::{Affine, area2, min_height, overlap};
 pub(crate) mod cells;
 mod edit;
 mod fill;
+mod loops;
 mod mirror;
 mod quick;
 

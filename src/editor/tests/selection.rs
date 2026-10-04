@@ -347,7 +347,7 @@ fn q_then_a_drag_draws_a_lasso_and_esc_lets_go_of_it() {
 }
 
 #[test]
-fn shift_q_lassos_vertices_out_of_the_selection() {
+fn alt_q_lassos_vertices_out_of_the_selection() {
     let doc = two_apart();
     let cache = Caches::default();
     let editor = editor(&doc, &cache);
@@ -358,7 +358,7 @@ fn shift_q_lassos_vertices_out_of_the_selection() {
     run(
         &editor,
         &mut state,
-        press(letter('Q'), keyboard::Modifiers::SHIFT),
+        press(letter('Q'), keyboard::Modifiers::ALT),
         280.0,
         180.0,
     );
@@ -382,4 +382,67 @@ fn shift_q_lassos_vertices_out_of_the_selection() {
     // Q again adds.
     run(&editor, &mut state, key('q'), 280.0, 180.0);
     assert!(state.lasso_armed && !state.lasso_removes);
+}
+
+#[test]
+fn shift_q_selects_the_edge_loop_and_held_tweaks_how_far_it_turns() {
+    // A grid of 4 by 4 points, 50 apart, each square two triangles.
+    let mut doc = Document::default();
+    let p = |i: usize, j: usize| (100.0 + i as f32 * 50.0, 100.0 + j as f32 * 50.0);
+    for i in 0..3 {
+        for j in 0..3 {
+            triangle(&mut doc, [p(i, j), p(i + 1, j), p(i, j + 1)]);
+            triangle(&mut doc, [p(i + 1, j), p(i + 1, j + 1), p(i, j + 1)]);
+        }
+    }
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    let shift_q = press(letter('Q'), keyboard::Modifiers::SHIFT);
+    let row = |state: &State| {
+        let mut ys: Vec<f32> = state.selection.iter().map(|&v| doc.vertex(v).y).collect();
+        ys.dedup();
+        (state.selection.len(), ys)
+    };
+
+    // Off any edge, no loop yet: nothing.
+    run(&editor, &mut state, shift_q.clone(), 600.0, 500.0);
+    assert!(state.selection.is_empty() && state.tweaking.is_none());
+
+    // Over an edge of the second row: the row, side to side.
+    run(&editor, &mut state, shift_q.clone(), 175.0, 150.0);
+    assert_eq!(row(&state), (4, vec![150.0]));
+
+    // Held, moving right: it may turn further (round the sides); back
+    // left: the row again.
+    run(&editor, &mut state, Event::Mouse(MOVE), 575.0, 150.0);
+    assert!(state.selection.len() > 4, "{:?}", state.selection);
+    run(&editor, &mut state, Event::Mouse(MOVE), 175.0, 150.0);
+    assert_eq!(row(&state), (4, vec![150.0]));
+
+    // Let go: done.
+    let q = letter('q');
+    let release = Event::Keyboard(keyboard::Event::KeyReleased {
+        key: q.clone(),
+        modified_key: q,
+        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyQ),
+        location: keyboard::Location::Standard,
+        modifiers: keyboard::Modifiers::empty(),
+    });
+    run(&editor, &mut state, release.clone(), 175.0, 150.0);
+    assert!(state.tweaking.is_none());
+
+    // Again, off any edge: tweaks the loop selected.
+    run(&editor, &mut state, shift_q.clone(), 600.0, 500.0);
+    assert!(state.tweaking.is_some());
+    run(&editor, &mut state, Event::Mouse(MOVE), 1000.0, 500.0);
+    assert!(state.selection.len() > 4);
+
+    // But not once the selection's changed by hand.
+    let mut state = State::default();
+    run(&editor, &mut state, shift_q.clone(), 175.0, 150.0);
+    run(&editor, &mut state, release, 175.0, 150.0);
+    state.selection.pop();
+    run(&editor, &mut state, shift_q, 600.0, 500.0);
+    assert!(state.tweaking.is_none());
 }

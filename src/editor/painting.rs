@@ -300,9 +300,8 @@ impl Editor<'_> {
                         format!("{:.0}%", hsv.value * 100.0)
                     }
                     (Tweaking::Opacity, Some(color)) => format!("{:.0}%", color.a * 100.0),
-                    (Tweaking::Lightness | Tweaking::Opacity, None) | (Tweaking::Reach, _) => {
-                        String::new()
-                    }
+                    (Tweaking::Lightness | Tweaking::Opacity, None)
+                    | (Tweaking::Reach | Tweaking::LoopTurn, _) => String::new(),
                 };
                 let label = Point::new(p.x + CURSOR_SIZE * 0.5, p.y - CURSOR_SIZE * 0.9);
                 for (offset, color) in [(1.0, BACKGROUND), (0.0, EDGE)] {

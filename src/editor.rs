@@ -101,6 +101,10 @@ const BUDGET: Duration = Duration::from_millis(10);
 const MAX_SNAPS: usize = 4;
 /// How long the shape highlight takes to move over to another shape.
 const SHAPE_FADE: Duration = Duration::from_millis(200);
+/// How far (radians) an edge loop may turn at a vertex unless tweaked
+/// (30°), and at most (90°).
+const LOOP_TURN: f32 = std::f32::consts::FRAC_PI_6;
+const MAX_LOOP_TURN: f32 = std::f32::consts::FRAC_PI_2;
 /// Rotation per wheel notch with Shift held.
 const ROTATE_STEP: f32 = 5.0 * std::f32::consts::PI / 180.0;
 
@@ -488,8 +492,15 @@ pub struct State {
     lasso: Vec<Point>,
     lasso_armed: bool,
     /// Whether the lasso (made ready, or being drawn) takes what it catches
-    /// out of the selection (Shift+Q), rather than adding it (Q).
+    /// out of the selection (Alt+Q), rather than adding it (Q).
     lasso_removes: bool,
+    /// The edge the selection's edge loop was found from (Shift+Q), as of
+    /// document revision: found again from it as how far it may turn is
+    /// tweaked.
+    edge_loop: Option<(VertexId, VertexId, u64)>,
+    /// How far (radians) an edge loop may turn at a vertex, if tweaked
+    /// (else `LOOP_TURN`).
+    loop_turn: Option<f32>,
     /// Creating a triangle: the guides its start lined up with when it was
     /// pressed (with Shift), those that would do and all those near.
     start_guides: (Vec<Guide>, Vec<Guide>),
@@ -527,6 +538,8 @@ enum Tweaking {
     Opacity,
     /// How far proportional editing reaches (Shift+O, in the shape mode).
     Reach,
+    /// How far the edge loop may turn at a vertex (Shift+Q).
+    LoopTurn,
 }
 
 /// An in-progress drag. Positions are in world coordinates.
