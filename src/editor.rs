@@ -82,6 +82,9 @@ use mirror::*;
 use painter::*;
 use selection::*;
 
+/// How far (screen px) a press on the selection may wander and still be a
+/// click, letting go of it: a pen's tap rarely stays put.
+const CLICK_SLOP: f32 = 8.0;
 /// Screen-space distance within which a corner is grabbed.
 const VERTEX_HIT: f32 = 10.0;
 /// Screen-space distance within which an edge is grabbed.

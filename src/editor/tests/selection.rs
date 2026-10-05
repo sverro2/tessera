@@ -446,3 +446,37 @@ fn shift_q_selects_the_edge_loop_and_held_tweaks_how_far_it_turns() {
     run(&editor, &mut state, shift_q, 600.0, 500.0);
     assert!(state.tweaking.is_none());
 }
+
+#[test]
+fn a_tap_that_wanders_a_little_still_lets_go_of_the_selection() {
+    let doc = two_apart();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    lasso_right(&editor, &mut state);
+
+    // A pen's tap: pressed, moved a few pixels, let go. Nothing moves.
+    run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 500.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 503.0, 504.0);
+    let edits = run(&editor, &mut state, Event::Mouse(RELEASE), 503.0, 504.0);
+    assert!(edits.is_empty(), "{edits:?}");
+    assert!(state.selection.is_empty());
+}
+
+#[test]
+fn a_drag_past_the_slop_moves_the_selection_all_the_way() {
+    let doc = two_apart();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    lasso_right(&editor, &mut state);
+
+    run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 500.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 503.0, 500.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 520.0, 500.0);
+    let edits = run(&editor, &mut state, Event::Mouse(RELEASE), 520.0, 500.0);
+    // By the whole 20 px, not from where it left the slop.
+    let moved = moves(&edits);
+    assert_eq!(moved[0], (3, Point::new(270.0, 300.0)), "{moved:?}");
+    assert_eq!(state.selection.len(), 3);
+}

@@ -931,6 +931,15 @@ impl Editor<'_> {
                 }
                 return canvas::Action::request_redraw().and_capture();
             }
+            // Pressed on the selection: not moving it until clearly dragged,
+            // so a tap still lets go of it.
+            Interaction::MovingSelection {
+                from,
+                to,
+                held: true,
+            } if from == to && self.camera.to_screen(*from).distance(pos) < CLICK_SLOP => {
+                return canvas::Action::request_redraw().and_capture();
+            }
             _ => {}
         }
 
@@ -1000,8 +1009,8 @@ impl Editor<'_> {
         }
         // A click (not a drag) on the selection lets go of it.
         if let (Interaction::MovingSelection { from, .. }, None) = (finished, &pending) {
-            let still = screen
-                .is_some_and(|pos| self.camera.to_screen(from).distance(pos) < VERTEX_HIT / 2.0);
+            let still =
+                screen.is_some_and(|pos| self.camera.to_screen(from).distance(pos) < CLICK_SLOP);
             if still {
                 state.selection.clear();
             }
