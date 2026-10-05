@@ -37,10 +37,11 @@ fn e_extrudes_the_outer_edges_facing_the_cursor() {
 }
 
 #[test]
-fn an_extrusion_leaves_out_edges_running_into_something() {
+fn an_extrusion_running_into_something_is_fitted_round_it() {
     let mut doc = one();
     // In the way of the left edge swept up, not of the right.
-    triangle(&mut doc, [(105.0, 215.0), (130.0, 215.0), (118.0, 195.0)]);
+    let obstacle = [(112.0, 215.0), (132.0, 215.0), (122.0, 200.0)];
+    triangle(&mut doc, obstacle);
     let cache = Caches::default();
     let editor = editor(&doc, &cache);
     let mut state = State {
@@ -51,7 +52,54 @@ fn an_extrusion_leaves_out_edges_running_into_something() {
     run(&editor, &mut state, key('e'), 200.0, 250.0);
     run(&editor, &mut state, Event::Mouse(MOVE), 200.0, 150.0);
     let edits = run(&editor, &mut state, Event::Mouse(PRESS), 200.0, 150.0);
-    assert_eq!(extruded(&edits), 2);
+    let [edits] = &edits[..] else {
+        panic!("{edits:?}");
+    };
+    let mut after = doc.clone();
+    assert!(after.apply_all(edits));
+    // Both edges swept (10000 each), round the triangle in the way (150),
+    // which is left as it was.
+    assert!((area(&after) - (area(&doc) + 20000.0 - 150.0)).abs() < 1.0);
+    let obstacle = obstacle.map(|(x, y)| Point::new(x, y));
+    assert!(after.triangles().any(|t| (0..3).any(|i| {
+        let mut t = t;
+        t.rotate_left(i);
+        t == obstacle || t == [obstacle[0], obstacle[2], obstacle[1]]
+    })));
+    // The far ends are selected, to go on from.
+    assert_eq!(state.selection.len(), 3);
+}
+
+#[test]
+fn sweeps_running_into_each_other_merge() {
+    // A notch: its sides, swept up and to the right, run into each other.
+    let mut doc = Document::default();
+    triangle(&mut doc, [(0.0, 0.0), (0.0, 300.0), (100.0, 200.0)]);
+    triangle(&mut doc, [(100.0, 200.0), (0.0, 300.0), (200.0, 300.0)]);
+    triangle(&mut doc, [(100.0, 200.0), (200.0, 300.0), (200.0, 0.0)]);
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State {
+        selection: doc.unique_vertices(),
+        ..State::default()
+    };
+
+    run(&editor, &mut state, key('e'), 100.0, 150.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 160.0, 90.0);
+    let edits = run(&editor, &mut state, Event::Mouse(PRESS), 160.0, 90.0);
+    let [edits] = &edits[..] else {
+        panic!("{edits:?}");
+    };
+    let mut after = doc.clone();
+    assert!(after.apply_all(edits));
+    // The right side and the notch's left side swept (18000 each), less
+    // where the latter runs into the right prong (1350): no hole there.
+    let swept = area(&doc) + 2.0 * 18000.0 - 1350.0;
+    assert!(
+        (area(&after) - swept).abs() < 1.0,
+        "{} {swept}",
+        area(&after)
+    );
 }
 
 #[test]
@@ -191,4 +239,11 @@ fn extruded_corners(edits: &[Vec<Edit>]) -> Vec<Point> {
         },
         _ => panic!("expected one edit: {edits:?}"),
     }
+}
+
+/// The area a drawing covers.
+fn area(doc: &Document) -> f32 {
+    doc.triangles()
+        .map(|[a, b, c]| crate::geometry::area2(a, b, c).abs() / 2.0)
+        .sum()
 }

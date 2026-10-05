@@ -391,7 +391,7 @@ fn bench_extrude() {
     let editor = super::tests::editor(&doc, &cache);
     let all = doc.unique_vertices();
     time("3042 tris: extrusion (piece)", 20, || {
-        editor.extrusion(&all, Vector::new(0.0, -60.0))
+        editor.extrusion_parts(&all, Vector::new(0.0, -60.0)).0
     });
     time("3042 tris: extrude (with check)", 20, || {
         editor.extrude(&all, Vector::new(0.0, -60.0), Point::new(100.0, -10.0))

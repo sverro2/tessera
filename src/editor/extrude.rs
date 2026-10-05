@@ -4,13 +4,18 @@
 //!
 //! Only outer edges (with a face on one side only) with both ends selected
 //! are swept, and only those whose open side the cursor went to: an edge
-//! facing the other way, or whose quad would run into what's there (or
-//! into another edge's), or come out flat, is left out.
+//! facing the other way, or whose quad would come out flat, is left out.
+//! A quad running into what's there (or into another edge's) is fitted in
+//! round it, the sweeps merging; if that can't be done, it's left out.
 
 use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::geometry::overlap;
+
+/// A quad swept from an edge that runs into something, to fit in round it:
+/// the face on the edge, the edge (`a` → `b`), and its two triangles.
+type Merging = (TriangleId, VertexId, VertexId, [[Point; 3]; 2]);
 
 impl Editor<'_> {
     /// The outer edges with both ends in `selection`, each wound as its
@@ -48,10 +53,17 @@ impl Editor<'_> {
         ends
     }
 
-    /// `selection` extruded by `by`, as a piece to join on: a quad (two
-    /// triangles) for each outer edge that can be swept that way, painted
-    /// like the face on it, its edges styled like the edge swept.
-    pub(super) fn extrusion(&self, selection: &[VertexId], by: Vector) -> Piece {
+    /// `selection` extruded by `by`: the quads clear of everything, as a
+    /// piece to join on (a quad, two triangles, for each outer edge that
+    /// can be swept that way, painted like the face on it, its edges
+    /// styled like the edge swept); and those running into what's
+    /// there or into each other, to fit in round that (see [`Self::merged`]),
+    /// each with the face on its edge and that edge.
+    pub(super) fn extrusion_parts(
+        &self,
+        selection: &[VertexId],
+        by: Vector,
+    ) -> (Piece, Vec<Merging>) {
         let document = self.document;
         let bounds = |t: &[Point; 3]| {
             let (mut min, mut max) = (t[0], t[0]);
@@ -66,10 +78,10 @@ impl Editor<'_> {
         };
         let there: Vec<([Point; 3], (Point, Point))> =
             document.triangles().map(|t| (t, bounds(&t))).collect();
-        // Thin is fine (a hole would be worse), as long as it isn't flat.
-        let thick = |t: &[Point; 3]| min_height(t.map(|p| self.camera.to_screen(p))) >= FLAT;
+        let height = |t: &[Point; 3]| min_height(t.map(|p| self.camera.to_screen(p)));
 
         let mut quads: Vec<(VertexId, VertexId, TriangleId, [[Point; 3]; 2])> = Vec::new();
+        let mut merging = Vec::new();
         for (a, b, face) in self.outer_edges(selection) {
             let (pa, pb) = (document.vertex(a), document.vertex(b));
             // The face is to the left of `a` → `b`: open to the right.
@@ -77,6 +89,10 @@ impl Editor<'_> {
                 continue;
             }
             let quad = [[pb, pa, pa + by], [pb, pa + by, pb + by]];
+            // Thin is fine (a hole would be worse), as long as it isn't flat.
+            if quad.iter().any(|t| height(t) < FLAT) {
+                continue;
+            }
             let clear = |t: &[Point; 3]| {
                 let b = bounds(t);
                 there
@@ -87,8 +103,11 @@ impl Editor<'_> {
                         .flat_map(|(.., other)| other)
                         .all(|u| !overlap(*t, *u))
             };
-            if quad.iter().all(|t| thick(t) && clear(t)) {
+            if quad.iter().all(clear) {
                 quads.push((a, b, face, quad));
+            } else if quad.iter().all(|t| height(t) >= MIN_THICKNESS) {
+                // Fitted in, it mustn't leave slivers: thick enough to.
+                merging.push((face, a, b, quad));
             }
         }
 
@@ -114,13 +133,95 @@ impl Editor<'_> {
                 }
             }
         }
-        piece
+        (piece, merging)
+    }
+
+    /// The edits putting down `piece`, then fitting each of the `merging`
+    /// quads in round what's there by then (only what's still uncovered,
+    /// joined up: where sweeps run into each other, they merge), painted
+    /// like the face on its edge and styled like that edge. `None` if
+    /// none of them fits.
+    fn merged(&self, piece: Piece, merging: &[Merging]) -> Option<Vec<Edit>> {
+        let mut edits = Vec::new();
+        let mut result = self.document.clone();
+        if !piece.is_empty() {
+            let paste = Edit::Paste { piece };
+            if !result.apply(paste.clone()) {
+                return None;
+            }
+            edits.push(paste);
+        }
+        let before = edits.len();
+        let snap = self.snap_distance();
+        let mut filled = Vec::new();
+        for &(face, a, b, quad) in merging {
+            for corners in quad {
+                let fill = Edit::AddTriangle { corners, snap };
+                if result.apply(fill.clone()) {
+                    edits.push(fill);
+                    filled.push((face, a, b, corners));
+                }
+            }
+        }
+        if edits.len() == before {
+            return None;
+        }
+
+        // Each new face painted like the face on the edge swept over it.
+        let existed: HashSet<[VertexId; 3]> = {
+            let mut after = self.document.clone();
+            for edit in &edits[..before] {
+                after.apply(edit.clone());
+            }
+            after.triangle_ids().iter().map(|&t| sorted(t)).collect()
+        };
+        let swept = |p: Point| {
+            filled
+                .iter()
+                .find(|(.., corners)| inside_polygon(p, corners))
+        };
+        let mut styled = HashSet::new();
+        for (t, &ids) in result.triangle_ids().iter().enumerate() {
+            if existed.contains(&sorted(ids)) {
+                continue;
+            }
+            let [p, q, r] = ids.map(|v| result.vertex(v));
+            let centre = Point::new((p.x + q.x + r.x) / 3.0, (p.y + q.y + r.y) / 3.0);
+            let Some(&(face, a, b, _)) = swept(centre) else {
+                continue;
+            };
+            if let Some(color) = self.document.color(face) {
+                edits.push(Edit::Paint {
+                    triangle: t,
+                    color: Some(color),
+                });
+            }
+            if let Some(style) = self.document.edge_style(a, b) {
+                for (u, v) in [(ids[0], ids[1]), (ids[1], ids[2]), (ids[2], ids[0])] {
+                    if styled.insert((u.min(v), u.max(v))) && result.edge_style(u, v).is_none() {
+                        edits.push(Edit::PaintEdge {
+                            a: u,
+                            b: v,
+                            style: Some(style),
+                        });
+                    }
+                }
+            }
+        }
+        Some(edits)
     }
 
     /// Extruding `selection` by `by` (the cursor at `at`); `None` if no
-    /// edge can be swept that way, or it doesn't work out.
+    /// edge can be swept that way, or it doesn't work out. Sweeps running
+    /// into something are fitted in round it if they can be, else left out.
     pub(super) fn extrude(&self, selection: &[VertexId], by: Vector, at: Point) -> Option<Pending> {
-        let piece = self.extrusion(selection, by);
+        let (piece, merging) = self.extrusion_parts(selection, by);
+        if !merging.is_empty()
+            && let Some(edits) = self.merged(piece.clone(), &merging)
+            && let Some(pending) = self.check(edits, at)
+        {
+            return Some(pending);
+        }
         if piece.is_empty() {
             return None;
         }
@@ -130,14 +231,20 @@ impl Editor<'_> {
     /// The vertices at the far ends of what `pending` extruded `selection`
     /// into: to go on extruding from.
     pub(super) fn extruded(&self, selection: &[VertexId], pending: &Pending) -> Vec<VertexId> {
-        let Some(Edit::Paste { piece }) = pending.edits.first() else {
-            return Vec::new();
-        };
+        // Where the far ends were put: the piece's, and the fitted quads'.
+        let put: Vec<Point> = pending
+            .edits
+            .iter()
+            .flat_map(|edit| match edit {
+                Edit::Paste { piece } => piece.vertices.clone(),
+                Edit::AddTriangle { corners, .. } => corners.to_vec(),
+                _ => Vec::new(),
+            })
+            .collect();
         let near = |p: Point, q: Point| p.distance(q) < 1e-3 * (1.0 + p.x.abs().max(p.y.abs()));
         let result = &pending.result;
         let used = result.unique_vertices();
-        let mut far: Vec<VertexId> = piece
-            .vertices
+        let mut far: Vec<VertexId> = put
             .iter()
             .filter(|&&p| !selection.iter().any(|&v| near(self.document.vertex(v), p)))
             .filter_map(|&p| used.iter().copied().find(|&v| near(result.vertex(v), p)))
@@ -146,4 +253,10 @@ impl Editor<'_> {
         far.dedup();
         far
     }
+}
+
+/// A triangle's corners in order: the same for each way round.
+fn sorted(mut t: [VertexId; 3]) -> [VertexId; 3] {
+    t.sort_unstable();
+    t
 }
