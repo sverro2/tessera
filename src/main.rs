@@ -73,7 +73,7 @@ pub fn main() -> iced::Result {
 /// The window's size when it opens.
 const WINDOW_SIZE: iced::Size = iced::Size::new(1152.0, 768.0);
 /// How far proportional editing may reach (screen px): least, most.
-const REACH: (f32, f32) = (5.0, 1000.0);
+const REACH: (f32, f32) = (editor::Dial::REACH.min, editor::Dial::REACH.max);
 /// What the canvas is for: changing the shape, or painting it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Mode {
@@ -752,6 +752,7 @@ impl Tessera {
                     self.background(),
                     editor::Settings {
                         tool: self.tool(),
+                        brush: self.paint.hsv,
                         proportional: self.shape.proportional.then_some(self.shape.reach),
                         clipboard: self.clipboard.as_ref(),
                         // Not while they're being looked up (or set).

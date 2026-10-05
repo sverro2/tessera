@@ -204,18 +204,6 @@ impl Editor<'_> {
                     frame.fill(&Path::circle(p, 3.5), Color { a: w, ..SELECTED });
                 }
             }
-            if let (true, Some(p)) = (tweaking, cursor) {
-                let label = Point::new(p.x + 14.0, p.y - 18.0);
-                for (offset, color) in [(1.0, BACKGROUND), (0.0, EDGE)] {
-                    frame.fill_text(canvas::Text {
-                        content: format!("{:.0} px", self.proportional.unwrap_or_default()),
-                        position: label + Vector::new(offset, offset),
-                        color,
-                        size: 13.0.into(),
-                        ..canvas::Text::default()
-                    });
-                }
-            }
         }
 
         // The selection: its faces (all corners selected) tinted, its

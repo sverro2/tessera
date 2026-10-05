@@ -109,6 +109,7 @@ pub(super) fn editor<'a>(doc: &'a Document, caches: &'a Caches) -> Editor<'a> {
         lit: Vec::new(),
         page: None,
         grid: Grid::default(),
+        brush: crate::paint::Hsv::default(),
         deadline: Cell::new(None),
     }
 }

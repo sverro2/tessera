@@ -207,6 +207,7 @@ fn bench_editor() {
                 lit: Vec::new(),
                 page: None,
                 grid: Grid::default(),
+                brush: crate::paint::Hsv::default(),
                 deadline: Cell::new(None),
             };
             let run = |f: &dyn Fn(&Editor)| {
@@ -1591,4 +1592,75 @@ fn merge_rotations() {
         }
     }
     println!("BENCH rotations: {ok} of {all} work out, slowest {slowest:?}");
+}
+
+/// Each tweak in progress (a key held, the mouse moved across), drawn over
+/// `TESSERA_BENCH`: the slider under the cursor, cut out round it, into
+/// `TESSERA_SHOTS`. Run with `TESSERA_BENCH=drawing.tessera
+/// TESSERA_SHOTS=dir cargo test --release shoot_tweaks -- --ignored --nocapture`.
+#[test]
+#[ignore = "writes files; needs a drawing and a GPU"]
+fn shoot_tweaks() {
+    let Ok(shots) = std::env::var("TESSERA_SHOTS") else {
+        return;
+    };
+    let Some(drawing) = Drawing::open() else {
+        return;
+    };
+    let Some(mut renderer) = headless_renderer() else {
+        println!("SHOTS: no GPU");
+        return;
+    };
+    let size = iced::Size::new(1000.0, 700.0);
+    let bounds = Rectangle::new(Point::ORIGIN, size);
+    let brush = paint::Hsv {
+        hue: 0.58,
+        saturation: 0.6,
+        value: 0.8,
+        alpha: 0.7,
+    };
+    let colour = Tool::Paint {
+        target: paint::Target::Faces,
+        brush: Brush::Color(brush.to_color()),
+        width: 3.0,
+        picking: false,
+    };
+    let edges = Tool::Paint {
+        target: paint::Target::Edges,
+        brush: Brush::Color(brush.to_color()),
+        width: 3.0,
+        picking: false,
+    };
+    for (name, what, tool, x) in [
+        ("lightness", Tweaking::Lightness, colour, 500.0),
+        ("opacity", Tweaking::Opacity, colour, 500.0),
+        ("width", Tweaking::Width, edges, 500.0),
+        ("reach", Tweaking::Reach, Tool::Shape, 500.0),
+        ("loop-turn", Tweaking::LoopTurn, Tool::Shape, 500.0),
+        // Near the edge: the slider runs on out of view.
+        ("lightness-edge", Tweaking::Lightness, colour, 120.0),
+    ] {
+        let cache = Caches::default();
+        let mut editor = drawing.editor(&cache);
+        editor.camera = drawing.whole(size);
+        editor.tool = tool;
+        editor.brush = brush;
+        editor.proportional = Some(120.0);
+        let at = Point::new(x, 350.0);
+        let state = State {
+            tweaking: Some(Tweak { what, at, last: at }),
+            ..State::default()
+        };
+        let cursor = mouse::Cursor::Available(at);
+        let pixels = draw_frame(&mut renderer, &editor, &state, bounds, cursor, true);
+        let image =
+            image::RgbaImage::from_raw(size.width as u32, size.height as u32, pixels).unwrap();
+        let cut = image::imageops::crop_imm(&image, (x as u32).saturating_sub(320), 280, 640, 140)
+            .to_image();
+        let file = format!("{shots}/tweak-{name}.png");
+        image::DynamicImage::ImageRgba8(cut)
+            .save_with_format(&file, image::ImageFormat::Png)
+            .unwrap();
+        println!("SHOTS: {file}");
+    }
 }

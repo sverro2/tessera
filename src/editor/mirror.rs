@@ -78,6 +78,7 @@ impl Editor<'_> {
             lit: self.lit.clone(),
             page: self.page,
             grid: self.grid,
+            brush: self.brush,
             deadline: self.deadline.clone(),
         })
     }

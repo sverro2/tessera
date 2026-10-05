@@ -22,6 +22,7 @@ pub(super) struct Worker<'a> {
     clipboard: Option<&'a Piece>,
     keys: Option<&'a Keymap>,
     grid: Grid,
+    brush: crate::paint::Hsv,
     deadline: Option<std::time::Instant>,
 }
 
@@ -129,6 +130,7 @@ impl<'a> Worker<'a> {
             lit: Vec::new(),
             page: None,
             grid: self.grid,
+            brush: self.brush,
             deadline: Cell::new(self.deadline),
         }
     }
@@ -916,6 +918,7 @@ impl Editor<'_> {
             lit: self.lit.clone(),
             page: self.page,
             grid: self.grid,
+            brush: self.brush,
             deadline: self.deadline.clone(),
         }
     }
@@ -1103,6 +1106,7 @@ impl Editor<'_> {
             clipboard: self.clipboard,
             keys: self.keys,
             grid: self.grid,
+            brush: self.brush,
             deadline: self.deadline.get(),
         }
     }

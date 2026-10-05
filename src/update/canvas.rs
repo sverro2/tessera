@@ -78,20 +78,19 @@ impl Tessera {
             }
             editor::Message::TweakWidth(across) => {
                 // In proportion: fine when thin, quicker when thick.
-                self.paint.edge_width =
-                    (self.paint.edge_width * (across * 0.01).exp()).clamp(0.5, 12.0);
+                self.paint.edge_width = editor::Dial::WIDTH.moved(self.paint.edge_width, across);
                 Task::none()
             }
             editor::Message::TweakReach(across) => {
-                self.shape.reach =
-                    (self.shape.reach * (across * 0.01).exp()).clamp(REACH.0, REACH.1);
+                self.shape.reach = editor::Dial::REACH.moved(self.shape.reach, across);
                 Task::none()
             }
             editor::Message::TweakLightness(across) => {
                 // On the colour's value itself: through black and back, its
                 // hue and saturation stay.
                 if let Brush::Color(_) = self.paint.brush {
-                    self.paint.hsv.value = (self.paint.hsv.value + across * 0.004).clamp(0.0, 2.0);
+                    self.paint.hsv.value =
+                        editor::Dial::LIGHTNESS.moved(self.paint.hsv.value, across);
                     let color = self.paint.hsv.to_color();
                     self.paint.brush = Brush::Color(color);
                     self.paint.hex = paint::to_hex(color);
@@ -101,7 +100,7 @@ impl Tessera {
             editor::Message::TweakOpacity(across) => {
                 // From see-through to opaque in some 500 px.
                 if let Brush::Color(_) = self.paint.brush {
-                    let alpha = (self.paint.hsv.alpha + across * 0.002).clamp(0.0, 1.0);
+                    let alpha = editor::Dial::OPACITY.moved(self.paint.hsv.alpha, across);
                     self.paint.hsv.alpha = alpha;
                     let color = self.paint.hsv.to_color();
                     self.paint.brush = Brush::Color(color);

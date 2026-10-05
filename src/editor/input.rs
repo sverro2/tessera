@@ -894,8 +894,7 @@ impl Editor<'_> {
             let across = pos.x - tweak.last.x;
             tweak.last = pos;
             if tweak.what == Tweaking::LoopTurn {
-                let turn = (self.loop_turn(state) + across * 0.2f32.to_radians())
-                    .clamp(0.0, MAX_LOOP_TURN);
+                let turn = Dial::LOOP_TURN.moved(self.loop_turn(state), across);
                 state.loop_turn = Some(turn);
                 self.select_edge_loop(state);
                 return canvas::Action::request_redraw().and_capture();

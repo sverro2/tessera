@@ -66,6 +66,7 @@ mod mirror;
 mod painter;
 mod painting;
 mod selection;
+mod tweak;
 
 #[cfg(test)]
 mod bench;
@@ -81,6 +82,7 @@ use meshes::{Drawn, EditorView, LayerMeshes};
 use mirror::*;
 use painter::*;
 use selection::*;
+pub use tweak::Dial;
 
 /// How far (screen px) a press on the selection may wander and still be a
 /// click, letting go of it: a pen's tap rarely stays put.
@@ -372,6 +374,9 @@ pub struct Settings<'a> {
     pub page: Option<Page>,
     /// The grid points snap to, holding Ctrl.
     pub grid: Grid,
+    /// The brush's colour as the app keeps it (its lightness may go past
+    /// 1, paling): where tweaking it is.
+    pub brush: crate::paint::Hsv,
 }
 
 /// The canvas for editing the current layer of `scene`, over the backdrop
@@ -397,6 +402,7 @@ pub fn view<'a>(
         lit,
         page,
         grid,
+        brush,
     } = settings;
     EditorView::new(Editor {
         document: current.document,
@@ -416,6 +422,7 @@ pub fn view<'a>(
         lit,
         page,
         grid,
+        brush,
         deadline: Cell::new(None),
     })
     .into()
@@ -458,6 +465,8 @@ struct Editor<'a> {
     /// (e.g. a fill through crowded geometry) can't make it crawl.
     /// The grid points snap to, holding Ctrl.
     grid: Grid,
+    /// The brush's colour as the app keeps it (see [`Settings::brush`]).
+    brush: crate::paint::Hsv,
     deadline: Cell<Option<std::time::Instant>>,
 }
 
