@@ -1693,24 +1693,43 @@ fn shoot_new_triangle() {
     let world = |x: f32, y: f32| editor.camera.to_world(Point::new(x, y));
     // Off to the left of the drawing, on blank canvas.
     let (a, b) = (world(30.0, 300.0), world(110.0, 330.0));
-    for (name, interaction, cursor) in [
-        ("side", Interaction::Creating { from: a, to: b }, (110.0, 330.0)),
+    let none = keyboard::Modifiers::empty();
+    for (name, interaction, cursor, modifiers) in [
+        (
+            "side",
+            Interaction::Creating { from: a, to: b },
+            (110.0, 330.0),
+            none,
+        ),
         (
             "corner",
             Interaction::Completing { a, b, apex: b },
             (60.0, 220.0),
+            none,
         ),
         (
             "corner-over",
             Interaction::Completing { a, b, apex: b },
             (180.0, 260.0),
+            none,
+        ),
+        // With Shift, near where its sides are all as long.
+        (
+            "corner-even",
+            Interaction::Completing { a, b, apex: b },
+            (98.0, 248.0),
+            keyboard::Modifiers::SHIFT,
         ),
     ] {
         let mut state = State {
             interaction,
+            modifiers,
             ..State::default()
         };
-        editor.follow(&mut state, editor.camera.to_world(Point::new(cursor.0, cursor.1)));
+        editor.follow(
+            &mut state,
+            editor.camera.to_world(Point::new(cursor.0, cursor.1)),
+        );
         let cursor = mouse::Cursor::Available(Point::new(cursor.0, cursor.1));
         let pixels = draw_frame(&mut renderer, &editor, &state, bounds, cursor, true);
         let image =

@@ -744,7 +744,7 @@ impl Editor<'_> {
         shift: bool,
     ) -> (Point, Vec<Guide>, Vec<Guide>) {
         let (fine, near, lined) = match shift {
-            true => self.guided_corner(&[from], world),
+            true => self.guided_corner(&[from], &[], world),
             false => Default::default(),
         };
         let end = if grid {
@@ -762,8 +762,8 @@ impl Editor<'_> {
     }
 
     /// Placing the third corner of a new triangle on `a`–`b`, the cursor at
-    /// `world`: with Ctrl on the grid; with Shift lined up (level or upright
-    /// with a corner, say, or where its sides are all as long); else on a
+    /// `world`: with Ctrl on the grid; with Shift lined up (its sides as
+    /// long, or level or upright with a corner, say); else on a
     /// vertex or edge in reach; else the cursor. The first of those that
     /// works out, and what it adds; and the guides that do, and those near.
     pub(super) fn place_apex(
@@ -774,25 +774,34 @@ impl Editor<'_> {
         grid: bool,
         shift: bool,
     ) -> (Option<LinedUp>, Vec<Guide>, Vec<Guide>) {
+        // Its sides as long: the two new ones, or one as the first; all
+        // three where those cross.
+        let even = [
+            Guide::Midway { a, b },
+            Guide::AsLong { at: a, a, b },
+            Guide::AsLong { at: b, a, b },
+        ];
         let (fine, near, lined) = match shift {
-            true => self.guided_corner(&[a, b], world),
+            true => self.guided_corner(&[a, b], &even, world),
             false => Default::default(),
         };
         let candidates: Vec<Point> = if grid {
             self.grid_points(world, &|p| self.on_guide(&near, &[p]))
         } else {
             let at = self.camera.to_screen(world);
-            // With Shift, where its sides are all as long, either way.
-            let even = [equilateral(a, b)[2], equilateral(b, a)[2]]
+            // Where all three are as long, before any other crossing near.
+            let shape = |guide: Guide| guide.shape(self.document, self.camera);
+            let all_even = crossings(shape(even[0]), shape(even[1]))
                 .into_iter()
-                .filter(|&p| shift && self.camera.to_screen(p).distance(at) <= VERTEX_HIT);
+                .filter(|&p| shift && self.camera.to_screen(p).distance(at) <= GUIDE_POINT_HIT);
             let snapped: Vec<Point> = self
                 .snaps(at, |_| false, |_, _| false, &[])
                 .into_iter()
                 .map(|(_, p)| p)
                 .take(MAX_SNAPS)
                 .collect();
-            even.chain(lined.into_iter().take(2 * MAX_SNAPS))
+            all_even
+                .chain(lined.into_iter().take(2 * MAX_SNAPS))
                 .chain(snapped)
                 .chain([world])
                 .collect()
@@ -1166,14 +1175,6 @@ pub(super) fn new_triangles<'a>(
         .iter()
         .filter(move |t| !existing.contains(&key(t)))
         .copied()
-}
-
-/// Equilateral triangle with base `from`–`to`, apex to the left of the drag.
-pub(super) fn equilateral(from: Point, to: Point) -> [Point; 3] {
-    let d = to - from;
-    let mid = Point::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
-    let h = 3f32.sqrt() / 2.0;
-    [from, to, mid + Vector::new(d.y * h, -d.x * h)]
 }
 
 /// Whether among `snaps` there's something a dragged point must join up

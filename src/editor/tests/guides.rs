@@ -513,3 +513,52 @@ fn guides_come_from_the_geometry_nearest_only() {
     assert_eq!(vertices.len(), NEAREST);
     assert!(vertices.iter().all(|&v| doc.vertex(v).x < 400.0));
 }
+
+#[test]
+fn with_shift_a_new_triangle_shows_which_sides_are_as_long() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    run(&editor, &mut state, Event::Mouse(MOVE), 500.0, 400.0);
+    run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 600.0, 400.0);
+    run(&editor, &mut state, Event::Mouse(RELEASE), 600.0, 400.0);
+    run(
+        &editor,
+        &mut state,
+        hold(keyboard::Modifiers::SHIFT),
+        600.0,
+        400.0,
+    );
+    let (a, b) = (Point::new(500.0, 400.0), Point::new(600.0, 400.0));
+    let place = |state: &mut State, x: f32, y: f32| {
+        run(&editor, state, Event::Mouse(MOVE), x, y);
+        let Interaction::Completing { apex, .. } = state.interaction else {
+            panic!("{:?}", state.interaction);
+        };
+        let lit = state
+            .pending
+            .as_ref()
+            .map_or_else(Vec::new, |pending| editor.lit(state, pending));
+        (apex, lit)
+    };
+
+    // Near where all three are as long (nearer still where one is as long
+    // as the outline is steep): there, and all three say so.
+    let even = Point::new(550.0, 400.0 - 50.0 * 3f32.sqrt());
+    let (apex, lit) = place(&mut state, even.x + 4.0, even.y - 3.0);
+    assert!(apex.distance(even) < 1e-2, "{apex:?}");
+    for guide in [
+        Guide::Midway { a, b },
+        Guide::AsLong { at: a, a, b },
+        Guide::AsLong { at: b, a, b },
+    ] {
+        assert!(lit.contains(&guide), "{guide:?} not in {lit:?}");
+    }
+
+    // Off to the right: the side from the first side's end as long as it.
+    let (apex, lit) = place(&mut state, 690.0, 352.0);
+    assert!((apex.distance(b) - 100.0).abs() < 1e-2, "{apex:?}");
+    assert_eq!(lit, [Guide::AsLong { at: b, a, b }]);
+}

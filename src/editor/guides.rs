@@ -57,6 +57,12 @@ pub(super) enum Guide {
     /// From a point that's no vertex yet (where an extrusion started),
     /// square to edge `a`–`b`: extruding it straight out.
     Normal { at: Point, a: VertexId, b: VertexId },
+    /// Just as far from `a` as from `b` (a new triangle's first side): its
+    /// other two sides as long.
+    Midway { a: Point, b: Point },
+    /// As far from `at` as `a` is from `b` (a new triangle's first side,
+    /// `at` one of its ends): the side from `at` as long as that one.
+    AsLong { at: Point, a: Point, b: Point },
 }
 
 impl Guide {
@@ -89,6 +95,11 @@ impl Guide {
                 let d = b - a;
                 Shape::Line(a + d * 0.5, Vector::new(-d.y, d.x))
             }
+            Guide::Midway { a, b } => {
+                let d = b - a;
+                Shape::Line(a + d * 0.5, Vector::new(-d.y, d.x))
+            }
+            Guide::AsLong { at, a, b } => Shape::Circle(at, a.distance(b)),
         }
     }
 
@@ -104,7 +115,9 @@ impl Guide {
             | Guide::Corner { .. }
             | Guide::Level { .. }
             | Guide::Middle { .. }
-            | Guide::Axis { .. } => None,
+            | Guide::Axis { .. }
+            | Guide::Midway { .. }
+            | Guide::AsLong { .. } => None,
         }
     }
 
@@ -121,7 +134,9 @@ impl Guide {
             | Guide::Axis { .. }
             | Guide::Along { .. }
             | Guide::ParallelFrom { .. }
-            | Guide::Normal { .. } => None,
+            | Guide::Normal { .. }
+            | Guide::Midway { .. }
+            | Guide::AsLong { .. } => None,
         }
     }
 
@@ -281,20 +296,22 @@ impl Editor<'_> {
     }
 
     /// Lining up a corner of a new triangle placed at `world` (with Shift):
-    /// level or upright with each of the corners placed already (`from`)
-    /// or with the vertices there are, in line with the shapes' outlines,
-    /// or at their angle from a corner placed. The guides that do, those
-    /// near, and where it goes for each to line up, best first.
+    /// with `also`, and level or upright with each of the corners placed
+    /// already (`from`) or with the vertices there are, in line with the
+    /// shapes' outlines, or at their angle from a corner placed. The guides
+    /// that do, those near, and where it goes for each to line up, best
+    /// first.
     pub(super) fn guided_corner(
         &self,
         from: &[Point],
+        also: &[Guide],
         world: Point,
     ) -> (Vec<Guide>, Vec<Guide>, Vec<Point>) {
         let mut near_points = from.to_vec();
         near_points.push(world);
         let outlines = self.nearest_outlines(self.outlines(|_| false), &near_points);
         let vertices = self.nearest_vertices(&near_points);
-        let mut guides = Vec::new();
+        let mut guides = also.to_vec();
         for upright in [false, true] {
             for &at in from {
                 guides.push(Guide::Axis { at, upright });
@@ -662,7 +679,9 @@ impl Editor<'_> {
                 | Guide::Level { .. }
                 | Guide::Middle { .. }
                 | Guide::Axis { .. }
-                | Guide::Along { .. } => &[],
+                | Guide::Along { .. }
+                | Guide::Midway { .. }
+                | Guide::AsLong { .. } => &[],
             };
             if let Shape::Line(o, d) = shape {
                 for &way in ways {
@@ -930,6 +949,23 @@ impl Editor<'_> {
                         frame.stroke(&Path::line(screen(v), p), stroke(GUIDE, 2.0));
                         mark(frame, screen(v), p, false, 0.0);
                     }
+                    continue;
+                }
+                // A new triangle's sides as long: those from its corners
+                // to where it lines up, and its first side.
+                Guide::Midway { a, b } => {
+                    for v in [a, b] {
+                        let v = camera.to_screen(v);
+                        frame.stroke(&Path::line(v, p), stroke(GUIDE, 2.0));
+                        mark(frame, v, p, false, 0.0);
+                    }
+                    continue;
+                }
+                Guide::AsLong { at: from, a, b } => {
+                    let from = camera.to_screen(from);
+                    frame.stroke(&Path::line(from, p), stroke(GUIDE, 2.0));
+                    mark(frame, from, p, false, 0.0);
+                    mark(frame, camera.to_screen(a), camera.to_screen(b), false, 0.0);
                     continue;
                 }
                 Guide::Between { .. } => continue,
