@@ -501,3 +501,76 @@ fn a_right_click_cancels_a_drag() {
     run(&editor, &mut state, Event::Mouse(RELEASE), 50.0, 400.0);
     assert!(state.selection.is_empty());
 }
+
+#[test]
+fn ctrl_middle_drag_zooms_about_where_it_started() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+    let mut state = State::default();
+    let mut messages = vec![];
+    let events = [
+        (hold(keyboard::Modifiers::CTRL), 400.0, 300.0),
+        (
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)),
+            400.0,
+            300.0,
+        ),
+        (Event::Mouse(MOVE), 400.0, 250.0),
+        (Event::Mouse(MOVE), 450.0, 350.0),
+        (
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Middle)),
+            450.0,
+            350.0,
+        ),
+        (Event::Mouse(MOVE), 450.0, 300.0),
+    ];
+    for (event, x, y) in events {
+        let cursor = mouse::Cursor::Available(Point::new(x, y));
+        if let Some(action) = editor.update(&mut state, &event, bounds, cursor) {
+            messages.extend(action.into_inner().0);
+        }
+    }
+    let zooms: Vec<_> = messages
+        .into_iter()
+        .filter_map(|m| match m {
+            Message::Zoom { anchor, factor } => Some((anchor, factor)),
+            _ => None,
+        })
+        .collect();
+    // Up zooms in, down out; nothing after letting go.
+    let [(a, up), (b, down)] = zooms[..] else {
+        panic!("{zooms:?}");
+    };
+    assert_eq!(a, Point::new(400.0, 300.0));
+    assert_eq!(b, a);
+    assert!(up > 1.0 && down < 1.0, "{up} {down}");
+    assert!((up * down * (50.0 / ZOOM_DRAG).exp() - 1.0).abs() < 1e-5);
+}
+
+#[test]
+fn middle_drag_without_ctrl_still_pans() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+    let mut state = State::default();
+    let mut messages = vec![];
+    for (event, y) in [
+        (
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)),
+            300.0,
+        ),
+        (Event::Mouse(MOVE), 250.0),
+    ] {
+        let cursor = mouse::Cursor::Available(Point::new(400.0, y));
+        if let Some(action) = editor.update(&mut state, &event, bounds, cursor) {
+            messages.extend(action.into_inner().0);
+        }
+    }
+    assert!(
+        matches!(&messages[..], [Message::Pan(v)] if v.y == -50.0),
+        "{messages:?}"
+    );
+}

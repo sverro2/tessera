@@ -404,6 +404,7 @@ impl Editor<'_> {
             }
             Interaction::Idle
             | Interaction::Panning { .. }
+            | Interaction::Zooming { .. }
             | Interaction::MovingBackground { .. }
             | Interaction::Painting { .. }
             | Interaction::Lassoing => {}
@@ -587,6 +588,7 @@ impl Editor<'_> {
         match interaction {
             Interaction::Idle
             | Interaction::Panning { .. }
+            | Interaction::Zooming { .. }
             | Interaction::MovingBackground { .. }
             | Interaction::Painting { .. }
             | Interaction::Lassoing

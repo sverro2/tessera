@@ -759,6 +759,10 @@ impl Editor<'_> {
         }
 
         state.interaction = match button {
+            mouse::Button::Middle if state.modifiers.command() => Interaction::Zooming {
+                anchor: pos,
+                last: pos,
+            },
             mouse::Button::Middle => Interaction::Panning { last: pos },
             mouse::Button::Left if matches!(self.tool, Tool::Background { .. }) => {
                 Interaction::MovingBackground { last: pos }
@@ -906,6 +910,16 @@ impl Editor<'_> {
                 let delta = pos - *last;
                 *last = pos;
                 return canvas::Action::publish(Message::Pan(delta)).and_capture();
+            }
+            Interaction::Zooming { anchor, last } => {
+                // Up zooms in, as the wheel turned away does.
+                let factor = ((last.y - pos.y) / ZOOM_DRAG).exp();
+                *last = pos;
+                return canvas::Action::publish(Message::Zoom {
+                    anchor: *anchor,
+                    factor,
+                })
+                .and_capture();
             }
             Interaction::Lassoing => {
                 let far = state

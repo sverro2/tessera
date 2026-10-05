@@ -241,6 +241,7 @@ impl Editor<'_> {
         let pending = match state.interaction {
             Interaction::Idle
             | Interaction::Panning { .. }
+            | Interaction::Zooming { .. }
             | Interaction::MovingBackground { .. }
             | Interaction::Painting { .. } => None,
             _ => state.pending.as_ref(),
@@ -771,7 +772,7 @@ impl Editor<'_> {
                 }
                 None => {}
             },
-            (Interaction::Panning { .. }, _) => {}
+            (Interaction::Panning { .. } | Interaction::Zooming { .. }, _) => {}
             (_, Some(pending)) => {
                 let at = camera.to_screen(pending.at);
 

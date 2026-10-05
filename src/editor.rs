@@ -105,6 +105,8 @@ const SHAPE_FADE: Duration = Duration::from_millis(200);
 /// (30°), and at most (90°).
 const LOOP_TURN: f32 = std::f32::consts::FRAC_PI_6;
 const MAX_LOOP_TURN: f32 = std::f32::consts::FRAC_PI_2;
+/// How far (screen px) to drag with Ctrl and the middle button to zoom by e.
+const ZOOM_DRAG: f32 = 200.0;
 /// Rotation per wheel notch with Shift held.
 const ROTATE_STEP: f32 = 5.0 * std::f32::consts::PI / 180.0;
 
@@ -550,6 +552,12 @@ enum Interaction {
     Panning {
         last: Point,
     },
+    /// Ctrl + middle drag: zooming about `anchor` (screen) as the cursor
+    /// goes up (in) or down (out); for tablets, which have no wheel.
+    Zooming {
+        anchor: Point,
+        last: Point,
+    },
     /// Creating a triangle started at `from` (where it was pressed, or with
     /// Ctrl or Shift held, lined up from there), dragged to `to`.
     Creating {
@@ -789,6 +797,7 @@ impl canvas::Program<Message> for Editor<'_> {
             Interaction::Panning { .. } | Interaction::MovingBackground { .. } => {
                 mouse::Interaction::Grabbing
             }
+            Interaction::Zooming { .. } => mouse::Interaction::ZoomIn,
             Interaction::Idle if !cursor.is_over(bounds) || !self.editable() => {
                 mouse::Interaction::default()
             }
