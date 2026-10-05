@@ -629,6 +629,7 @@ impl Editor<'_> {
         let gridded = matches!(
             state.interaction,
             Interaction::Creating { .. }
+                | Interaction::Completing { .. }
                 | Interaction::MovingVertex { .. }
                 | Interaction::Extending { .. }
                 | Interaction::LeavingFace { .. }
@@ -683,6 +684,7 @@ impl Editor<'_> {
             && matches!(
                 state.interaction,
                 Interaction::Creating { .. }
+                    | Interaction::Completing { .. }
                     | Interaction::MovingVertex { .. }
                     | Interaction::Extending { .. }
                     | Interaction::LeavingFace { .. }
@@ -715,6 +717,22 @@ impl Editor<'_> {
             let mesh = self.mesh(triangles);
             overlay.fill(&mesh, Color { a: 0.3, ..REMOVED });
             overlay.stroke(&mesh, stroke(REMOVED, 1.5));
+        }
+        // A new triangle: its first side, so far; its third corner placed
+        // where it doesn't fit, the triangle in red.
+        match (state.interaction, pending) {
+            (Interaction::Creating { from, to }, _) => {
+                let (a, b) = (camera.to_screen(from), camera.to_screen(to));
+                overlay.stroke(&Path::line(a, b), stroke(ADDED, 2.0));
+                handle(overlay, a, ADDED);
+                handle(overlay, b, ADDED);
+            }
+            (Interaction::Completing { a, b, apex }, None) => {
+                let mesh = self.mesh(std::iter::once([a, b, apex]));
+                overlay.fill(&mesh, Color { a: 0.3, ..REMOVED });
+                overlay.stroke(&mesh, stroke(REMOVED, 1.5));
+            }
+            _ => {}
         }
         self.draw_selection(overlay, state, pending, cursor_pos);
 

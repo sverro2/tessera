@@ -182,6 +182,7 @@ impl Editor<'_> {
             if matches!(
                 state.interaction,
                 Interaction::Creating { .. }
+                    | Interaction::Completing { .. }
                     | Interaction::MovingVertex { .. }
                     | Interaction::Extending { .. }
                     | Interaction::LeavingFace { .. }
@@ -230,11 +231,16 @@ impl Editor<'_> {
     }
 
     /// Esc lets go of what's going on with the selection (grabbing,
-    /// rotating... or pasting); else of the lasso made ready; else of the
-    /// selection. Nothing to let go of: nothing.
+    /// rotating... or pasting), or of a new triangle; else of the lasso
+    /// made ready; else of the selection. Nothing to let go of: nothing.
     fn on_escape(&self, state: &mut State) -> Option<canvas::Action<Message>> {
-        let pasting = matches!(state.interaction, Interaction::Pasting { .. });
-        if state.selection.is_empty() && !state.lasso_armed && !pasting {
+        let placing = matches!(
+            state.interaction,
+            Interaction::Pasting { .. }
+                | Interaction::Creating { .. }
+                | Interaction::Completing { .. }
+        );
+        if state.selection.is_empty() && !state.lasso_armed && !placing {
             return None;
         }
         match state.interaction {
@@ -718,8 +724,10 @@ impl Editor<'_> {
             }
             let pasting = matches!(state.interaction, Interaction::Pasting { .. });
             let extruding = matches!(state.interaction, Interaction::Extruding { .. });
-            // Pasting, a click where it doesn't fit does nothing.
-            if pasting && button == mouse::Button::Left && state.pending.is_none() {
+            let completing = matches!(state.interaction, Interaction::Completing { .. });
+            // Pasting, or putting down a new triangle, a click where it
+            // doesn't fit does nothing.
+            if (pasting || completing) && button == mouse::Button::Left && state.pending.is_none() {
                 return Some(canvas::Action::request_redraw().and_capture());
             }
             let pending = state.pending.take();
@@ -1001,6 +1009,23 @@ impl Editor<'_> {
         let pending = state.pending.take();
         state.guides.clear();
         state.near_guides.clear();
+
+        // A new triangle's first side drawn: now its third corner, following
+        // the cursor until a click. Too short to tell which way: nothing.
+        if let Interaction::Creating { from, to } = finished {
+            let camera = self.camera;
+            if camera.to_screen(from).distance(camera.to_screen(to)) >= VERTEX_HIT {
+                state.interaction = Interaction::Completing {
+                    a: from,
+                    b: to,
+                    apex: to,
+                };
+                if let Some(pos) = screen {
+                    self.follow(state, camera.to_world(pos));
+                }
+            }
+            return Some(canvas::Action::request_redraw().and_capture());
+        }
 
         // A mirror where it was let go, if it's long enough to tell
         // its direction and clear of the drawing.

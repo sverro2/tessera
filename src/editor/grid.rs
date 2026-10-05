@@ -136,24 +136,6 @@ impl Editor<'_> {
             .any(|&guide| points.iter().any(|&p| self.runs_through(guide, p)))
     }
 
-    /// A new triangle started at `from`, the cursor at `world`: its dragged
-    /// corner on the grid (with `shift`, one where it or its third corner is
-    /// on a guide first).
-    pub(super) fn grid_create(&self, from: Point, world: Point, shift: bool) -> Gridded {
-        let (fine, near) = if shift {
-            let (fine, near, _) = self.guided_creation(from, world);
-            (fine, near)
-        } else {
-            Default::default()
-        };
-        let prefer = |p: Point| self.on_guide(&near, &[p, self.third_corner(from, p)]);
-        let found = self
-            .grid_points(world, &prefer)
-            .into_iter()
-            .find_map(|p| Some((p, self.create(from, p, p)?)));
-        (found, fine, near)
-    }
-
     /// Dragging vertex `id`, the cursor at `world`: onto the grid (editing
     /// proportionally, those around going along).
     pub(super) fn grid_move(&self, id: VertexId, world: Point, shift: bool) -> Gridded {

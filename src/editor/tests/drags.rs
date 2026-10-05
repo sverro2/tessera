@@ -434,7 +434,10 @@ fn a_right_click_cancels_a_drag() {
         let mut state = State::default();
         run(&editor, &mut state, Event::Mouse(PRESS), x0, y0);
         run(&editor, &mut state, Event::Mouse(MOVE), x1, y1);
-        assert!(state.pending.is_some());
+        // (A new triangle's first side makes nothing yet.)
+        assert!(
+            state.pending.is_some() || matches!(state.interaction, Interaction::Creating { .. })
+        );
         assert!(run(&editor, &mut state, right.clone(), x1, y1).is_empty());
         assert!(run(&editor, &mut state, Event::Mouse(RELEASE), x1, y1).is_empty());
         assert!(matches!(state.interaction, Interaction::Idle));
@@ -550,4 +553,67 @@ fn a_vertex_dragged_close_to_an_edge_lands_on_it_joined_up() {
         assert!((p.x - (250.0 + (300.0 - p.y) / 2.0)).abs() < 1e-3, "{p:?}");
         assert!(after.connected(1).len() > 2, "{:?}", after.triangle_ids());
     }
+}
+
+#[test]
+fn a_new_triangle_is_its_first_side_dragged_then_a_click_for_its_third_corner() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+
+    // The first side, dragged out: nothing made on letting go.
+    run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 600.0, 400.0);
+    assert!(run(&editor, &mut state, Event::Mouse(RELEASE), 600.0, 400.0).is_empty());
+
+    // The third corner follows the cursor (no button held), anywhere: not
+    // a third as long as the others, say; a click puts it down there.
+    run(&editor, &mut state, Event::Mouse(MOVE), 570.0, 470.0);
+    assert!(state.pending.is_some());
+    let edits = run(&editor, &mut state, Event::Mouse(PRESS), 570.0, 470.0);
+    assert_eq!(
+        edits,
+        [[Edit::AddTriangle {
+            corners: [
+                Point::new(500.0, 400.0),
+                Point::new(600.0, 400.0),
+                Point::new(570.0, 470.0)
+            ],
+            snap: editor.snap_distance(),
+        }]]
+    );
+    assert!(matches!(state.interaction, Interaction::Idle));
+}
+
+#[test]
+fn a_right_click_or_esc_drops_a_new_triangle_whole() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let right = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right));
+    for cancel in [right, escape()] {
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
+        run(&editor, &mut state, Event::Mouse(MOVE), 600.0, 400.0);
+        run(&editor, &mut state, Event::Mouse(RELEASE), 600.0, 400.0);
+        run(&editor, &mut state, Event::Mouse(MOVE), 550.0, 480.0);
+        assert!(run(&editor, &mut state, cancel, 550.0, 480.0).is_empty());
+        assert!(matches!(state.interaction, Interaction::Idle));
+        assert!(state.pending.is_none());
+        // A click after makes nothing either.
+        assert!(run(&editor, &mut state, Event::Mouse(PRESS), 550.0, 480.0).is_empty());
+    }
+}
+
+#[test]
+fn a_click_without_dragging_out_a_side_makes_no_triangle() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 503.0, 401.0);
+    assert!(run(&editor, &mut state, Event::Mouse(RELEASE), 503.0, 401.0).is_empty());
+    assert!(matches!(state.interaction, Interaction::Idle));
 }

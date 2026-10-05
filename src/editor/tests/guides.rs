@@ -198,8 +198,7 @@ fn with_shift_a_new_triangle_lines_up_too() {
     // Level with where it started: its base level.
     let (to, state) = create((600.0, 404.0));
     assert_eq!(to, Point::new(600.0, 400.0));
-    let lit = editor.lit(&state, state.pending.as_ref().unwrap());
-    assert!(lit.contains(&Guide::Axis {
+    assert!(state.guides.contains(&Guide::Axis {
         at: Point::new(500.0, 400.0),
         upright: false
     }));
@@ -252,7 +251,7 @@ fn shapes_apart_line_up_with_each_other() {
         580.0,
     );
     run(&editor, &mut state, Event::Mouse(MOVE), 178.0, 452.0);
-    let lit = editor.lit(&state, state.pending.as_ref().unwrap());
+    let lit = &state.guides;
     assert!(lit.contains(&Guide::Along { u: 3, v: 5 }), "{lit:?}");
 
     // A new triangle's base parallel to edge 3 5 (and as long, at the
@@ -276,9 +275,11 @@ fn shapes_apart_line_up_with_each_other() {
         end.x + 4.0,
         end.y + 3.0,
     );
-    let pending = state.pending.as_ref().unwrap();
-    assert!(pending.at.distance(end) < 1e-3, "{:?}", pending.at);
-    let lit = editor.lit(&state, pending);
+    let Interaction::Creating { to, .. } = state.interaction else {
+        panic!("{:?}", state.interaction);
+    };
+    assert!(to.distance(end) < 1e-3, "{to:?}");
+    let lit = &state.guides;
     // (Edge 0 2 of the other one runs alike: the guide is kept once.)
     assert!(
         lit.iter()
@@ -367,67 +368,81 @@ fn guides_that_would_flatten_the_shape_are_left_out() {
 }
 
 #[test]
-fn a_new_triangle_snaps_by_its_third_corner_too() {
+fn a_new_triangles_third_corner_snaps_onto_a_vertex_in_reach() {
     let doc = one();
     let cache = Caches::default();
     let editor = editor(&doc, &cache);
 
-    // From (500, 400): dragged to (484.9, 185.9), its third corner comes
-    // to (307, 306), in reach of corner 1 (300, 300); dragged to (307,
-    // 306), the dragged corner is. Either way it's welded on.
-    for (x, y) in [(484.9, 185.9), (307.0, 306.0)] {
-        let mut state = State::default();
-        run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
-        run(&editor, &mut state, Event::Mouse(MOVE), x, y);
-        let edits = run(&editor, &mut state, Event::Mouse(RELEASE), x, y);
-        let mut after = doc.clone();
-        assert!(after.apply_all(&edits[0]));
-        assert_eq!(after.vertex_count(), 5, "to ({x}, {y})");
-        assert!(after.unique_vertices().contains(&1));
-    }
+    // Its first side from (500, 400) to (500, 250); its third corner put
+    // down a few px off corner 1 (300, 300): welded on.
+    let mut state = State::default();
+    run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 500.0, 250.0);
+    assert!(run(&editor, &mut state, Event::Mouse(RELEASE), 500.0, 250.0).is_empty());
+    run(&editor, &mut state, Event::Mouse(MOVE), 304.0, 303.0);
+    let edits = run(&editor, &mut state, Event::Mouse(PRESS), 304.0, 303.0);
+    let mut after = doc.clone();
+    assert!(after.apply_all(&edits[0]));
+    assert_eq!(after.vertex_count(), 5);
+    assert!(after.unique_vertices().contains(&1));
 }
 
 #[test]
-fn with_shift_a_new_triangle_lines_up_by_its_third_corner_and_far_side() {
+fn with_shift_a_new_triangle_lines_up_by_each_corner() {
     let doc = one();
     let cache = Caches::default();
     let editor = editor(&doc, &cache);
-    let create = |to: (f32, f32)| {
-        let mut state = State::default();
-        run(&editor, &mut state, Event::Mouse(MOVE), 500.0, 400.0);
-        run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
-        run(
-            &editor,
-            &mut state,
-            hold(keyboard::Modifiers::SHIFT),
-            500.0,
-            400.0,
-        );
-        run(&editor, &mut state, Event::Mouse(MOVE), to.0, to.1);
-        let Interaction::Creating { from, to, .. } = state.interaction else {
-            panic!("{:?}", state.interaction);
-        };
-        let lit = editor.lit(&state, state.pending.as_ref().expect("lined up"));
-        (to, editor.third_corner(from, to), lit)
+    let mut state = State::default();
+    run(&editor, &mut state, Event::Mouse(MOVE), 500.0, 400.0);
+    run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
+    run(
+        &editor,
+        &mut state,
+        hold(keyboard::Modifiers::SHIFT),
+        500.0,
+        400.0,
+    );
+
+    // Its first side, drawn to (603, 404): level with where it started.
+    run(&editor, &mut state, Event::Mouse(MOVE), 603.0, 404.0);
+    let Interaction::Creating { to, .. } = state.interaction else {
+        panic!("{:?}", state.interaction);
+    };
+    assert!((to.y - 400.0).abs() < 1e-3, "{to:?}");
+    assert!(
+        state
+            .guides
+            .iter()
+            .any(|guide| matches!(guide, Guide::Axis { upright: false, .. }))
+    );
+    run(&editor, &mut state, Event::Mouse(RELEASE), 603.0, 404.0);
+    let Interaction::Completing { b, .. } = state.interaction else {
+        panic!("{:?}", state.interaction);
     };
 
-    // Dragged to (635, 440), its third corner comes to about (x, 303):
-    // level with the bottom corners instead.
-    let (_, third, lit) = create((635.0, 440.0));
-    assert!((third.y - 300.0).abs() < 1e-3, "{third:?}");
-    assert!(lit.iter().any(|guide| matches!(
-        guide,
-        Guide::Level { upright: false, .. } | Guide::Along { .. }
-    )));
+    // Its third corner at (497, 300): upright over where it started.
+    run(&editor, &mut state, Event::Mouse(MOVE), 497.0, 330.0);
+    let Interaction::Completing { apex, .. } = state.interaction else {
+        panic!("{:?}", state.interaction);
+    };
+    assert!((apex.x - 500.0).abs() < 1e-3, "{apex:?}");
 
-    // Dragged to (632, 474), its far side comes out about upright:
-    // upright.
-    let (to, third, lit) = create((632.0, 474.0));
-    assert!((third.x - to.x).abs() < 1e-2, "{to:?} {third:?}");
-    assert!(
-        lit.iter()
-            .any(|guide| matches!(guide, Guide::Across { edge: None, .. }))
+    // Near where its sides would be as long: there.
+    let even = Point::new(
+        (500.0 + b.x) / 2.0,
+        400.0 - (b.x - 500.0) * 3f32.sqrt() / 2.0,
     );
+    run(
+        &editor,
+        &mut state,
+        Event::Mouse(MOVE),
+        even.x + 4.0,
+        even.y + 3.0,
+    );
+    let Interaction::Completing { apex, .. } = state.interaction else {
+        panic!("{:?}", state.interaction);
+    };
+    assert!(apex.distance(even) < 1e-2, "{apex:?} {even:?}");
 }
 
 #[test]

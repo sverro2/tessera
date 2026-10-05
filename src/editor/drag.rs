@@ -162,28 +162,21 @@ impl Editor<'_> {
         match &mut state.interaction {
             Interaction::Creating { from, .. } => {
                 let from = *from;
-                // The corner dragged: with Ctrl on the grid; with Shift level
-                // or upright with where it starts, or with the vertices there
-                // are, and so on; else snapped.
-                let (found, mut fine, mut near) = if grid {
-                    self.grid_create(from, world, shift)
-                } else if shift {
-                    let (fine, near, found) = self.guided_creation(from, world);
-                    (
-                        found.or_else(|| self.create_snapped(from, world)),
-                        fine,
-                        near,
-                    )
-                } else {
-                    (self.create_snapped(from, world), Vec::new(), Vec::new())
-                };
+                let (to, mut fine, mut near) = self.side_end(from, world, grid, shift);
                 // And those its start lined up with.
                 fine.extend(state.start_guides.0.iter().copied());
                 near.extend(state.start_guides.1.iter().copied());
                 (state.guides, state.near_guides) = (fine, near);
-                let to = found.as_ref().map_or(world, |(at, _)| *at);
-                state.pending = found.map(|(_, pending)| pending);
+                state.pending = None;
                 state.interaction = Interaction::Creating { from, to };
+            }
+            Interaction::Completing { a, b, .. } => {
+                let (a, b) = (*a, *b);
+                let (found, fine, near) = self.place_apex(a, b, world, grid, shift);
+                (state.guides, state.near_guides) = (fine, near);
+                let apex = found.as_ref().map_or(world, |(at, _)| *at);
+                state.pending = found.map(|(_, pending)| pending);
+                state.interaction = Interaction::Completing { a, b, apex };
             }
             Interaction::MovingVertex { id, .. } if grid => {
                 let id = *id;
@@ -600,7 +593,9 @@ impl Editor<'_> {
             | Interaction::PivotingSelection { .. }
             | Interaction::Extruding { .. }
             | Interaction::Pasting { .. } => None,
-            Interaction::Creating { from, to, .. } => self.create(from, to, to),
+            // Only a side so far: nothing made yet.
+            Interaction::Creating { .. } => None,
+            Interaction::Completing { a, b, apex } => self.complete(a, b, apex),
             Interaction::MovingVertex { id, to } => self.move_to(id, to),
             Interaction::LeavingFace { edge, apex, .. } => {
                 let (a, b, start) = edge?;
@@ -725,76 +720,87 @@ impl Editor<'_> {
             .find_map(|p| self.check(vec![Edit::MoveVertex { id, to: p }], p))
     }
 
-    /// Creating a triangle dragged from `from` to `to` (placing a point
-    /// `at`): equilateral, its third corner to the left as seen.
-    pub(super) fn create(&self, from: Point, to: Point, at: Point) -> Option<Pending> {
-        // Seen mirrored, the other way round, so it's still to the left as
-        // seen.
-        let flips = self.camera.image.is_some_and(Affine::flips);
-        let corners = if flips {
-            equilateral(to, from)
-        } else {
-            equilateral(from, to)
-        };
+    /// A new triangle with corners `a`, `b` and `apex` (placed last): only
+    /// what's not covered yet, joined up.
+    pub(super) fn complete(&self, a: Point, b: Point, apex: Point) -> Option<Pending> {
         self.check(
             vec![Edit::AddTriangle {
-                corners,
+                corners: [a, b, apex],
                 snap: self.snap_distance(),
             }],
-            at,
+            apex,
         )
     }
 
-    /// Creating a triangle dragged from `from` to `to`, its dragged corner
-    /// or its third one snapped onto the best snap that works out (a
-    /// vertex, an edge), else as it is: where the drag ends up, and what
-    /// that adds. `None` if nothing works out.
-    pub(super) fn create_snapped(&self, from: Point, to: Point) -> Option<(Point, Pending)> {
-        let third = self.third_corner(from, to);
+    /// Where a new triangle's first side, started at `from`, ends with the
+    /// cursor at `world`: with Ctrl on the grid, with Shift lined up (level
+    /// or upright with its start, say); else on a vertex or edge in reach,
+    /// or the cursor. And the guides that do, and those near.
+    pub(super) fn side_end(
+        &self,
+        from: Point,
+        world: Point,
+        grid: bool,
+        shift: bool,
+    ) -> (Point, Vec<Guide>, Vec<Guide>) {
+        let (fine, near, lined) = match shift {
+            true => self.guided_corner(&[from], world),
+            false => Default::default(),
+        };
+        let end = if grid {
+            self.grid_points(world, &|p| self.on_guide(&near, &[p]))
+                .first()
+                .copied()
+        } else {
+            lined.first().copied().or_else(|| {
+                self.snaps(self.camera.to_screen(world), |_| false, |_, _| false, &[])
+                    .first()
+                    .map(|&(_, p)| p)
+            })
+        };
+        (end.unwrap_or(world), fine, near)
+    }
 
-        // Each snap as (onto a vertex, how far on screen, where the drag
-        // ends up, where the point snapped lands).
-        let mut found: Vec<(bool, f32, Point, Point)> = Vec::new();
-        for (corner, dragged) in [(to, true), (third, false)] {
-            let at = self.camera.to_screen(corner);
-            for (target, p) in self.snaps(at, |_| false, |_, _| false, &[]) {
-                let end = if dragged {
-                    p
-                } else {
-                    self.dragged_corner(from, p)
-                };
-                let distance = self.camera.to_screen(p).distance(at);
-                found.push((matches!(target, Target::Vertex(_)), distance, end, p));
-            }
-        }
-        found.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.total_cmp(&y.1)));
-
-        found
+    /// Placing the third corner of a new triangle on `a`–`b`, the cursor at
+    /// `world`: with Ctrl on the grid; with Shift lined up (level or upright
+    /// with a corner, say, or where its sides are all as long); else on a
+    /// vertex or edge in reach; else the cursor. The first of those that
+    /// works out, and what it adds; and the guides that do, and those near.
+    pub(super) fn place_apex(
+        &self,
+        a: Point,
+        b: Point,
+        world: Point,
+        grid: bool,
+        shift: bool,
+    ) -> (Option<LinedUp>, Vec<Guide>, Vec<Guide>) {
+        let (fine, near, lined) = match shift {
+            true => self.guided_corner(&[a, b], world),
+            false => Default::default(),
+        };
+        let candidates: Vec<Point> = if grid {
+            self.grid_points(world, &|p| self.on_guide(&near, &[p]))
+        } else {
+            let at = self.camera.to_screen(world);
+            // With Shift, where its sides are all as long, either way.
+            let even = [equilateral(a, b)[2], equilateral(b, a)[2]]
+                .into_iter()
+                .filter(|&p| shift && self.camera.to_screen(p).distance(at) <= VERTEX_HIT);
+            let snapped: Vec<Point> = self
+                .snaps(at, |_| false, |_, _| false, &[])
+                .into_iter()
+                .map(|(_, p)| p)
+                .take(MAX_SNAPS)
+                .collect();
+            even.chain(lined.into_iter().take(2 * MAX_SNAPS))
+                .chain(snapped)
+                .chain([world])
+                .collect()
+        };
+        let found = candidates
             .into_iter()
-            .take(MAX_SNAPS)
-            .map(|(_, _, end, p)| (end, p))
-            .chain([(to, to)])
-            .find_map(|(end, p)| Some((end, self.create(from, end, p)?)))
-    }
-
-    /// A new triangle's sixty degrees, as seen: turning its dragged corner
-    /// by minus this around where it started gives its third corner (the
-    /// other way round seen mirrored, so it's still to the left as seen).
-    pub(super) fn sixty(&self) -> f32 {
-        let flips = self.camera.image.is_some_and(Affine::flips);
-        let sign = if flips { -1.0 } else { 1.0 };
-        sign * std::f32::consts::FRAC_PI_3
-    }
-
-    /// The third corner of a new triangle dragged from `from` to `to`.
-    pub(super) fn third_corner(&self, from: Point, to: Point) -> Point {
-        from + turn(to - from, -self.sixty())
-    }
-
-    /// Where a new triangle started at `from` is dragged to for its third
-    /// corner to be at `third`.
-    pub(super) fn dragged_corner(&self, from: Point, third: Point) -> Point {
-        from + turn(third - from, self.sixty())
+            .find_map(|p| Some((p, self.complete(a, b, p)?)));
+        (found, fine, near)
     }
 
     /// Dragging from edge `a`–`b` (grabbed at `start`) to `apex`. On a side of
@@ -1131,12 +1137,6 @@ pub(super) fn longest_edge([a, b, c]: [Point; 3]) -> (Point, Point) {
         .into_iter()
         .max_by(|x, y| x.0.distance(x.1).total_cmp(&y.0.distance(y.1)))
         .unwrap()
-}
-
-/// `v` turned by `angle` (radians).
-pub(super) fn turn(v: Vector, angle: f32) -> Vector {
-    let (sin, cos) = angle.sin_cos();
-    Vector::new(v.x * cos - v.y * sin, v.x * sin + v.y * cos)
 }
 
 pub(super) fn dot(a: Vector, b: Vector) -> f32 {

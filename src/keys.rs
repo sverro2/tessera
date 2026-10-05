@@ -230,7 +230,7 @@ impl Action {
 
 /// What the mouse does with keys held: not changed here, but shown in the
 /// lookup, by where it works.
-pub const GESTURES: [(Context, &str, &str); 10] = [
+pub const GESTURES: [(Context, &str, &str); 12] = [
     (
         Context::Global,
         "Esc",
@@ -238,7 +238,17 @@ pub const GESTURES: [(Context, &str, &str); 10] = [
     ),
     (Context::Global, "Middle-drag", "Pan"),
     (Context::Global, "Wheel", "Zoom"),
+    (
+        Context::Global,
+        "Ctrl+middle-drag",
+        "Zoom (up: in), as on a drawing tablet",
+    ),
     (Context::Global, "Shift+wheel", "Rotate the view"),
+    (
+        Context::Shape,
+        "Drag on blank canvas, then click",
+        "New triangle: its first side, then its third corner",
+    ),
     (
         Context::Shape,
         "Shift+click",
@@ -257,7 +267,7 @@ pub const GESTURES: [(Context, &str, &str); 10] = [
     (
         Context::Shape,
         "Right-click",
-        "Cancel a drag, or grabbing, rotating, scaling, extruding or pasting",
+        "Cancel a drag, a new triangle, or grabbing, rotating, scaling, extruding or pasting",
     ),
     (Context::Paint, "Ctrl+click", "Pick up a colour"),
     (Context::Paint, "Click or drag", "Paint"),

@@ -573,11 +573,19 @@ enum Interaction {
         anchor: Point,
         last: Point,
     },
-    /// Creating a triangle started at `from` (where it was pressed, or with
-    /// Ctrl or Shift held, lined up from there), dragged to `to`.
+    /// Drawing a new triangle's first side: from `from` (where it was
+    /// pressed, or with Ctrl or Shift held, lined up from there) to `to`.
+    /// Let go, its third corner is placed (see `Completing`).
     Creating {
         from: Point,
         to: Point,
+    },
+    /// A new triangle's first side drawn (`a`–`b`): its third corner at
+    /// `apex`, following the cursor, until a click puts it down.
+    Completing {
+        a: Point,
+        b: Point,
+        apex: Point,
     },
     MovingVertex {
         id: VertexId,
@@ -679,6 +687,7 @@ impl Interaction {
                 | Interaction::PivotingSelection { .. }
                 | Interaction::Extruding { .. }
                 | Interaction::Pasting { .. }
+                | Interaction::Completing { .. }
         )
     }
 }

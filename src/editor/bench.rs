@@ -307,11 +307,12 @@ fn bench_suite() {
             editor.extrude(&all, Vector::new(0.0, -60.0), Point::new(100.0, -10.0))
         });
         let from = Point::new(side + 60.0, 100.0);
+        let b = from + Vector::new(60.0, 0.0);
         time(&label("guided creation (Shift)"), runs, || {
-            editor.guided_creation(from, Point::new(side + 120.0, 140.0))
+            editor.place_apex(from, b, Point::new(side + 120.0, 140.0), false, true)
         });
         time(&label("grid creation (Ctrl)"), runs, || {
-            editor.grid_create(from, Point::new(side + 123.0, 137.0), false)
+            editor.place_apex(from, b, Point::new(side + 123.0, 137.0), true, false)
         });
         let mut layers = crate::layers::Layers::default();
         let id = layers.first_layer();
@@ -409,8 +410,9 @@ fn bench_guided() {
     let editor = super::tests::editor(&doc, &cache);
     let side = 50.0 + 39.0 * 40.0;
     let from = Point::new(side + 60.0, 100.0);
+    let b = from + Vector::new(60.0, 0.0);
     time("3042 tris: guided creation", 400, || {
-        editor.guided_creation(from, Point::new(side + 120.0, 140.0))
+        editor.place_apex(from, b, Point::new(side + 120.0, 140.0), false, true)
     });
 }
 
@@ -1658,6 +1660,63 @@ fn shoot_tweaks() {
         let cut = image::imageops::crop_imm(&image, (x as u32).saturating_sub(320), 280, 640, 140)
             .to_image();
         let file = format!("{shots}/tweak-{name}.png");
+        image::DynamicImage::ImageRgba8(cut)
+            .save_with_format(&file, image::ImageFormat::Png)
+            .unwrap();
+        println!("SHOTS: {file}");
+    }
+}
+
+/// A new triangle on its way, over `TESSERA_BENCH`: its first side being
+/// dragged out, its third corner placed where it fits and where it
+/// doesn't, into `TESSERA_SHOTS`. Run with `TESSERA_BENCH=drawing.tessera
+/// TESSERA_SHOTS=dir cargo test --release shoot_new_triangle -- --ignored
+/// --nocapture`.
+#[test]
+#[ignore = "writes files; needs a drawing and a GPU"]
+fn shoot_new_triangle() {
+    let Ok(shots) = std::env::var("TESSERA_SHOTS") else {
+        return;
+    };
+    let Some(drawing) = Drawing::open() else {
+        return;
+    };
+    let Some(mut renderer) = headless_renderer() else {
+        println!("SHOTS: no GPU");
+        return;
+    };
+    let size = iced::Size::new(1000.0, 700.0);
+    let bounds = Rectangle::new(Point::ORIGIN, size);
+    let cache = Caches::default();
+    let mut editor = drawing.editor(&cache);
+    editor.camera = drawing.whole(size);
+    let world = |x: f32, y: f32| editor.camera.to_world(Point::new(x, y));
+    // Off to the left of the drawing, on blank canvas.
+    let (a, b) = (world(30.0, 300.0), world(110.0, 330.0));
+    for (name, interaction, cursor) in [
+        ("side", Interaction::Creating { from: a, to: b }, (110.0, 330.0)),
+        (
+            "corner",
+            Interaction::Completing { a, b, apex: b },
+            (60.0, 220.0),
+        ),
+        (
+            "corner-over",
+            Interaction::Completing { a, b, apex: b },
+            (180.0, 260.0),
+        ),
+    ] {
+        let mut state = State {
+            interaction,
+            ..State::default()
+        };
+        editor.follow(&mut state, editor.camera.to_world(Point::new(cursor.0, cursor.1)));
+        let cursor = mouse::Cursor::Available(Point::new(cursor.0, cursor.1));
+        let pixels = draw_frame(&mut renderer, &editor, &state, bounds, cursor, true);
+        let image =
+            image::RgbaImage::from_raw(size.width as u32, size.height as u32, pixels).unwrap();
+        let cut = image::imageops::crop_imm(&image, 0, 150, 400, 260).to_image();
+        let file = format!("{shots}/new-triangle-{name}.png");
         image::DynamicImage::ImageRgba8(cut)
             .save_with_format(&file, image::ImageFormat::Png)
             .unwrap();
