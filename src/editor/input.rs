@@ -163,6 +163,14 @@ impl Editor<'_> {
                 }
                 // What it does here, as the user has it.
                 let action = self.pressed(key, *physical_key, *modifiers)?;
+                // Undo, in the middle of something: cancels that, as a right
+                // click does (rather than undoing the step before).
+                if action == Action::Undo
+                    && (dragging(state.interaction) || state.interaction.is_transforming())
+                {
+                    cancel(state);
+                    return Some(canvas::Action::request_redraw().and_capture());
+                }
                 self.on_action(state, action, *repeat, inside, screen)
             }
         }
@@ -695,25 +703,8 @@ impl Editor<'_> {
         }
         // Mid-drag, a right click cancels it: all is as it was, and letting
         // go of the left button then does nothing.
-        if button == mouse::Button::Right
-            && matches!(
-                state.interaction,
-                Interaction::Creating { .. }
-                    | Interaction::MovingVertex { .. }
-                    | Interaction::Extending { .. }
-                    | Interaction::LeavingFace { .. }
-                    | Interaction::MovingSelection { held: true, .. }
-                    | Interaction::Lassoing
-                    | Interaction::PlacingMirror { .. }
-                    | Interaction::Painting { .. }
-            )
-        {
-            state.interaction = Interaction::Idle;
-            state.pending = None;
-            state.aim = None;
-            state.lasso.clear();
-            state.stroke.clear();
-            state.edge_stroke.clear();
+        if button == mouse::Button::Right && dragging(state.interaction) {
+            cancel(state);
             return Some(canvas::Action::request_redraw().and_capture());
         }
         // Grabbed, rotating or scaling, the selection follows the cursor: a
@@ -1187,4 +1178,29 @@ pub(super) fn as_seen(
                 .map(move |image| image.apply(document.vertex(v)))
         })
         .collect()
+}
+
+/// Whether a drag is under way that a right click cancels.
+fn dragging(interaction: Interaction) -> bool {
+    matches!(
+        interaction,
+        Interaction::Creating { .. }
+            | Interaction::MovingVertex { .. }
+            | Interaction::Extending { .. }
+            | Interaction::LeavingFace { .. }
+            | Interaction::MovingSelection { held: true, .. }
+            | Interaction::Lassoing
+            | Interaction::PlacingMirror { .. }
+            | Interaction::Painting { .. }
+    )
+}
+
+/// What's going on, cancelled: all is as it was.
+fn cancel(state: &mut State) {
+    state.interaction = Interaction::Idle;
+    state.pending = None;
+    state.aim = None;
+    state.lasso.clear();
+    state.stroke.clear();
+    state.edge_stroke.clear();
 }

@@ -607,6 +607,43 @@ fn a_right_click_or_esc_drops_a_new_triangle_whole() {
 }
 
 #[test]
+fn undo_while_making_a_triangle_cancels_it_and_undoes_nothing_else() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+    let cursor = mouse::Cursor::Available(Point::new(560.0, 440.0));
+    // Ctrl+Z: whether the canvas keeps it (from the app, which would undo).
+    let undo = |state: &mut State| {
+        editor
+            .update(state, &ctrl('z'), bounds, cursor)
+            .is_some_and(|action| action.into_inner().2 == iced::event::Status::Captured)
+    };
+
+    // Dragging out its first side, then placing its third corner.
+    for placing in [false, true] {
+        let mut state = State::default();
+        run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 400.0);
+        run(&editor, &mut state, Event::Mouse(MOVE), 600.0, 400.0);
+        if placing {
+            run(&editor, &mut state, Event::Mouse(RELEASE), 600.0, 400.0);
+            run(&editor, &mut state, Event::Mouse(MOVE), 560.0, 440.0);
+            assert!(state.pending.is_some());
+        }
+        assert!(undo(&mut state));
+        assert!(matches!(state.interaction, Interaction::Idle));
+        assert!(state.pending.is_none());
+        // Letting go, or a click, after makes nothing.
+        assert!(run(&editor, &mut state, Event::Mouse(RELEASE), 560.0, 440.0).is_empty());
+        assert!(run(&editor, &mut state, Event::Mouse(PRESS), 560.0, 440.0).is_empty());
+        assert!(run(&editor, &mut state, Event::Mouse(RELEASE), 560.0, 440.0).is_empty());
+
+        // Nothing going on: it's the app's, to undo.
+        assert!(!undo(&mut state));
+    }
+}
+
+#[test]
 fn a_click_without_dragging_out_a_side_makes_no_triangle() {
     let doc = one();
     let cache = Caches::default();
