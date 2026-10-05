@@ -1045,6 +1045,20 @@ fn new_asks_before_losing_changes() {
 }
 
 #[test]
+fn new_drawing_starts_in_the_shape_mode() {
+    let mut app = Tessera::default();
+    edit(&mut app, 0.0);
+    let _ = app.update(Message::SetMode(Mode::Paint));
+    let _ = app.update(Message::File(FileMessage::Replace(Replace::New)));
+    assert_eq!(app.mode, Mode::Shape);
+
+    // Also when the canvas is blank already.
+    let _ = app.update(Message::SetMode(Mode::Paint));
+    let _ = app.update(Message::File(FileMessage::New));
+    assert_eq!(app.mode, Mode::Shape);
+}
+
+#[test]
 fn saved_changes_need_no_asking() {
     let mut app = Tessera::default();
     edit(&mut app, 0.0);

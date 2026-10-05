@@ -34,9 +34,9 @@ impl Tessera {
         match message {
             FileMessage::New => {
                 self.dialogs.menu = None;
-                // A blank canvas is new already.
+                // A blank canvas is new already, but starts in the shape mode.
                 if self.is_blank() {
-                    return Task::none();
+                    return self.update(Message::SetMode(Mode::Shape));
                 }
                 self.replace(Replace::New)
             }
@@ -98,6 +98,8 @@ impl Tessera {
                 self.layers_panel.focus = None;
                 self.backgrounds.editing = false;
                 self.backgrounds.saved = self.backgrounds.version;
+                // There's nothing to paint yet.
+                let _ = self.update(Message::SetMode(Mode::Shape));
                 self.view_changed()
             }
             FileMessage::Replace(Replace::Open) => Task::perform(open_file(), |value| {
