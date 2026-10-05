@@ -31,6 +31,7 @@ pub(crate) mod cells;
 mod edit;
 mod fill;
 mod loops;
+mod merge;
 mod mirror;
 mod quick;
 
@@ -131,6 +132,22 @@ pub enum Edit {
     /// Add a piece of drawing as it is (pasted), joined up where its
     /// corners land on vertices. Rejected if it overlaps anything.
     Paste { piece: Piece },
+    /// Carry out `edit` (moving vertices, or pasting), and where what it
+    /// moved or pasted lands over the drawing, merge it in: it stays as it
+    /// is, on top, and the faces under it are cut away round it, filled in
+    /// again where they still show (joined up at new vertices where they
+    /// cross it; within `snap`, world units, things count as touching, as
+    /// for [`Edit::AddTriangle`]). Faces some of whose corners moved
+    /// (stretched, or folded over), and those of the moved ones not all of
+    /// whose corners are among `held` (if any: the selection, which the
+    /// rest only goes along with, editing proportionally), are made again
+    /// if need be, keeping their vertices. Rejected if what's carried
+    /// whole folds over itself.
+    Merging {
+        edit: Box<Edit>,
+        snap: f32,
+        held: Vec<VertexId>,
+    },
     /// Paint a face this colour; `None` clears it.
     Paint {
         triangle: TriangleId,
@@ -146,6 +163,25 @@ pub enum Edit {
     PaintAll { color: Option<Color> },
     /// Paint every edge this style; `None` clears them all.
     PaintAllEdges { style: Option<EdgeStyle> },
+}
+
+impl Edit {
+    /// The edit carried out: what's merged, else itself.
+    pub fn inner(&self) -> &Edit {
+        match self {
+            Edit::Merging { edit, .. } => edit.inner(),
+            edit => edit,
+        }
+    }
+
+    /// The vertices it moves.
+    fn moved(&self) -> Vec<VertexId> {
+        match self.inner() {
+            Edit::MoveVertex { id, .. } => vec![*id],
+            Edit::MoveVertices { moves } => moves.iter().map(|&(id, _)| id).collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// A piece of a drawing, apart from it (copied): its triangles' corners
@@ -199,6 +235,9 @@ pub struct Changes {
     pub squashed: Vec<[VertexId; 3]>,
     /// Existing vertices that added triangles attach to.
     pub attached: Vec<VertexId>,
+    /// Whether merging (see [`Edit::Merging`]) cleared anything away: if
+    /// not, it was just the edit merged.
+    pub merged: bool,
 }
 
 impl Changes {
@@ -476,14 +515,10 @@ impl Document {
 
         for edit in edits {
             let mut next = document.clone();
-            let moved: Vec<VertexId> = match edit {
-                Edit::MoveVertex { id, .. } => vec![*id],
-                Edit::MoveVertices { moves } => moves.iter().map(|&(id, _)| id).collect(),
-                _ => Vec::new(),
-            };
+            let moved = edit.moved();
             // A pasted piece's faces, as they were copied (see
             // `is_valid_after`).
-            let pasted: QuickSet<[(u32, u32); 3]> = match edit {
+            let pasted: QuickSet<[(u32, u32); 3]> = match edit.inner() {
                 Edit::Paste { piece } => piece
                     .triangles
                     .iter()
@@ -491,9 +526,23 @@ impl Document {
                     .collect(),
                 _ => QuickSet::default(),
             };
-            let valid = next.apply_unchecked(edit.clone(), &mut changes, deadline)
-                && next.normalize(&moved, &mut changes, &document)
-                && next.is_valid_after(&document, &pasted);
+            let valid = match edit {
+                Edit::Merging { edit, snap, held } => next.merge(
+                    edit,
+                    *snap,
+                    held,
+                    &moved,
+                    &pasted,
+                    &mut changes,
+                    &document,
+                    deadline,
+                ),
+                _ => {
+                    next.apply_unchecked(edit.clone(), &mut changes, deadline)
+                        && next.normalize(&moved, &mut changes, &document)
+                        && next.is_valid_after(&document, &pasted)
+                }
+            };
             if !valid {
                 return None;
             }

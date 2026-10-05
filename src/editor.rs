@@ -89,8 +89,8 @@ const CLICK_SLOP: f32 = 8.0;
 const VERTEX_HIT: f32 = 10.0;
 /// Screen-space distance within which an edge is grabbed.
 const EDGE_HIT: f32 = 7.0;
-/// Minimum height (screen px) of any triangle we create; thinner slivers
-/// would be invisible and impossible to grab.
+/// How close (screen px) things come before counting as touching, joined
+/// up: snapped together, rather than left a sliver apart.
 const MIN_THICKNESS: f32 = 5.0;
 /// Height (screen px) under which a triangle counts as flat: too thin even
 /// for an extrusion, which may otherwise make slivers rather than holes.

@@ -1250,3 +1250,345 @@ fn bench_whole_shape() {
         );
     }
 }
+
+/// Merging a patch of `testdata/grid-12k.tessera` into it, half a cell off:
+/// pasted over the middle. Run with
+/// `cargo test --release bench_merge -- --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark: slow, and needs the generated drawings"]
+fn bench_merge() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/grid-12k.tessera");
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let contents = crate::file::open(&bytes).unwrap();
+    let doc = &contents.layers.layers()[0].document;
+    let cache = Caches::default();
+    let mut editor = super::tests::editor(doc, &cache);
+    editor.camera = contents.camera;
+    let centre = Point::new(1185.0, 1185.0);
+    for reach in [30.0, 80.0] {
+        let patch: Vec<VertexId> = doc
+            .unique_vertices()
+            .into_iter()
+            .filter(|&v| doc.vertex(v).distance(centre) < reach)
+            .collect();
+        let piece = doc.piece(&patch);
+        let label = format!("12482 tris: {} pasted over, merged", piece.triangles.len());
+        let edit = editor.merging(Edit::Paste {
+            piece: piece.moved(Vector::new(7.0, 5.0)),
+        });
+        println!(
+            "BENCH-INFO {} works: {}",
+            label,
+            doc.preview(std::slice::from_ref(&edit)).is_some()
+        );
+        time(&label, 3, || doc.preview(std::slice::from_ref(&edit)));
+        // For comparison: clear of everything, nothing to merge.
+        let clear = Edit::Paste {
+            piece: piece.moved(Vector::new(5000.0, 0.0)),
+        };
+        let label = format!("12482 tris: {} pasted clear", piece.triangles.len());
+        time(&label, 3, || doc.preview(std::slice::from_ref(&clear)));
+    }
+}
+
+/// Square grids of a growing size moved over another, off its own grid,
+/// merged: how long the canvas takes, and whether it works out (else why
+/// not). Run with `cargo test --release bench_merge_sizes -- --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark: slow"]
+fn bench_merge_sizes() {
+    for k in [2, 4, 8, 16, 32] {
+        let mut doc = grid(30, 20.0);
+        // A k by k grid of cells, apart from it on the right.
+        let size = 23.0;
+        let p = |i: usize, j: usize| Point::new(1000.0 + i as f32 * size, 100.0 + j as f32 * size);
+        for i in 0..k {
+            for j in 0..k {
+                for corners in [
+                    [p(i, j), p(i + 1, j), p(i, j + 1)],
+                    [p(i + 1, j), p(i + 1, j + 1), p(i, j + 1)],
+                ] {
+                    doc.apply(Edit::AddTriangle { corners, snap: 0.0 });
+                }
+            }
+        }
+        let cache = Caches::default();
+        let editor = super::tests::editor(&doc, &cache);
+        let moving: Vec<VertexId> = doc
+            .unique_vertices()
+            .into_iter()
+            .filter(|&v| doc.vertex(v).x >= 1000.0)
+            .collect();
+        let by = Vector::new(-700.0, 7.0);
+        let start = T::now();
+        let found = editor.transform(&moving, Point::ORIGIN, |p, w| p + by * w);
+        let took = start.elapsed();
+        let why = if found.is_some() {
+            "ok".to_string()
+        } else {
+            let moves = moving.iter().map(|&v| (v, doc.vertex(v) + by)).collect();
+            let edit = editor.merging(Edit::MoveVertices { moves });
+            match doc.preview(std::slice::from_ref(&edit)) {
+                None => "the document turned it down".to_string(),
+                Some((after, _)) => {
+                    let n = doc.vertex_slots();
+                    let thin: Vec<_> = after
+                        .triangle_ids()
+                        .iter()
+                        .filter(|t| doc.find_triangle(**t).is_none() || t.iter().any(|&v| v >= n))
+                        .map(|t| t.map(|v| after.vertex(v)))
+                        .filter(|&t| crate::geometry::min_height(t) < MIN_THICKNESS)
+                        .collect();
+                    format!("the canvas turned it down: thin {thin:?}")
+                }
+            }
+        };
+        println!("BENCH {} tris moved over: {took:?}, {why}", 2 * k * k);
+    }
+}
+
+/// The parts of merging a 16 by 16 grid over another (see
+/// [`bench_merge_sizes`]). Run with
+/// `cargo test --release bench_merge_parts -- --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark: slow"]
+fn bench_merge_parts() {
+    let k = 16;
+    let mut doc = grid(30, 20.0);
+    let size = 23.0;
+    let p = |i: usize, j: usize| Point::new(1000.0 + i as f32 * size, 100.0 + j as f32 * size);
+    for i in 0..k {
+        for j in 0..k {
+            for corners in [
+                [p(i, j), p(i + 1, j), p(i, j + 1)],
+                [p(i + 1, j), p(i + 1, j + 1), p(i, j + 1)],
+            ] {
+                doc.apply(Edit::AddTriangle { corners, snap: 0.0 });
+            }
+        }
+    }
+    let moving: Vec<VertexId> = doc
+        .unique_vertices()
+        .into_iter()
+        .filter(|&v| doc.vertex(v).x >= 1000.0)
+        .collect();
+    let by = Vector::new(-700.0, 7.0);
+    let moves: Vec<_> = moving.iter().map(|&v| (v, doc.vertex(v) + by)).collect();
+    let plain = Edit::MoveVertices { moves };
+    let merging = Edit::Merging {
+        edit: Box::new(plain.clone()),
+        snap: 5.0,
+        held: Vec::new(),
+    };
+    time("512 tris: plain move (turned down)", 5, || {
+        doc.preview_shape_until(std::slice::from_ref(&plain), None)
+    });
+    time("512 tris: merged, shape only", 5, || {
+        doc.preview_shape_until(std::slice::from_ref(&merging), None)
+    });
+    let (shaped, _) = doc
+        .preview_shape_until(std::slice::from_ref(&merging), None)
+        .unwrap();
+    time("512 tris: merged, painting it", 5, || {
+        let mut shaped = shaped.clone();
+        doc.paint_after(&merging, &mut shaped);
+        shaped
+    });
+}
+
+/// How often a grid moved over another merges, over many places it may
+/// land. Run with `cargo test --release merge_acceptance -- --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark: slow"]
+fn merge_acceptance() {
+    let k = 8;
+    let mut doc = grid(30, 20.0);
+    let size = 23.0;
+    let p = |i: usize, j: usize| Point::new(1000.0 + i as f32 * size, 100.0 + j as f32 * size);
+    for i in 0..k {
+        for j in 0..k {
+            for corners in [
+                [p(i, j), p(i + 1, j), p(i, j + 1)],
+                [p(i + 1, j), p(i + 1, j + 1), p(i, j + 1)],
+            ] {
+                doc.apply(Edit::AddTriangle { corners, snap: 0.0 });
+            }
+        }
+    }
+    let cache = Caches::default();
+    let editor = super::tests::editor(&doc, &cache);
+    let moving: Vec<VertexId> = doc
+        .unique_vertices()
+        .into_iter()
+        .filter(|&v| doc.vertex(v).x >= 1000.0)
+        .collect();
+    let (mut ok, mut all) = (0, 0);
+    for dx in 0..20 {
+        for dy in 0..20 {
+            let by = Vector::new(-700.0 + dx as f32 * 1.3, 7.0 + dy as f32 * 1.7);
+            all += 1;
+            if editor
+                .transform(&moving, Point::ORIGIN, |p, w| p + by * w)
+                .is_some()
+            {
+                ok += 1;
+            }
+        }
+    }
+    println!("BENCH merges {ok} of {all}");
+}
+
+/// Each shape of each layer of `TESSERA_BENCH` moved over the next on its
+/// layer (centre onto centre), merged: whether that works out, else why.
+/// Run with `TESSERA_BENCH=drawing.tessera cargo test --release
+/// merge_shapes -- --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark: needs a drawing"]
+fn merge_shapes() {
+    let Ok(path) = std::env::var("TESSERA_BENCH") else {
+        return;
+    };
+    let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
+    for layer in contents.layers.layers() {
+        let doc = &layer.document;
+        // Its shapes: the vertices of each part connected.
+        let mut shapes: Vec<Vec<VertexId>> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for v in doc.unique_vertices() {
+            if seen.contains(&v) {
+                continue;
+            }
+            let mut shape: Vec<VertexId> = doc.connected(v).into_iter().flatten().collect();
+            shape.sort_unstable();
+            shape.dedup();
+            seen.extend(shape.iter().copied());
+            shapes.push(shape);
+        }
+        let cache = Caches::default();
+        let mut editor = super::tests::editor(doc, &cache);
+        editor.camera = contents.camera;
+        let centre = |shape: &[VertexId]| {
+            let n = shape.len() as f32;
+            let sum = shape
+                .iter()
+                .fold(Vector::ZERO, |s, &v| s + (doc.vertex(v) - Point::ORIGIN));
+            Point::ORIGIN + sum * (1.0 / n)
+        };
+        println!(
+            "LAYER {} ({} tris, {} shapes, zoom {})",
+            layer.name,
+            doc.triangle_ids().len(),
+            shapes.len(),
+            editor.camera.zoom
+        );
+        for i in 0..shapes.len().min(12) {
+            let j = (i + 1) % shapes.len();
+            if i == j {
+                continue;
+            }
+            let by = centre(&shapes[j]) - centre(&shapes[i]);
+            let start = T::now();
+            let found = editor.transform(&shapes[i], Point::ORIGIN, |p, w| p + by * w);
+            let took = start.elapsed();
+            let why = if found.is_some() {
+                "ok".to_string()
+            } else {
+                let moves = shapes[i].iter().map(|&v| (v, doc.vertex(v) + by)).collect();
+                let edit = editor.merging(Edit::MoveVertices { moves });
+                match doc.preview(std::slice::from_ref(&edit)) {
+                    None => "the document turned it down".to_string(),
+                    Some((after, _)) => {
+                        let n = doc.vertex_slots();
+                        let thinnest = after
+                            .triangle_ids()
+                            .iter()
+                            .filter(|t| {
+                                doc.find_triangle(**t).is_none() || t.iter().any(|&v| v >= n)
+                            })
+                            .map(|t| {
+                                crate::geometry::min_height(
+                                    t.map(|v| editor.camera.to_screen(after.vertex(v))),
+                                )
+                            })
+                            .fold(f32::INFINITY, f32::min);
+                        format!("the canvas turned it down: thinnest new {thinnest} px")
+                    }
+                }
+            };
+            println!(
+                "  shape {i} ({} vertices) onto {j}: {took:?}, {why}",
+                shapes[i].len()
+            );
+        }
+    }
+}
+
+/// Vertices in clusters of each layer of `TESSERA_BENCH` rotated by many
+/// angles (as R does), merged: none may crash, and how many work out. Run
+/// with `TESSERA_BENCH=drawing.tessera cargo test --release
+/// merge_rotations -- --ignored --nocapture`.
+#[test]
+#[ignore = "a benchmark: needs a drawing"]
+fn merge_rotations() {
+    let Ok(path) = std::env::var("TESSERA_BENCH") else {
+        return;
+    };
+    let contents = crate::file::open(&std::fs::read(path).unwrap()).unwrap();
+    let (mut ok, mut all) = (0, 0);
+    let mut slowest = std::time::Duration::ZERO;
+    for layer in contents.layers.layers() {
+        let doc = &layer.document;
+        let vertices = doc.unique_vertices();
+        if vertices.is_empty() {
+            continue;
+        }
+        let cache = Caches::default();
+        let mut editor = super::tests::editor(doc, &cache);
+        editor.camera = contents.camera;
+        // Editing proportionally too, if asked: reaching that far (px).
+        editor.proportional = std::env::var("MERGE_REACH")
+            .ok()
+            .and_then(|reach| reach.parse().ok());
+        for k in 0..6 {
+            let centre = doc.vertex(vertices[(k * 7919) % vertices.len()]);
+            for reach in [25.0, 60.0, 150.0] {
+                let selection: Vec<VertexId> = vertices
+                    .iter()
+                    .copied()
+                    .filter(|&v| doc.vertex(v).distance(centre) < reach)
+                    .collect();
+                for step in 1..12 {
+                    // Only this one, again and again: to profile it.
+                    if let Ok(focus) = std::env::var("MERGE_FOCUS")
+                        && focus != format!("{} {k} {reach} {step}", layer.name)
+                    {
+                        continue;
+                    }
+                    let angle = step as f32 * 0.29;
+                    let (sin, cos) = angle.sin_cos();
+                    let start = T::now();
+                    let found = editor.transform(&selection, centre, |p, w| {
+                        let d = p - centre;
+                        let turned =
+                            centre + Vector::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos);
+                        p + (turned - p) * w
+                    });
+                    slowest = slowest.max(start.elapsed());
+                    if std::env::var("SIZES").is_ok() && start.elapsed().as_millis() > 20 {
+                        println!(
+                            "SLOW {} k {k} reach {reach} step {step}: {} {:?}",
+                            layer.name,
+                            selection.len(),
+                            start.elapsed()
+                        );
+                    }
+                    all += 1;
+                    ok += usize::from(found.is_some());
+                }
+            }
+        }
+    }
+    println!("BENCH rotations: {ok} of {all} work out, slowest {slowest:?}");
+}

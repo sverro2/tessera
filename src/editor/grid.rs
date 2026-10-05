@@ -102,7 +102,7 @@ impl Editor<'_> {
     /// Where what `pending` places ends up (world): the selection moved,
     /// a piece pasted, an extrusion's far ends; else the point dragged.
     pub(super) fn placed(&self, state: &State, pending: &Pending) -> Vec<Point> {
-        let pasted = match pending.edits.first() {
+        let pasted = match pending.edits.first().map(Edit::inner) {
             Some(Edit::Paste { piece }) => Some(piece),
             _ => None,
         };
@@ -228,7 +228,7 @@ impl Editor<'_> {
             .into_iter()
             .find_map(|snap| {
                 let piece = piece.moved(by + snap);
-                self.check(vec![Edit::Paste { piece }], world)
+                self.check(vec![self.merging(Edit::Paste { piece })], world)
             })
     }
 

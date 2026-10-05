@@ -160,6 +160,14 @@ impl Document {
         if shaped.triangles == self.triangles {
             return;
         }
+        // Merged: painted as it landed, then its pieces as they lay.
+        if let Edit::Merging { edit, .. } = edit {
+            let mut landed = self.clone();
+            if landed.apply_unchecked((**edit).clone(), &mut Changes::default(), None) {
+                self.paint_merged(&landed, shaped);
+            }
+            return;
+        }
         // A mirror image takes its paint from what it mirrors; a pasted
         // piece brings its own.
         let added;
@@ -257,6 +265,8 @@ impl Document {
                 };
                 true
             }
+            // Carried out by `merge`.
+            Edit::Merging { .. } => false,
             Edit::PaintAll { color } => {
                 self.colors = match color {
                     Some(color) => self.triangles.iter().map(|&t| (key(t), color)).collect(),
@@ -661,16 +671,25 @@ impl Document {
         let changed_bounds = changed
             .filter(|changed| !changed.vertices.is_empty())
             .map(|changed| cells::bounds(changed.vertices.iter().map(|&v| self.vertices[v])));
+        // Those before `start` have no junction, and gain none: splitting
+        // adds no vertices. Only when flat ones go (at first, or a split
+        // made one) is it all looked through again.
+        let mut start = 0;
+        let mut tidy = true;
+        let mut cuts: QuickMap<(VertexId, VertexId, VertexId), u32> = QuickMap::default();
         for _ in 0..limit {
             let vertices = &self.vertices;
             let count = self.triangles.len();
-            self.triangles.retain(|&t| {
-                let flat = is_flat(t.map(|v| vertices[v]));
-                if flat {
-                    changes.squashed.push(t);
-                }
-                !flat
-            });
+            if tidy {
+                self.triangles.retain(|&t| {
+                    let flat = is_flat(t.map(|v| vertices[v]));
+                    if flat {
+                        changes.squashed.push(t);
+                    }
+                    !flat
+                });
+                start = 0;
+            }
             if stale || self.triangles.len() != count {
                 used = self.unique_vertices();
                 // Sorted into cells only when many changed (or all count):
@@ -681,58 +700,79 @@ impl Document {
                 stale = false;
             }
             let vertices = &self.vertices;
-            let junction = self.triangles.iter().enumerate().find_map(|(i, &t)| {
-                // An unchanged triangle can only have gained a changed
-                // vertex on its edges.
-                let only_changed = changed.filter(|changed| !changed.triangle(t));
-                (0..3).find_map(|k| {
-                    let (u, v, x) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
-                    let (a, b) = (vertices[u], vertices[v]);
-                    let reach = tolerance(a.distance(b));
-                    let (min, max) = (
-                        Point::new(a.x.min(b.x) - reach, a.y.min(b.y) - reach),
-                        Point::new(a.x.max(b.x) + reach, a.y.max(b.y) + reach),
-                    );
-                    // Unchanged, and away from all that changed: nothing.
-                    if only_changed.is_some()
-                        && changed_bounds.is_none_or(|(cmin, cmax)| {
-                            max.x < cmin.x || cmax.x < min.x || max.y < cmin.y || cmax.y < min.y
-                        })
-                    {
-                        return None;
-                    }
-                    let candidates: Box<dyn Iterator<Item = VertexId>> =
-                        match (only_changed, &near_changed, &near) {
-                            (Some(_), Some(near_changed), _) => Box::new(
-                                near_changed
-                                    .within(min, max)
-                                    .filter(|w| used.binary_search(w).is_ok()),
-                            ),
-                            (Some(changed), None, _) => Box::new(changed.vertices.iter().copied()),
-                            (None, _, Some(near)) => Box::new(near.within(min, max)),
-                            (None, _, None) => Box::new(used.iter().copied()),
-                        };
-                    // Quickly out of its bounds, then really on it.
-                    candidates
-                        .filter(|&w| {
-                            let p = vertices[w];
-                            min.x <= p.x && p.x <= max.x && min.y <= p.y && p.y <= max.y
-                        })
-                        .filter(|&w| !t.contains(&w) && is_inside_segment(vertices[w], a, b))
-                        // The lowest, as going through them in order would.
-                        .min()
-                        .map(|w| (i, (u, v, w), [u, w, x], [w, v, x]))
-                })
-            });
+            let junction = self
+                .triangles
+                .iter()
+                .enumerate()
+                .skip(start)
+                .find_map(|(i, &t)| {
+                    // An unchanged triangle can only have gained a changed
+                    // vertex on its edges.
+                    let only_changed = changed.filter(|changed| !changed.triangle(t));
+                    (0..3).find_map(|k| {
+                        let (u, v, x) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
+                        let (a, b) = (vertices[u], vertices[v]);
+                        let reach = tolerance(a.distance(b));
+                        let (min, max) = (
+                            Point::new(a.x.min(b.x) - reach, a.y.min(b.y) - reach),
+                            Point::new(a.x.max(b.x) + reach, a.y.max(b.y) + reach),
+                        );
+                        // Unchanged, and away from all that changed: nothing.
+                        if only_changed.is_some()
+                            && changed_bounds.is_none_or(|(cmin, cmax)| {
+                                max.x < cmin.x || cmax.x < min.x || max.y < cmin.y || cmax.y < min.y
+                            })
+                        {
+                            return None;
+                        }
+                        let candidates: Box<dyn Iterator<Item = VertexId>> =
+                            match (only_changed, &near_changed, &near) {
+                                (Some(_), Some(near_changed), _) => Box::new(
+                                    near_changed
+                                        .within(min, max)
+                                        .filter(|w| used.binary_search(w).is_ok()),
+                                ),
+                                (Some(changed), None, _) => {
+                                    Box::new(changed.vertices.iter().copied())
+                                }
+                                (None, _, Some(near)) => Box::new(near.within(min, max)),
+                                (None, _, None) => Box::new(used.iter().copied()),
+                            };
+                        // Quickly out of its bounds, then really on it.
+                        candidates
+                            .filter(|&w| {
+                                let p = vertices[w];
+                                min.x <= p.x && p.x <= max.x && min.y <= p.y && p.y <= max.y
+                            })
+                            .filter(|&w| !t.contains(&w) && is_inside_segment(vertices[w], a, b))
+                            // The lowest, as going through them in order would.
+                            .min()
+                            .map(|w| (i, (u, v, w), [u, w, x], [w, v, x]))
+                    })
+                });
 
             let Some((i, cut, first, second)) = junction else {
                 return true;
             };
+            // The same cut again and again: going round in circles
+            // (vertices all but on one another, each on the other's
+            // sides), which may go on for seconds before settling, if it
+            // does. Turned down soon instead. (Again a few times can be:
+            // flat ones gone.)
+            let times = cuts.entry(cut).or_insert(0);
+            *times += 1;
+            if *times > 8 {
+                return false;
+            }
 
             changes.cut.push(cut);
             self.triangles.remove(i);
             self.push_triangle(first);
             self.push_triangle(second);
+            start = i;
+            tidy = [first, second]
+                .iter()
+                .any(|t| is_flat(t.map(|v| self.vertices[v])));
         }
 
         false

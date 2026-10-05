@@ -500,6 +500,85 @@ fn a_drag_past_the_slop_moves_the_selection_all_the_way() {
     assert_eq!(state.selection.len(), 3);
 }
 
+/// The colour of the face at `(x, y)` in `doc`, if any is there.
+fn color_at(doc: &Document, x: f32, y: f32) -> Option<Option<Color>> {
+    doc.triangle_at(Point::new(x, y)).map(|t| doc.color(t))
+}
+
+#[test]
+fn a_selection_dragged_over_another_shape_merges_in_front_of_it() {
+    let red = Color::from_rgb(1.0, 0.0, 0.0);
+    let mut doc = painted(
+        &[
+            [(100.0, 300.0), (200.0, 300.0), (150.0, 200.0)],
+            [(250.0, 300.0), (350.0, 300.0), (300.0, 200.0)],
+        ],
+        Color::BLACK,
+    );
+    assert!(doc.apply(Edit::Paint {
+        triangle: 1,
+        color: Some(red),
+    }));
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    lasso_right(&editor, &mut state);
+
+    // 80 to the left: 30 px into the left one along the bottom. Shown
+    // while dragging, made on letting go.
+    run(&editor, &mut state, Event::Mouse(PRESS), 500.0, 500.0);
+    let edits = run(&editor, &mut state, Event::Mouse(MOVE), 420.0, 500.0);
+    assert!(edits.is_empty());
+    assert!(state.pending.is_some());
+    let edits = run(&editor, &mut state, Event::Mouse(RELEASE), 420.0, 500.0);
+    let [edits] = &edits[..] else {
+        panic!("{edits:?}");
+    };
+    assert!(matches!(&edits[..], [Edit::Merging { .. }]), "{edits:?}");
+    let mut after = doc.clone();
+    assert!(after.apply_all(edits));
+
+    // In front where they overlap; the rest of the left one as it was.
+    assert_eq!(color_at(&after, 185.0, 290.0), Some(Some(red)));
+    assert_eq!(color_at(&after, 120.0, 290.0), Some(Some(Color::BLACK)));
+    let area: f32 = after
+        .triangles()
+        .map(|[a, b, c]| crate::geometry::area2(a, b, c).abs() / 2.0)
+        .sum();
+    assert!((area - (10000.0 - 450.0)).abs() < 1.0, "{area}");
+    assert_eq!(state.selection.len(), 3);
+}
+
+#[test]
+fn a_paste_over_a_shape_merges_in_front_of_it() {
+    let red = Color::from_rgb(1.0, 0.0, 0.0);
+    let doc = painted(
+        &[[(100.0, 300.0), (300.0, 300.0), (200.0, 100.0)]],
+        Color::BLACK,
+    );
+    // Copied from another layer, from where the big one is here.
+    let small = painted(&[[(180.0, 260.0), (220.0, 260.0), (200.0, 220.0)]], red);
+    let piece = small.piece(&small.unique_vertices());
+    let cache = Caches::default();
+    let mut editor = editor(&doc, &cache);
+    editor.clipboard = Some(&piece);
+    let mut state = State::default();
+
+    // Where it was copied from, in the middle of the big one.
+    run(&editor, &mut state, ctrl('v'), 200.0, 250.0);
+    let edits = run(&editor, &mut state, Event::Mouse(PRESS), 200.0, 250.0);
+    let [edits] = &edits[..] else {
+        panic!("{edits:?}");
+    };
+    let mut after = doc.clone();
+    assert!(after.apply_all(edits));
+    assert_eq!(color_at(&after, 200.0, 245.0), Some(Some(red)));
+    assert_eq!(color_at(&after, 200.0, 290.0), Some(Some(Color::BLACK)));
+    assert_eq!(color_at(&after, 200.0, 150.0), Some(Some(Color::BLACK)));
+    // What was pasted is selected.
+    assert_eq!(state.selection.len(), 3);
+}
+
 #[test]
 fn c_subdivides_the_selection_and_again_finer() {
     let doc = two_apart();
@@ -544,4 +623,63 @@ fn c_without_a_selection_still_cuts_the_edge_pointed_at() {
             at: Point::new(150.0, 300.0)
         }]]
     );
+}
+
+#[test]
+fn r_inside_a_mesh_rebuilds_the_faces_around_what_turned() {
+    // A grid, 6 by 6 squares of 40; its middle 2 by 2 squares' corners
+    // turned 60° (R): the faces round them would fold over. They're made
+    // again, the outline as it was, all of it still covered once.
+    let mut doc = Document::default();
+    let p = |i: usize, j: usize| (100.0 + i as f32 * 40.0, 100.0 + j as f32 * 40.0);
+    for i in 0..6 {
+        for j in 0..6 {
+            triangle(&mut doc, [p(i, j), p(i + 1, j), p(i, j + 1)]);
+            triangle(&mut doc, [p(i + 1, j), p(i + 1, j + 1), p(i, j + 1)]);
+        }
+    }
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let centre = Point::new(220.0, 220.0);
+    let mut state = State {
+        selection: doc
+            .unique_vertices()
+            .into_iter()
+            .filter(|&v| {
+                let d = doc.vertex(v) - centre;
+                d.x.abs() <= 40.0 && d.y.abs() <= 40.0
+            })
+            .collect(),
+        ..State::default()
+    };
+    assert_eq!(state.selection.len(), 9);
+
+    let (sin, cos) = 60f32.to_radians().sin_cos();
+    let from = centre + Vector::new(100.0, 0.0);
+    let to = centre + Vector::new(100.0 * cos, 100.0 * sin);
+    run(&editor, &mut state, key('r'), from.x, from.y);
+    run(&editor, &mut state, Event::Mouse(MOVE), to.x, to.y);
+    let edits = run(&editor, &mut state, Event::Mouse(PRESS), to.x, to.y);
+    let [edits] = &edits[..] else {
+        panic!("{edits:?}");
+    };
+    assert!(matches!(&edits[..], [Edit::Merging { .. }]), "{edits:?}");
+    let mut after = doc.clone();
+    assert!(after.apply_all(edits));
+    let area = |doc: &Document| -> f32 {
+        doc.triangles()
+            .map(|[a, b, c]| crate::geometry::area2(a, b, c).abs() / 2.0)
+            .sum()
+    };
+    assert!(
+        (area(&after) - 240.0 * 240.0).abs() < 1.0,
+        "{}",
+        area(&after)
+    );
+    // The turned vertices kept, where they were turned to.
+    for &v in &state.selection {
+        let d = doc.vertex(v) - centre;
+        let turned = centre + Vector::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos);
+        assert!(after.vertex(v).distance(turned) < 1e-2, "{v}");
+    }
 }

@@ -5,15 +5,18 @@
 //! Only outer edges (with a face on one side only) with both ends selected
 //! are swept, and only those whose open side the cursor went to: an edge
 //! facing the other way, or whose quad would come out flat, is left out.
-//! A quad running into what's there (or into another edge's) is fitted in
-//! round it, the sweeps merging; if that can't be done, it's left out.
+//! What's swept comes in front of the rest of the drawing, cutting it away
+//! (see [`Edit::Merging`]); a quad running into the shape extruded, or into
+//! another edge's, is fitted in round that instead, the sweeps merging. If
+//! that can't be done, it's left out.
 
 use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::geometry::overlap;
 
-/// A quad swept from an edge that runs into something, to fit in round it:
+/// A quad swept from an edge that runs into the shape extruded or another
+/// edge's quad, to fit in round it:
 /// the face on the edge, the edge (`a` → `b`), and its two triangles.
 type Merging = (TriangleId, VertexId, VertexId, [[Point; 3]; 2]);
 
@@ -53,12 +56,13 @@ impl Editor<'_> {
         ends
     }
 
-    /// `selection` extruded by `by`: the quads clear of everything, as a
-    /// piece to join on (a quad, two triangles, for each outer edge that
-    /// can be swept that way, painted like the face on it, its edges
-    /// styled like the edge swept); and those running into what's
-    /// there or into each other, to fit in round that (see [`Self::merged`]),
-    /// each with the face on its edge and that edge.
+    /// `selection` extruded by `by`: the quads clear of the shape extruded
+    /// and of each other, as a piece to put down in front of the rest (a
+    /// quad, two triangles, for each outer edge that can be swept that way,
+    /// painted like the face on it, its edges styled like the edge swept);
+    /// and those running into that shape or into each other, to fit in
+    /// round that (see [`Self::merged`]), each with the face on its edge
+    /// and that edge.
     pub(super) fn extrusion_parts(
         &self,
         selection: &[VertexId],
@@ -76,8 +80,15 @@ impl Editor<'_> {
         let apart = |(min, max): (Point, Point), (umin, umax): (Point, Point)| {
             max.x < umin.x || umax.x < min.x || max.y < umin.y || umax.y < min.y
         };
-        let there: Vec<([Point; 3], (Point, Point))> =
-            document.triangles().map(|t| (t, bounds(&t))).collect();
+        // The shape extruded: its faces with all corners selected.
+        let selected: HashSet<VertexId> = selection.iter().copied().collect();
+        let own: Vec<([Point; 3], (Point, Point))> = document
+            .triangle_ids()
+            .iter()
+            .filter(|t| t.iter().all(|v| selected.contains(v)))
+            .map(|t| t.map(|v| document.vertex(v)))
+            .map(|t| (t, bounds(&t)))
+            .collect();
         let height = |t: &[Point; 3]| min_height(t.map(|p| self.camera.to_screen(p)));
 
         let mut quads: Vec<(VertexId, VertexId, TriangleId, [[Point; 3]; 2])> = Vec::new();
@@ -95,9 +106,7 @@ impl Editor<'_> {
             }
             let clear = |t: &[Point; 3]| {
                 let b = bounds(t);
-                there
-                    .iter()
-                    .all(|(u, ub)| apart(b, *ub) || !overlap(*t, *u))
+                own.iter().all(|(u, ub)| apart(b, *ub) || !overlap(*t, *u))
                     && quads
                         .iter()
                         .flat_map(|(.., other)| other)
@@ -105,8 +114,7 @@ impl Editor<'_> {
             };
             if quad.iter().all(clear) {
                 quads.push((a, b, face, quad));
-            } else if quad.iter().all(|t| height(t) >= MIN_THICKNESS) {
-                // Fitted in, it mustn't leave slivers: thick enough to.
+            } else {
                 merging.push((face, a, b, quad));
             }
         }
@@ -136,7 +144,8 @@ impl Editor<'_> {
         (piece, merging)
     }
 
-    /// The edits putting down `piece`, then fitting each of the `merging`
+    /// The edits putting down `piece` (in front of what it lands on), then
+    /// fitting each of the `merging`
     /// quads in round what's there by then (only what's still uncovered,
     /// joined up: where sweeps run into each other, they merge), painted
     /// like the face on its edge and styled like that edge. `None` if
@@ -145,7 +154,7 @@ impl Editor<'_> {
         let mut edits = Vec::new();
         let mut result = self.document.clone();
         if !piece.is_empty() {
-            let paste = Edit::Paste { piece };
+            let paste = self.merging(Edit::Paste { piece });
             if !result.apply(paste.clone()) {
                 return None;
             }
@@ -212,8 +221,10 @@ impl Editor<'_> {
     }
 
     /// Extruding `selection` by `by` (the cursor at `at`); `None` if no
-    /// edge can be swept that way, or it doesn't work out. Sweeps running
-    /// into something are fitted in round it if they can be, else left out.
+    /// edge can be swept that way, or it doesn't work out. Sweeps come in
+    /// front of the rest of the drawing; running into the shape extruded
+    /// or each other, they're fitted in round that if they can be, else
+    /// left out.
     pub(super) fn extrude(&self, selection: &[VertexId], by: Vector, at: Point) -> Option<Pending> {
         let (piece, merging) = self.extrusion_parts(selection, by);
         if !merging.is_empty()
@@ -225,7 +236,7 @@ impl Editor<'_> {
         if piece.is_empty() {
             return None;
         }
-        self.check(vec![Edit::Paste { piece }], at)
+        self.check(vec![self.merging(Edit::Paste { piece })], at)
     }
 
     /// The vertices at the far ends of what `pending` extruded `selection`
@@ -235,7 +246,7 @@ impl Editor<'_> {
         let put: Vec<Point> = pending
             .edits
             .iter()
-            .flat_map(|edit| match edit {
+            .flat_map(|edit| match edit.inner() {
                 Edit::Paste { piece } => piece.vertices.clone(),
                 Edit::AddTriangle { corners, .. } => corners.to_vec(),
                 _ => Vec::new(),

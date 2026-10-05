@@ -131,3 +131,68 @@ fn random_fills() {
     }
     println!("fills: ok {ok}, nothing to add {empty}, rejected {rejected}");
 }
+
+#[test]
+fn random_merges() {
+    let mut seed = 4242u64;
+    let mut rand = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32) / (1u64 << 31) as f32
+    };
+
+    let (mut ok, mut rejected) = (0, 0);
+    for _ in 0..40 {
+        // A few triangles here and there.
+        let mut doc = Document::default();
+        for _ in 0..6 {
+            let (x, y) = (rand() * 400.0, rand() * 400.0);
+            let corners = [
+                (0.0, 0.0),
+                (60.0 + rand() * 60.0, 0.0),
+                (rand() * 60.0, 80.0),
+            ]
+            .map(|(dx, dy)| Point::new(x + dx, y + dy));
+            doc.apply(Edit::AddTriangle { corners, snap: 0.5 });
+        }
+
+        for _ in 0..10 {
+            // One face's corners moved over the rest, or pasted there.
+            let triangles = doc.triangle_ids().to_vec();
+            let t = triangles[(rand() * triangles.len() as f32) as usize % triangles.len()];
+            let by = iced::Vector::new(rand() * 200.0 - 100.0, rand() * 200.0 - 100.0);
+            let edit = if rand() < 0.5 {
+                Edit::MoveVertices {
+                    moves: t.iter().map(|&v| (v, doc.vertex(v) + by)).collect(),
+                }
+            } else {
+                Edit::Paste {
+                    piece: doc.piece(&t).moved(by),
+                }
+            };
+            let edit = Edit::Merging {
+                edit: Box::new(edit),
+                snap: 0.5,
+                held: Vec::new(),
+            };
+            let before = doc.clone();
+            if doc.apply(edit.clone()) {
+                ok += 1;
+                let shapes: Vec<[Point; 3]> = doc.triangles().collect();
+                for (i, &s) in shapes.iter().enumerate() {
+                    assert!(area2(s[0], s[1], s[2]) > 0.0, "{before:?} {edit:?}");
+                    for &u in &shapes[i + 1..] {
+                        assert!(!overlap(s, u), "{before:?} {edit:?}");
+                    }
+                }
+                assert!(!super::tests::has_t_junction(&doc), "{before:?} {edit:?}");
+            } else {
+                // Moved, a face joined on may fold over: that's turned down.
+                rejected += 1;
+            }
+        }
+    }
+    println!("merges: ok {ok}, rejected {rejected}");
+    assert!(ok > rejected);
+}

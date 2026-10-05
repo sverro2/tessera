@@ -368,7 +368,10 @@ impl Editor<'_> {
             .into_iter()
             .map(|(v, w)| (v, f(self.document.vertex(v), w)))
             .collect();
-        self.check(vec![Edit::MoveVertices { moves }], at)
+        self.check(
+            vec![self.merging_held(Edit::MoveVertices { moves }, selection)],
+            at,
+        )
     }
 
     /// Dragging vertex `id` to `to`, editing proportionally: those around
@@ -383,11 +386,12 @@ impl Editor<'_> {
             |u, v| u == id || v == id,
             &[],
         );
+        let joins = must_join(&snaps, &[]);
         snaps
             .into_iter()
             .take(MAX_SNAPS)
             .map(|(_, p)| p)
-            .chain([to])
+            .chain((!joins).then_some(to))
             .find_map(|p| {
                 let by = p - from;
                 Some((p, self.transform(&[id], p, |q, w| q + by * w)?))

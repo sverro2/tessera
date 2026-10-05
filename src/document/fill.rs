@@ -137,10 +137,20 @@ impl Document {
             .map(|i| (outline[i], outline[(i + 1) % outline.len()]))
             .collect();
 
-        let mesh: Vec<[Point; 3]> = self.triangles().collect();
+        // Only what reaches into the outline's bounds can matter.
+        let (min, max) = super::cells::bounds(outline.iter().copied());
+        let reaches = |points: &[Point]| {
+            let (lo, hi) = super::cells::bounds(points.iter().copied());
+            hi.x >= min.x - EPSILON
+                && lo.x <= max.x + EPSILON
+                && hi.y >= min.y - EPSILON
+                && lo.y <= max.y + EPSILON
+        };
+        let mesh: Vec<[Point; 3]> = self.triangles().filter(|t| reaches(t)).collect();
         let mut edges: Vec<(Point, Point)> = self
             .edges()
             .map(|(u, v)| (self.vertices[u], self.vertices[v]))
+            .filter(|&(p, q)| reaches(&[p, q]))
             .collect();
 
         // Where the fill may put corners.
@@ -422,7 +432,7 @@ fn strictly_between(p: Point, a: Point, b: Point) -> bool {
 }
 
 /// Where segments `p`–`q` and `a`–`b` properly cross (not just touch).
-fn crossing(p: Point, q: Point, a: Point, b: Point) -> Option<Point> {
+pub(super) fn crossing(p: Point, q: Point, a: Point, b: Point) -> Option<Point> {
     let (sp, sq) = (side(a, b, p), side(a, b, q));
     let (sa, sb) = (side(p, q, a), side(p, q, b));
     let apart = |x: f32, y: f32| (x > EPSILON && y < -EPSILON) || (x < -EPSILON && y > EPSILON);

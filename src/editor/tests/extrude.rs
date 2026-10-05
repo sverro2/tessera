@@ -37,11 +37,19 @@ fn e_extrudes_the_outer_edges_facing_the_cursor() {
 }
 
 #[test]
-fn an_extrusion_running_into_something_is_fitted_round_it() {
+fn an_extrusion_comes_in_front_of_what_it_runs_into() {
+    let red = Color::from_rgb(1.0, 0.0, 0.0);
     let mut doc = one();
+    assert!(doc.apply(Edit::Paint {
+        triangle: 0,
+        color: Some(red),
+    }));
     // In the way of the left edge swept up, not of the right.
-    let obstacle = [(112.0, 215.0), (132.0, 215.0), (122.0, 200.0)];
-    triangle(&mut doc, obstacle);
+    triangle(&mut doc, [(112.0, 215.0), (132.0, 215.0), (122.0, 200.0)]);
+    assert!(doc.apply(Edit::Paint {
+        triangle: 1,
+        color: Some(Color::BLACK),
+    }));
     let cache = Caches::default();
     let editor = editor(&doc, &cache);
     let mut state = State {
@@ -57,15 +65,11 @@ fn an_extrusion_running_into_something_is_fitted_round_it() {
     };
     let mut after = doc.clone();
     assert!(after.apply_all(edits));
-    // Both edges swept (10000 each), round the triangle in the way (150),
-    // which is left as it was.
-    assert!((area(&after) - (area(&doc) + 20000.0 - 150.0)).abs() < 1.0);
-    let obstacle = obstacle.map(|(x, y)| Point::new(x, y));
-    assert!(after.triangles().any(|t| (0..3).any(|i| {
-        let mut t = t;
-        t.rotate_left(i);
-        t == obstacle || t == [obstacle[0], obstacle[2], obstacle[1]]
-    })));
+    // Both edges swept (10000 each), over the triangle in the way: it's
+    // covered, painted like what's swept.
+    assert!((area(&after) - 40000.0).abs() < 1.0, "{}", area(&after));
+    let at = after.triangle_at(Point::new(122.0, 210.0)).unwrap();
+    assert_eq!(after.color(at), Some(red));
     // The far ends are selected, to go on from.
     assert_eq!(state.selection.len(), 3);
 }

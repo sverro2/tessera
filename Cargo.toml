@@ -20,6 +20,7 @@ rayon = "1.12.0"
 resvg = { version = "0.45", default-features = false }
 # The file format: a zip of the drawing (JSON) and its background images.
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+spade = "2.15.1"
 
 # Geometry and rendering are far too slow unoptimised; keep our own code
 # quick to build but optimise it a little, and dependencies fully.

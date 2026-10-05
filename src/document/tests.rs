@@ -812,6 +812,116 @@ fn square(doc: &mut Document, x: f32, y: f32, size: f32, color: Color) {
     }
 }
 
+/// The colour at `p`, if anything's there.
+fn color_at(doc: &Document, p: Point) -> Option<Option<Color>> {
+    doc.triangle_at(p).map(|t| doc.color(t))
+}
+
+#[test]
+fn moved_over_the_drawing_it_merges_in_on_top() {
+    let (red, blue) = (
+        Color::from_rgb(1.0, 0.0, 0.0),
+        Color::from_rgb(0.0, 0.0, 1.0),
+    );
+    let mut doc = Document::default();
+    square(&mut doc, 0.0, 0.0, 100.0, red);
+    square(&mut doc, 200.0, 0.0, 40.0, blue);
+    let blue_square: Vec<VertexId> = (4..8).collect();
+    // Into the middle of the red square, and half over its right edge.
+    for (by, area_after) in [(-170.0, 10000.0), (-120.0, 10000.0 + 800.0)] {
+        let moves = blue_square
+            .iter()
+            .map(|&v| (v, doc.vertex(v) + iced::Vector::new(by, 30.0)))
+            .collect();
+        let edit = Edit::MoveVertices { moves };
+        // As it was, it can't go there.
+        assert!(!doc.clone().apply(edit.clone()));
+        let mut after = doc.clone();
+        assert!(after.apply(Edit::Merging {
+            edit: Box::new(edit),
+            snap: 0.5,
+            held: Vec::new(),
+        }));
+        // On top, the red cut away under it; nothing left over or out.
+        assert!((area(&after) - area_after).abs() < 0.1, "{}", area(&after));
+        let x = 200.0 + by;
+        assert_eq!(
+            color_at(&after, Point::new(x + 20.0, 50.0)),
+            Some(Some(blue))
+        );
+        assert_eq!(
+            color_at(&after, Point::new(x - 10.0, 50.0)),
+            Some(Some(red))
+        );
+        assert_eq!(color_at(&after, Point::new(50.0, 10.0)), Some(Some(red)));
+    }
+}
+
+#[test]
+fn pasted_over_the_drawing_it_merges_in_on_top() {
+    let (red, blue) = (
+        Color::from_rgb(1.0, 0.0, 0.0),
+        Color::from_rgb(0.0, 0.0, 1.0),
+    );
+    let mut doc = Document::default();
+    square(&mut doc, 0.0, 0.0, 100.0, red);
+    let mut blue_doc = Document::default();
+    square(&mut blue_doc, 30.0, 30.0, 40.0, blue);
+    let piece = blue_doc.piece(&blue_doc.unique_vertices());
+
+    assert!(!doc.clone().apply(Edit::Paste {
+        piece: piece.clone()
+    }));
+    let mut after = doc.clone();
+    assert!(after.apply(Edit::Merging {
+        edit: Box::new(Edit::Paste { piece }),
+        snap: 0.5,
+        held: Vec::new(),
+    }));
+    assert!((area(&after) - 10000.0).abs() < 0.1, "{}", area(&after));
+    assert_eq!(color_at(&after, Point::new(50.0, 50.0)), Some(Some(blue)));
+    assert_eq!(color_at(&after, Point::new(10.0, 50.0)), Some(Some(red)));
+    assert_eq!(color_at(&after, Point::new(90.0, 90.0)), Some(Some(red)));
+}
+
+#[test]
+fn merging_rebuilds_faces_folded_over_to_the_outline_as_it_runs_now() {
+    let mut doc = Document::default();
+    square(&mut doc, 0.0, 0.0, 100.0, Color::BLACK);
+    // A corner pulled across the square: its faces fold over. Rebuilt,
+    // the outline runs from (100, 0) round by (100, 100) and (0, 100) to
+    // where the corner went: a dart, 5000 in area.
+    let edit = Edit::MoveVertices {
+        moves: vec![(0, Point::new(150.0, 150.0))],
+    };
+    assert!(!doc.clone().apply(edit.clone()));
+    assert!(doc.apply(Edit::Merging {
+        edit: Box::new(edit),
+        snap: 0.5,
+        held: Vec::new(),
+    }));
+    assert!((area(&doc) - 5000.0).abs() < 0.1, "{}", area(&doc));
+    assert!(doc.colors().all(|color| color == Some(Color::BLACK)));
+}
+
+#[test]
+fn merging_what_moved_whole_folded_over_itself_is_rejected() {
+    let mut doc = Document::default();
+    square(&mut doc, 0.0, 0.0, 100.0, Color::BLACK);
+    // Every corner moved, one of them across: no way to tell what's on top.
+    let moves = vec![
+        (0, Point::new(150.0, 150.0)),
+        (1, Point::new(101.0, 0.0)),
+        (2, Point::new(101.0, 100.0)),
+        (3, Point::new(1.0, 100.0)),
+    ];
+    assert!(!doc.clone().apply(Edit::Merging {
+        edit: Box::new(Edit::MoveVertices { moves }),
+        snap: 0.5,
+        held: Vec::new(),
+    }));
+}
+
 #[test]
 fn subdividing_halves_the_faces_and_splits_those_beside_them() {
     let red = Color::from_rgb(1.0, 0.0, 0.0);

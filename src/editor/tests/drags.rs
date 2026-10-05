@@ -235,7 +235,7 @@ fn dragging_a_corner_onto_a_separate_outline_edge_joins() {
 }
 
 #[test]
-fn slivers_are_rejected() {
+fn pulling_from_an_edge_is_cancelled_back_by_it() {
     let doc = one();
     let cache = Caches::default();
     let editor = editor(&doc, &cache);
@@ -251,7 +251,7 @@ fn slivers_are_rejected() {
             .map(|pending| pending.edits)
     };
     assert_eq!(edit(297.0), None); // on the source edge: cancelled
-    assert_eq!(edit(303.0), None);
+    assert_eq!(edit(303.0), None); // within reach of it: the same
     assert!(matches!(
         edit(250.0).as_deref(),
         Some([Edit::InsertVertex { .. }, Edit::MoveVertex { .. }])
@@ -293,57 +293,6 @@ fn dragging_a_centre_out_of_the_outline_stretches_the_shape() {
         }]]
     );
     assert!(doc.clone().apply_all(&edits[0]));
-}
-
-#[test]
-fn limited_moves_never_leave_slivers() {
-    // A fan around vertex 0 whose outline has a dent at (30, 30), so the
-    // area vertex 0 may move in is bounded by some edges' extensions.
-    let ring = [
-        Point::new(100.0, 0.0),
-        Point::new(30.0, 30.0),
-        Point::new(0.0, 100.0),
-        Point::new(-100.0, 0.0),
-        Point::new(0.0, -100.0),
-    ]
-    .map(|p| p + Vector::new(400.0, 300.0));
-    let centre = Point::new(390.0, 290.0);
-
-    // Vertex 0 is the centre, 1..=5 the ring.
-    let mut doc = Document::default();
-    for (from, to) in [(0, 1), (1, 2), (2, 3), (3, 4), (4, 0)] {
-        assert!(doc.apply(Edit::AddTriangle {
-            corners: [centre, ring[from], ring[to]],
-            snap: 0.0
-        }));
-    }
-    assert_eq!(doc.triangle_ids().len(), 5);
-
-    let cache = Caches::default();
-    let editor = editor(&doc, &cache);
-
-    for x in (0..16).map(|i| i as f32 * 50.0) {
-        for y in (0..12).map(|i| i as f32 * 50.0) {
-            // Without a valid position the vertex stays where it was.
-            let Some((_, pending)) = editor.limit_move(0, Point::new(x, y)) else {
-                continue;
-            };
-
-            for t in pending
-                .result
-                .triangle_ids()
-                .iter()
-                .filter(|t| t.contains(&0))
-            {
-                let h = min_height(t.map(|v| pending.result.vertex(v)));
-                assert!(
-                    h >= MIN_THICKNESS,
-                    "cursor ({x}, {y}): {:?} leaves height {h}",
-                    pending.edits
-                );
-            }
-        }
-    }
 }
 
 #[test]
@@ -573,4 +522,32 @@ fn middle_drag_without_ctrl_still_pans() {
         matches!(&messages[..], [Message::Pan(v)] if v.y == -50.0),
         "{messages:?}"
     );
+}
+
+#[test]
+fn a_vertex_dragged_close_to_an_edge_lands_on_it_joined_up() {
+    let doc = two_apart();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    // Vertex 1 (200, 300) of the left triangle, to a few px left of the
+    // right one's left edge (which at y 280 is at x 260).
+    for off in [1.0, 3.0, 5.0] {
+        let edits = drag(
+            &editor,
+            &[
+                (PRESS, 200.0, 300.0),
+                (MOVE, 260.0 - off, 280.0),
+                (RELEASE, 260.0 - off, 280.0),
+            ],
+        );
+        let [edits] = &edits[..] else {
+            panic!("{edits:?}");
+        };
+        let mut after = doc.clone();
+        assert!(after.apply_all(edits));
+        // On the edge, a corner of the right triangle too: joined up.
+        let p = after.vertex(1);
+        assert!((p.x - (250.0 + (300.0 - p.y) / 2.0)).abs() < 1e-3, "{p:?}");
+        assert!(after.connected(1).len() > 2, "{:?}", after.triangle_ids());
+    }
 }

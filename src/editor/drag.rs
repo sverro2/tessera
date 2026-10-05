@@ -2,7 +2,7 @@
 //! transforming), snapped and kept valid, worked out on other threads
 //! where that's slow.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::*;
 
@@ -295,7 +295,7 @@ impl Editor<'_> {
                         .chain([Vector::ZERO])
                         .find_map(|snap| {
                             let piece = piece.moved(by + snap);
-                            self.check(vec![Edit::Paste { piece }], world)
+                            self.check(vec![self.merging(Edit::Paste { piece })], world)
                         })
                 });
             }
@@ -615,86 +615,22 @@ impl Editor<'_> {
     }
 
     /// Applies `edits` (placing a point `at`) to a copy of the document, if
-    /// the document accepts them and they leave no slivers.
+    /// the document accepts them (and they overlap no mirror image).
     pub(super) fn check(&self, edits: Vec<Edit>, at: Point) -> Option<Pending> {
         if self.out_of_time() {
             return None;
         }
+
         // The shape first: the paint only once it's taken (see below).
         let (result, changes) = self
             .document
             .preview_shape_until(&edits, self.deadline.get())?;
+        // Merging nothing away, it's just the edit merged.
+        let edits = match &edits[..] {
+            [Edit::Merging { edit, .. }] if !changes.merged => vec![(**edit).clone()],
+            _ => edits,
+        };
 
-        // Slivers would be invisible and impossible to grab. Triangles that
-        // were already that thin (e.g. when zoomed far out) may stay so, as
-        // long as they don't get any thinner, or only smaller, keeping
-        // their shape (scaled down, say): the drawing's, and those pasted
-        // as they were copied.
-        let height = |document: &Document, t: [VertexId; 3]| {
-            min_height(t.map(|v| self.camera.to_screen(document.vertex(v))))
-        };
-        // How skinny: its height over its longest side.
-        let skinny = |document: &Document, t: [VertexId; 3]| {
-            let [a, b, c] = t.map(|v| document.vertex(v));
-            let longest = a.distance(b).max(b.distance(c)).max(c.distance(a));
-            min_height([a, b, c]) / longest.max(f32::MIN_POSITIVE)
-        };
-        // Only those new, or with a corner moved, can have got thinner.
-        let sorted = |mut t: [VertexId; 3]| {
-            t.sort_unstable();
-            t
-        };
-        let before: Option<HashSet<[VertexId; 3]>> =
-            (result.triangle_ids() != self.document.triangle_ids()).then(|| {
-                let triangles = self.document.triangle_ids();
-                triangles.iter().map(|&t| sorted(t)).collect()
-            });
-        let existed = |t: [VertexId; 3]| {
-            before
-                .as_ref()
-                .is_none_or(|before| before.contains(&sorted(t)))
-        };
-        let moved = |v: VertexId| {
-            v >= self.document.vertex_slots() || self.document.vertex(v) != result.vertex(v)
-        };
-        let thin: Vec<[VertexId; 3]> = result
-            .triangle_ids()
-            .iter()
-            .copied()
-            .filter(|&t| t.iter().any(|&v| moved(v)) || !existed(t))
-            .filter(|&t| height(&result, t) < MIN_THICKNESS)
-            .collect();
-        if !thin.is_empty() {
-            let pasted: HashSet<[(u32, u32); 3]> = edits
-                .iter()
-                .filter_map(|edit| match edit {
-                    Edit::Paste { piece } => Some(piece),
-                    _ => None,
-                })
-                .flat_map(|piece| {
-                    piece
-                        .triangles
-                        .iter()
-                        .map(|t| doc::corners_key(t.map(|v| piece.vertices[v])))
-                })
-                .collect();
-            // Subdividing makes them smaller, as asked: as small as it likes.
-            let subdividing = edits
-                .iter()
-                .any(|edit| matches!(edit, Edit::Subdivide { .. }));
-            let sliver = !subdividing
-                && thin.iter().any(|&t| {
-                    if existed(t) {
-                        height(&result, t) < height(self.document, t) - 1e-3
-                            && skinny(&result, t) < skinny(self.document, t) - 1e-3
-                    } else {
-                        !pasted.contains(&doc::corners_key(t.map(|v| result.vertex(v))))
-                    }
-                });
-            if sliver {
-                return None;
-            }
-        }
         // Over a mirror line: it would overlap a mirror image.
         if !self.mirrors.is_empty() {
             let maps = doc::crossings(&doc::images(self.mirrors));
@@ -722,6 +658,24 @@ impl Editor<'_> {
         })
     }
 
+    /// `edit` (moving the selection, or pasting) merged into what it lands
+    /// over, rather than turned down: what's moved comes in front, and
+    /// what's under it is cut away round it (see [`Edit::Merging`]).
+    pub(super) fn merging(&self, edit: Edit) -> Edit {
+        self.merging_held(edit, &[])
+    }
+
+    /// As [`Self::merging`], moving `held` (the selection), which what's
+    /// around only goes along with (editing proportionally): only faces of
+    /// the selection's are carried whole.
+    pub(super) fn merging_held(&self, edit: Edit, held: &[VertexId]) -> Edit {
+        Edit::Merging {
+            edit: Box::new(edit),
+            snap: self.snap_distance(),
+            held: held.to_vec(),
+        }
+    }
+
     /// How close (world units) a new triangle's corners and sides may come
     /// to existing geometry before counting as touching it: what a fill
     /// needs to leave no slivers.
@@ -742,7 +696,9 @@ impl Editor<'_> {
 
     /// Dragging vertex `id` to `to`: onto the best snap that works out (a
     /// vertex to weld with, an edge to join, or the line through one of its
-    /// opposite edges), else to `to` itself.
+    /// opposite edges), else to `to` itself, unless a vertex or edge is in
+    /// reach: it joins up with that, or doesn't go there (rather than
+    /// landing a hair off it).
     pub(super) fn move_to(&self, id: VertexId, to: Point) -> Option<Pending> {
         let lines: Vec<_> = self
             .document
@@ -758,11 +714,12 @@ impl Editor<'_> {
             &lines,
         );
 
+        let joins = must_join(&snaps, &lines);
         snaps
             .into_iter()
             .take(MAX_SNAPS)
             .map(|(_, p)| p)
-            .chain([to])
+            .chain((!joins).then_some(to))
             .find_map(|p| self.check(vec![Edit::MoveVertex { id, to: p }], p))
     }
 
@@ -1213,4 +1170,15 @@ pub(super) fn equilateral(from: Point, to: Point) -> [Point; 3] {
     let mid = Point::new((from.x + to.x) / 2.0, (from.y + to.y) / 2.0);
     let h = 3f32.sqrt() / 2.0;
     [from, to, mid + Vector::new(d.y * h, -d.x * h)]
+}
+
+/// Whether among `snaps` there's something a dragged point must join up
+/// with, rather than land a hair off: a vertex, or an edge (not one of
+/// `lines`, which only line it up).
+pub(super) fn must_join(snaps: &[(Target, Point)], lines: &[(VertexId, VertexId)]) -> bool {
+    snaps.iter().any(|(target, _)| match *target {
+        Target::Vertex(_) => true,
+        Target::Edge(u, v) => !lines.contains(&(u, v)),
+        Target::Mirror => false,
+    })
 }

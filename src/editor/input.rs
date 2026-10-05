@@ -418,9 +418,9 @@ impl Editor<'_> {
         let at = self.camera.to_world(inside);
         let paste = |by: Vector| {
             self.check(
-                vec![Edit::Paste {
+                vec![self.merging(Edit::Paste {
                     piece: piece.moved(by),
-                }],
+                })],
                 at,
             )
         };
