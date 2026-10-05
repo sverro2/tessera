@@ -627,10 +627,17 @@ impl Editor<'_> {
 
         // Slivers would be invisible and impossible to grab. Triangles that
         // were already that thin (e.g. when zoomed far out) may stay so, as
-        // long as they don't get any thinner: the drawing's, and those
-        // pasted as they were copied.
+        // long as they don't get any thinner, or only smaller, keeping
+        // their shape (scaled down, say): the drawing's, and those pasted
+        // as they were copied.
         let height = |document: &Document, t: [VertexId; 3]| {
             min_height(t.map(|v| self.camera.to_screen(document.vertex(v))))
+        };
+        // How skinny: its height over its longest side.
+        let skinny = |document: &Document, t: [VertexId; 3]| {
+            let [a, b, c] = t.map(|v| document.vertex(v));
+            let longest = a.distance(b).max(b.distance(c)).max(c.distance(a));
+            min_height([a, b, c]) / longest.max(f32::MIN_POSITIVE)
         };
         // Only those new, or with a corner moved, can have got thinner.
         let sorted = |mut t: [VertexId; 3]| {
@@ -674,6 +681,7 @@ impl Editor<'_> {
             let sliver = thin.iter().any(|&t| {
                 if existed(t) {
                     height(&result, t) < height(self.document, t) - 1e-3
+                        && skinny(&result, t) < skinny(self.document, t) - 1e-3
                 } else {
                     !pasted.contains(&doc::corners_key(t.map(|v| result.vertex(v))))
                 }

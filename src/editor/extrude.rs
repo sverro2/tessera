@@ -5,7 +5,7 @@
 //! Only outer edges (with a face on one side only) with both ends selected
 //! are swept, and only those whose open side the cursor went to: an edge
 //! facing the other way, or whose quad would run into what's there (or
-//! into another edge's), or come out too thin to see, is left out.
+//! into another edge's), or come out flat, is left out.
 
 use std::collections::{HashMap, HashSet};
 
@@ -66,8 +66,8 @@ impl Editor<'_> {
         };
         let there: Vec<([Point; 3], (Point, Point))> =
             document.triangles().map(|t| (t, bounds(&t))).collect();
-        let thick =
-            |t: &[Point; 3]| min_height(t.map(|p| self.camera.to_screen(p))) >= MIN_THICKNESS;
+        // Thin is fine (a hole would be worse), as long as it isn't flat.
+        let thick = |t: &[Point; 3]| min_height(t.map(|p| self.camera.to_screen(p))) >= FLAT;
 
         let mut quads: Vec<(VertexId, VertexId, TriangleId, [[Point; 3]; 2])> = Vec::new();
         for (a, b, face) in self.outer_edges(selection) {

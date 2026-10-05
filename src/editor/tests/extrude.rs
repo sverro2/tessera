@@ -55,6 +55,24 @@ fn an_extrusion_leaves_out_edges_running_into_something() {
 }
 
 #[test]
+fn an_extrusion_nearly_along_an_edge_leaves_no_hole_there() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State {
+        selection: vec![0, 1, 2],
+        ..State::default()
+    };
+
+    // Right and a little down: the bottom edge swept into a sliver 3 px
+    // high, kept, as well as the right edge.
+    run(&editor, &mut state, key('e'), 200.0, 250.0);
+    run(&editor, &mut state, Event::Mouse(MOVE), 300.0, 253.0);
+    let edits = run(&editor, &mut state, Event::Mouse(PRESS), 300.0, 253.0);
+    assert_eq!(extruded(&edits), 4);
+}
+
+#[test]
 fn escape_cancels_an_extrusion() {
     let doc = one();
     let cache = Caches::default();

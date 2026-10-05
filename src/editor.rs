@@ -92,6 +92,9 @@ const EDGE_HIT: f32 = 7.0;
 /// Minimum height (screen px) of any triangle we create; thinner slivers
 /// would be invisible and impossible to grab.
 const MIN_THICKNESS: f32 = 5.0;
+/// Height (screen px) under which a triangle counts as flat: too thin even
+/// for an extrusion, which may otherwise make slivers rather than holes.
+const FLAT: f32 = 0.5;
 /// How far (screen px) inside a limiting edge a dragged vertex stops: just
 /// clear of making its triangle with that edge a sliver.
 const SLIDE_INSET: f32 = MIN_THICKNESS + 0.5;

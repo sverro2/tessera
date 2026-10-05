@@ -101,6 +101,25 @@ fn t_scales_the_selection_around_its_centre() {
 }
 
 #[test]
+fn t_scales_the_selection_down_past_thin_keeping_its_shape() {
+    let doc = two_apart();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    lasso_right(&editor, &mut state);
+
+    // A fortieth of the size: 2.5 px high, but no skinnier than it was.
+    let c = Point::new(300.0, 800.0 / 3.0);
+    run(&editor, &mut state, key('t'), c.x + 40.0, c.y);
+    run(&editor, &mut state, Event::Mouse(MOVE), c.x + 1.0, c.y);
+    let edits = run(&editor, &mut state, Event::Mouse(PRESS), c.x + 1.0, c.y);
+    for (v, to) in moves(&edits) {
+        let expected = c + (doc.vertex(v) - c) * (1.0 / 40.0);
+        assert!(to.distance(expected) < 1e-3, "{v}: {to:?} != {expected:?}");
+    }
+}
+
+#[test]
 fn ctrl_a_selects_every_vertex_of_the_layer() {
     let doc = two_apart();
     let cache = Caches::default();
