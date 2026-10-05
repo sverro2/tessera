@@ -187,6 +187,7 @@ impl Document {
         match edit {
             Edit::AddTriangle { corners, snap } => self.fill(corners, snap, changes, deadline),
             Edit::InsertVertex { at } => self.insert_vertex(at),
+            Edit::Subdivide { edges } => self.subdivide(&edges),
             Edit::RemoveTriangle { triangle } => {
                 triangle < self.triangles.len() && {
                     self.triangles.remove(triangle);
@@ -372,6 +373,65 @@ impl Document {
                 Some((k, color?))
             })
             .collect();
+    }
+
+    /// Splits `edges` at their middles, and the triangles on them (see
+    /// [`Edit::Subdivide`]). `false` if none of them is an edge.
+    pub(super) fn subdivide(&mut self, edges: &[(VertexId, VertexId)]) -> bool {
+        let wanted: QuickSet<(VertexId, VertexId)> =
+            edges.iter().map(|&(a, b)| (a.min(b), a.max(b))).collect();
+        let mut middles: QuickMap<(VertexId, VertexId), VertexId> = QuickMap::default();
+        let mut split = false;
+        let triangles = std::mem::take(&mut self.triangles);
+        for t in triangles {
+            // The middle of each side `k` (from corner `k` to the next) to
+            // split, made once for both sides of it.
+            let sides: [Option<VertexId>; 3] = std::array::from_fn(|k| {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                let edge = (a.min(b), a.max(b));
+                wanted.contains(&edge).then(|| {
+                    *middles.entry(edge).or_insert_with(|| {
+                        let (p, q) = (self.vertices[a], self.vertices[b]);
+                        self.vertices
+                            .push(Point::new((p.x + q.x) / 2.0, (p.y + q.y) / 2.0));
+                        self.vertices.len() - 1
+                    })
+                })
+            });
+            let pieces: Vec<[VertexId; 3]> = match sides {
+                [None, None, None] => vec![t],
+                [Some(ab), Some(bc), Some(ca)] => {
+                    let [a, b, c] = t;
+                    vec![[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]]
+                }
+                _ => {
+                    // Turned so the first side split is from corner 0.
+                    let k = (0..3)
+                        .find(|&k| sides[k].is_some() && sides[(k + 2) % 3].is_none())
+                        .unwrap_or(0);
+                    let [a, b, c] = [t[k], t[(k + 1) % 3], t[(k + 2) % 3]];
+                    let ab = sides[k].expect("split");
+                    match sides[(k + 1) % 3] {
+                        // a, ab, b, bc, c: the corner at b cut off, the rest
+                        // across its shorter diagonal.
+                        Some(bc) => {
+                            let p = |v: VertexId| self.vertices[v];
+                            if p(a).distance(p(bc)) <= p(ab).distance(p(c)) {
+                                vec![[ab, b, bc], [a, ab, bc], [a, bc, c]]
+                            } else {
+                                vec![[ab, b, bc], [a, ab, c], [ab, bc, c]]
+                            }
+                        }
+                        None => vec![[a, ab, c], [ab, b, c]],
+                    }
+                }
+            };
+            split |= pieces.len() > 1;
+            for piece in pieces {
+                self.push_triangle(piece);
+            }
+        }
+        split
     }
 
     /// Splits the triangle containing `at` (on its boundary counts) into

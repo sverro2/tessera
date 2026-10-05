@@ -107,6 +107,11 @@ pub enum Edit {
     /// Add a vertex at `at`, splitting the triangle it lies in into three,
     /// or the triangles on the edge it lies on into two each.
     InsertVertex { at: Point },
+    /// Split each of `edges` (`a`–`b`, either way round) at its middle, and
+    /// the triangles on them with it: one with all three split into four
+    /// (its corners, and one in the middle), the same shape halved; one
+    /// with two, into three; with one, into two.
+    Subdivide { edges: Vec<(VertexId, VertexId)> },
     /// Remove a triangle, leaving a hole (or a smaller outline).
     RemoveTriangle { triangle: TriangleId },
     /// Move a vertex (and thereby every triangle using it). Where the move

@@ -797,3 +797,49 @@ fn an_edge_loop_round_a_ring_stops_where_it_started() {
     // Less: the edge alone.
     assert_eq!(doc.edge_loop(a, b, 50f32.to_radians()), [(a, b)]);
 }
+
+/// A square of two triangles, from `(x, y)`, `size` wide, painted `color`.
+fn square(doc: &mut Document, x: f32, y: f32, size: f32, color: Color) {
+    let [a, b, c, d] =
+        [(x, y), (x + size, y), (x + size, y + size), (x, y + size)].map(|(x, y)| Point::new(x, y));
+    for corners in [[a, b, c], [a, c, d]] {
+        assert!(doc.apply(Edit::AddTriangle { corners, snap: 0.0 }));
+        let t = doc.triangle_ids().len() - 1;
+        assert!(doc.apply(Edit::Paint {
+            triangle: t,
+            color: Some(color),
+        }));
+    }
+}
+
+#[test]
+fn subdividing_halves_the_faces_and_splits_those_beside_them() {
+    let red = Color::from_rgb(1.0, 0.0, 0.0);
+    let mut doc = Document::default();
+    // Two triangles side by side, sharing 1–2; the left one painted.
+    square(&mut doc, 0.0, 0.0, 100.0, red);
+    let [a, b, c] = doc.triangle_ids()[0];
+    let edges = vec![(a, b), (b, c), (c, a)];
+    let before = area(&doc);
+    assert!(doc.apply(Edit::Subdivide { edges }));
+
+    // Four in place of the first, its shape halved; the other split in
+    // two along the shared side; still all painted alike, nothing missed.
+    assert_eq!(doc.triangle_ids().len(), 6);
+    assert!((area(&doc) - before).abs() < 1e-3);
+    assert!(doc.colors().all(|color| color == Some(red)));
+    assert!(!super::tests::has_t_junction(&doc));
+    let heights: Vec<f32> = doc.triangles().map(min_height).collect();
+    let small = heights
+        .iter()
+        .filter(|&&h| (h - 100.0 / 2.0f32.sqrt() / 2.0).abs() < 1e-3);
+    assert_eq!(small.count(), 4, "{heights:?}");
+}
+
+#[test]
+fn subdividing_nothing_that_is_an_edge_is_rejected() {
+    let mut doc = doc_with_triangle();
+    assert!(!doc.apply(Edit::Subdivide {
+        edges: vec![(0, 7)]
+    }));
+}

@@ -598,9 +598,12 @@ impl Editor<'_> {
         Some(canvas::Action::request_redraw().and_capture())
     }
 
-    /// Cutting (C) cuts the edge under the cursor (at `inside`) where it
-    /// is. Deleting (D) removes the selected vertices: every triangle using
-    /// one; else the triangle under the cursor.
+    /// Cutting (C) subdivides the selection: every edge with both ends
+    /// selected split at its middle, the faces on them with it, the new
+    /// vertices selected too (to go on); else it cuts the edge under the
+    /// cursor (at `inside`) where it is. Deleting (D) removes the selected
+    /// vertices: every triangle using one; else the triangle under the
+    /// cursor.
     fn remove_key(
         &self,
         state: &mut State,
@@ -608,6 +611,39 @@ impl Editor<'_> {
         inside: Point,
     ) -> Option<canvas::Action<Message>> {
         let edits = match action {
+            Action::CutEdge if !state.selection.is_empty() => {
+                let selected: std::collections::HashSet<VertexId> =
+                    state.selection.iter().copied().collect();
+                let edges: Vec<(VertexId, VertexId)> = self
+                    .document
+                    .unique_edges()
+                    .into_iter()
+                    .filter(|(a, b)| selected.contains(a) && selected.contains(b))
+                    .collect();
+                if edges.is_empty() {
+                    return None;
+                }
+                let pending = self.check(
+                    vec![Edit::Subdivide { edges }],
+                    self.camera.to_world(inside),
+                )?;
+                let n = self.document.vertex_slots();
+                state.selection.extend(
+                    pending
+                        .result
+                        .unique_vertices()
+                        .into_iter()
+                        .filter(|&v| v >= n),
+                );
+                let revision = self.document.revision();
+                return Some(
+                    canvas::Action::publish(Message::Edit {
+                        edits: pending.edits,
+                        revision,
+                    })
+                    .and_capture(),
+                );
+            }
             Action::CutEdge => match self.hit_test(inside)? {
                 Hover::Edge { at, .. } => vec![Edit::InsertVertex { at }],
                 Hover::Vertex(_) | Hover::Face(_) => return None,

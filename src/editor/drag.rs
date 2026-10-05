@@ -678,14 +678,19 @@ impl Editor<'_> {
                         .map(|t| doc::corners_key(t.map(|v| piece.vertices[v])))
                 })
                 .collect();
-            let sliver = thin.iter().any(|&t| {
-                if existed(t) {
-                    height(&result, t) < height(self.document, t) - 1e-3
-                        && skinny(&result, t) < skinny(self.document, t) - 1e-3
-                } else {
-                    !pasted.contains(&doc::corners_key(t.map(|v| result.vertex(v))))
-                }
-            });
+            // Subdividing makes them smaller, as asked: as small as it likes.
+            let subdividing = edits
+                .iter()
+                .any(|edit| matches!(edit, Edit::Subdivide { .. }));
+            let sliver = !subdividing
+                && thin.iter().any(|&t| {
+                    if existed(t) {
+                        height(&result, t) < height(self.document, t) - 1e-3
+                            && skinny(&result, t) < skinny(self.document, t) - 1e-3
+                    } else {
+                        !pasted.contains(&doc::corners_key(t.map(|v| result.vertex(v))))
+                    }
+                });
             if sliver {
                 return None;
             }

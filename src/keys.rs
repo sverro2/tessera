@@ -151,7 +151,7 @@ impl Action {
                  one pointed at, frontmost as drawn); again, back (but over another shape: on that)"
             }
             ShowKeys => "Show these shortcuts",
-            CutEdge => "Cut the hovered edge",
+            CutEdge => "Subdivide the selection, or cut the hovered edge",
             Delete => "Delete the hovered face (or the selection)",
             Grab => "Grab the selection (click to put down)",
             Rotate => "Rotate the selection",

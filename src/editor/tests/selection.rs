@@ -499,3 +499,49 @@ fn a_drag_past_the_slop_moves_the_selection_all_the_way() {
     assert_eq!(moved[0], (3, Point::new(270.0, 300.0)), "{moved:?}");
     assert_eq!(state.selection.len(), 3);
 }
+
+#[test]
+fn c_subdivides_the_selection_and_again_finer() {
+    let doc = two_apart();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    lasso_right(&editor, &mut state);
+
+    // The right triangle into four, its new vertices selected too.
+    let edits = run(&editor, &mut state, key('c'), 600.0, 500.0);
+    let [edits] = &edits[..] else {
+        panic!("{edits:?}");
+    };
+    assert!(matches!(&edits[..], [Edit::Subdivide { .. }]), "{edits:?}");
+    let mut after = doc.clone();
+    assert!(after.apply_all(edits));
+    assert_eq!(after.triangle_ids().len(), 5);
+    assert_eq!(state.selection.len(), 6);
+
+    // Again: each of those four into four.
+    let editor = super::tests::editor(&after, &cache);
+    let edits = run(&editor, &mut state, key('c'), 600.0, 500.0);
+    let [edits] = &edits[..] else {
+        panic!("{edits:?}");
+    };
+    assert!(after.apply_all(edits));
+    assert_eq!(after.triangle_ids().len(), 17);
+    assert_eq!(state.selection.len(), 15);
+}
+
+#[test]
+fn c_without_a_selection_still_cuts_the_edge_pointed_at() {
+    let doc = one();
+    let cache = Caches::default();
+    let editor = editor(&doc, &cache);
+    let mut state = State::default();
+    // On the bottom edge, 0–1.
+    let edits = run(&editor, &mut state, key('c'), 150.0, 300.0);
+    assert_eq!(
+        edits,
+        [[Edit::InsertVertex {
+            at: Point::new(150.0, 300.0)
+        }]]
+    );
+}
