@@ -58,6 +58,7 @@ use crate::paint::{self, Brush};
 mod drag;
 mod draw;
 mod extrude;
+mod gradient;
 mod grid;
 mod guides;
 mod input;
@@ -163,6 +164,13 @@ pub enum Tool {
     /// Place a mirror on the current layer: drag a line clear of its
     /// drawing.
     Mirror,
+    /// Lay a gradient over the current layer's faces or edges: drag its
+    /// line (`line`, start to end, once there is one; its ends dragged to
+    /// change it). `radial`: out from its start, all round.
+    Gradient {
+        line: Option<(Point, Point)>,
+        radial: bool,
+    },
 }
 
 /// What the pipette picked up: a face's colour or an edge's style (`None`
@@ -198,6 +206,10 @@ pub enum Message {
     /// A mirror was placed on the current layer (instead of the one it
     /// had).
     SetMirror(Mirror),
+    /// The gradient's line (world) is this now: drawn, or an end of it
+    /// moved; `None`, none (a drag too short to tell, or cancelled where
+    /// there was none).
+    GradientLine(Option<(Point, Point)>),
     /// Holding Shift+O, editing proportionally, the mouse
     /// moved this far across (screen px): reach further (or less far).
     TweakReach(f32),
@@ -632,6 +644,15 @@ enum Interaction {
         from: Point,
         to: Point,
     },
+    /// Drawing the gradient's line (world) from `start` to `end`, or
+    /// moving one of its ends (`start`, if `moving_start`) to the cursor;
+    /// `before`, the line there was, to go back to if cancelled.
+    Gradienting {
+        start: Point,
+        end: Point,
+        moving_start: bool,
+        before: Option<(Point, Point)>,
+    },
     /// Placing a mirror (world): along the line `from` → `to`, as snapped;
     /// started at `start`, on a vertex if `anchored`.
     PlacingMirror {
@@ -828,6 +849,11 @@ impl canvas::Program<Message> for Editor<'_> {
             Interaction::Idle if matches!(self.tool, Tool::Background { .. }) => {
                 mouse::Interaction::Grab
             }
+            Interaction::Idle | Interaction::Gradienting { .. }
+                if matches!(self.tool, Tool::Gradient { .. }) =>
+            {
+                mouse::Interaction::Crosshair
+            }
             // Our own cursor/handles are drawn on the canvas.
             _ => mouse::Interaction::Hidden,
         }
@@ -885,7 +911,9 @@ impl Editor<'_> {
     /// How layers look now: the shape mode keeps to the plain look.
     fn look(&self) -> Look {
         match self.tool {
-            Tool::Paint { .. } | Tool::Background { painted: true } => Look::Painted,
+            Tool::Paint { .. } | Tool::Gradient { .. } | Tool::Background { painted: true } => {
+                Look::Painted
+            }
             Tool::Shape | Tool::Mirror | Tool::Background { painted: false } => Look::Plain,
         }
     }

@@ -216,7 +216,7 @@ impl Tessera {
         );
 
         let hsv = self.paint.hsv;
-        let mut body = column![
+        let head = column![
             joined(vec![
                 (
                     "Faces",
@@ -241,59 +241,65 @@ impl Tessera {
                     tooltip::Position::Bottom,
                 )
             },
-            row![
-                current,
-                text_input("#rrggbb", &self.paint.hex)
-                    .size(13)
-                    .padding([3, 6])
-                    .on_input(|value| Message::Paint(PaintMessage::HexTyped(value))),
-                eraser,
-                pipette,
-            ]
-            .spacing(8)
-            .align_y(Center),
-            container(
-                wheel::view(hsv, INNER - 20.0)
-                    .map(|value| Message::Paint(PaintMessage::WheelPicked(value)))
-            )
-            .center_x(Fill),
-            row![
-                small("Light").width(44),
-                // Black, the colour itself (in the middle), white.
-                slider(0.0..=2.0, hsv.value, move |value| {
-                    Message::Paint(PaintMessage::WheelPicked(Hsv { value, ..hsv }))
-                })
-                .step(0.01),
-            ]
-            .spacing(8)
-            .align_y(Center),
-            row![
-                small("Opacity").width(44),
-                // See-through to opaque.
-                slider(0.0..=1.0, hsv.alpha, move |alpha| {
-                    Message::Paint(PaintMessage::WheelPicked(Hsv { alpha, ..hsv }))
-                })
-                .step(0.01),
-            ]
-            .spacing(8)
-            .align_y(Center),
         ]
         .spacing(8);
-        if self.paint.target == Target::Edges {
-            body = body.push(
+        if self.gradients.open {
+            return container(opaque(
+                container(head.push(self.gradient_controls(INNER)))
+                    .padding(10)
+                    .width(INNER + 20.0)
+                    .style(container::bordered_box),
+            ))
+            .padding(12)
+            .into();
+        }
+        let mut body = head
+            .push(
                 row![
-                    small("Width").width(44),
-                    slider(0.5..=12.0, self.paint.edge_width, |value| Message::Paint(
-                        PaintMessage::EdgeWidth(value)
-                    ))
-                    .step(0.5),
-                    text(format!("{:.1}", self.paint.edge_width))
+                    current,
+                    text_input("#rrggbb", &self.paint.hex)
                         .size(13)
-                        .width(28),
+                        .padding([3, 6])
+                        .on_input(|value| Message::Paint(PaintMessage::HexTyped(value))),
+                    eraser,
+                    pipette,
+                ]
+                .spacing(8)
+                .align_y(Center),
+            )
+            .push(
+                container(
+                    wheel::view(hsv, INNER - 20.0)
+                        .map(|value| Message::Paint(PaintMessage::WheelPicked(value))),
+                )
+                .center_x(Fill),
+            )
+            .push(
+                row![
+                    small("Light").width(44),
+                    // Black, the colour itself (in the middle), white.
+                    slider(0.0..=2.0, hsv.value, move |value| {
+                        Message::Paint(PaintMessage::WheelPicked(Hsv { value, ..hsv }))
+                    })
+                    .step(0.01),
+                ]
+                .spacing(8)
+                .align_y(Center),
+            )
+            .push(
+                row![
+                    small("Opacity").width(44),
+                    // See-through to opaque.
+                    slider(0.0..=1.0, hsv.alpha, move |alpha| {
+                        Message::Paint(PaintMessage::WheelPicked(Hsv { alpha, ..hsv }))
+                    })
+                    .step(0.01),
                 ]
                 .spacing(8)
                 .align_y(Center),
             );
+        if self.paint.target == Target::Edges {
+            body = body.push(self.edge_width_slider());
         }
         // Everything at once; holding Shift, on every layer.
         let all_layers = self.modifiers.shift();
@@ -310,6 +316,15 @@ impl Tessera {
                 .style(button::secondary)
                 .on_press(Message::Paint(PaintMessage::PaintEverything(all_layers))),
             tip("Hold Shift to paint every layer"),
+            tooltip::Position::Bottom,
+        ));
+        body = body.push(tooltip(
+            button(text("Add gradient…").size(12).width(Fill).center())
+                .width(Fill)
+                .padding([4, 8])
+                .style(button::secondary)
+                .on_press(Message::Gradient(GradientMessage::Open(true))),
+            tip("Colour the faces (or edges) a shape at a time, along a line you draw (Shift+G)"),
             tooltip::Position::Bottom,
         ));
         body = body
@@ -330,6 +345,188 @@ impl Tessera {
         ))
         .padding(12)
         .into()
+    }
+
+    /// How wide the brush paints edges.
+    fn edge_width_slider(&self) -> Element<'_, Message> {
+        row![
+            text("Width").size(13).width(44),
+            slider(0.5..=12.0, self.paint.edge_width, |value| Message::Paint(
+                PaintMessage::EdgeWidth(value)
+            ))
+            .step(0.5),
+            text(format!("{:.1}", self.paint.edge_width))
+                .size(13)
+                .width(28),
+        ]
+        .spacing(8)
+        .align_y(Center)
+        .into()
+    }
+
+    /// Laying a gradient (in the paint panel, `inner` wide): linear or
+    /// radial, its stops on a bar (the one picked coloured on the wheel),
+    /// what to do on the canvas, applying it; the presets.
+    fn gradient_controls(&self, inner: f32) -> Element<'_, Message> {
+        use gradient::Kind;
+        let gradients = &self.gradients;
+        let small = |label| text(label).size(13);
+        let hint = |label| text(label).size(11).style(text::secondary);
+        let message = |m| Message::Gradient(m);
+        let hsv = gradients.hsv;
+        let swatch = container(space().width(24).height(24)).style(move |_| container::Style {
+            background: Some(hsv.to_color().into()),
+            border: iced::Border {
+                radius: 3.0.into(),
+                ..iced::Border::default()
+            },
+            ..container::Style::default()
+        });
+        let removable = gradients.gradient.stops().len() > 2;
+        let mut body = column![
+            joined(vec![
+                (
+                    "Linear",
+                    gradients.gradient.kind == Kind::Linear,
+                    message(GradientMessage::SetKind(Kind::Linear)),
+                ),
+                (
+                    "Radial",
+                    gradients.gradient.kind == Kind::Radial,
+                    message(GradientMessage::SetKind(Kind::Radial)),
+                ),
+            ]),
+            gradient_bar::view(&gradients.gradient, gradients.selected, inner)
+                .map(|event| Message::Gradient(GradientMessage::Bar(event))),
+            hint("Click the bar to add a colour; drag one along"),
+            row![
+                swatch,
+                text_input("#rrggbb", &gradients.hex)
+                    .size(13)
+                    .padding([3, 6])
+                    .on_input(|value| Message::Gradient(GradientMessage::HexTyped(value))),
+                tooltip(
+                    button(small("×"))
+                        .padding([3, 8])
+                        .style(button::secondary)
+                        .on_press_maybe(removable.then(|| message(GradientMessage::RemoveStop))),
+                    tip("Take this colour out"),
+                    tooltip::Position::Bottom,
+                ),
+                tooltip(
+                    button(small("⇄"))
+                        .padding([3, 8])
+                        .style(button::secondary)
+                        .on_press(message(GradientMessage::Reverse)),
+                    tip("The other way round"),
+                    tooltip::Position::Bottom,
+                ),
+            ]
+            .spacing(6)
+            .align_y(Center),
+            container(
+                wheel::view(hsv, inner - 20.0)
+                    .map(|value| Message::Gradient(GradientMessage::WheelPicked(value)))
+            )
+            .center_x(Fill),
+            row![
+                small("Light").width(44),
+                slider(0.0..=2.0, hsv.value, move |value| {
+                    Message::Gradient(GradientMessage::WheelPicked(Hsv { value, ..hsv }))
+                })
+                .step(0.01),
+            ]
+            .spacing(8)
+            .align_y(Center),
+            row![
+                small("Opacity").width(44),
+                slider(0.0..=1.0, hsv.alpha, move |alpha| {
+                    Message::Gradient(GradientMessage::WheelPicked(Hsv { alpha, ..hsv }))
+                })
+                .step(0.01),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        ]
+        .spacing(8);
+        let what = match (gradients.gradient.kind, self.paint.target) {
+            (_, _) if gradients.line.is_some() => {
+                "Drag its ends to change it, or draw another; Shift: every 15°"
+            }
+            (Kind::Linear, Target::Faces) => {
+                "Drag across the shapes to colour: from where it starts to where it ends"
+            }
+            (Kind::Radial, Target::Faces) => {
+                "Drag across the shapes to colour: out from its centre to its rim"
+            }
+            (Kind::Linear, Target::Edges) => {
+                "Drag across the shapes whose edges to colour: from where it starts to where it ends"
+            }
+            (Kind::Radial, Target::Edges) => {
+                "Drag across the shapes whose edges to colour: out from its centre to its rim"
+            }
+        };
+        body = body.push(hint(what)).push(
+            row![
+                button(small("Apply").width(Fill).center())
+                    .width(Fill)
+                    .padding([4, 8])
+                    .on_press_maybe(gradients.line.map(|_| message(GradientMessage::Apply))),
+                button(small("Done").width(Fill).center())
+                    .width(Fill)
+                    .padding([4, 8])
+                    .style(button::secondary)
+                    .on_press(message(GradientMessage::Done)),
+            ]
+            .spacing(8),
+        );
+
+        // Presets: kept under a name, picked to come back to.
+        body = body.push(hint("Presets")).push(
+            row![
+                text_input("Name", &gradients.name)
+                    .size(13)
+                    .padding([3, 6])
+                    .on_input(|value| Message::Gradient(GradientMessage::NameTyped(value)))
+                    .on_submit(message(GradientMessage::SavePreset)),
+                button(small("Save"))
+                    .padding([3, 10])
+                    .style(button::secondary)
+                    .on_press_maybe(
+                        (!gradients.name.trim().is_empty())
+                            .then(|| message(GradientMessage::SavePreset))
+                    ),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        );
+        for (i, preset) in gradients.presets.list().iter().enumerate() {
+            let strip = gradient_bar::strip(&preset.gradient, iced::Size::new(40.0, 14.0))
+                .map(move |_| Message::Gradient(GradientMessage::LoadPreset(i)));
+            body = body.push(
+                row![
+                    button(
+                        row![strip, text(preset.name.as_str()).size(12)]
+                            .spacing(8)
+                            .align_y(Center)
+                    )
+                    .width(Fill)
+                    .padding([2, 6])
+                    .style(button::text)
+                    .on_press(message(GradientMessage::LoadPreset(i))),
+                    tooltip(
+                        button(small("×"))
+                            .padding([2, 8])
+                            .style(button::text)
+                            .on_press(message(GradientMessage::RemovePreset(i))),
+                        tip("Forget this preset"),
+                        tooltip::Position::Bottom,
+                    ),
+                ]
+                .align_y(Center),
+            );
+        }
+        scrollable(body).into()
     }
 
     /// The layers, front first, beside the canvas: select one to edit it,

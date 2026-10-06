@@ -154,6 +154,12 @@ impl Tessera {
                 self.push_undo(before);
                 Task::none()
             }
+            editor::Message::GradientLine(line) => {
+                if self.gradients.open {
+                    self.gradients.line = line;
+                }
+                Task::none()
+            }
             editor::Message::MoveBackground(delta) => {
                 if let Some(background) = self.background_mut() {
                     background.center += delta;

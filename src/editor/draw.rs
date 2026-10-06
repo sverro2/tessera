@@ -278,6 +278,7 @@ impl Editor<'_> {
             // paint, and the brush as the cursor.
             Tool::Paint { .. } => self.draw_painting(&mut overlay, state, cursor_pos),
             Tool::Mirror => self.draw_placing_mirror(&mut overlay, state, bounds, cursor_pos),
+            Tool::Gradient { .. } => self.draw_gradient_line(&mut overlay, state),
             Tool::Shape => {
                 self.draw_shaping(&mut overlay, state, bounds, cursor_pos, pending, source)
             }

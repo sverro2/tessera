@@ -8,6 +8,7 @@ mod backdrop;
 mod checker;
 mod drags;
 mod extrude;
+mod gradient;
 mod grid;
 mod guides;
 mod mirror;

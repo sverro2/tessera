@@ -402,6 +402,7 @@ impl Editor<'_> {
             | Interaction::Zooming { .. }
             | Interaction::MovingBackground { .. }
             | Interaction::Painting { .. }
+            | Interaction::Gradienting { .. }
             | Interaction::Lassoing => {}
             Interaction::PlacingMirror {
                 start,
@@ -587,6 +588,7 @@ impl Editor<'_> {
             | Interaction::MovingBackground { .. }
             | Interaction::Painting { .. }
             | Interaction::Lassoing
+            | Interaction::Gradienting { .. }
             | Interaction::PlacingMirror { .. } => None,
             // Worked out as they move (see `follow`); not moved yet, nothing.
             Interaction::MovingSelection { .. }

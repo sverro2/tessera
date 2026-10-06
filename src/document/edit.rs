@@ -265,6 +265,39 @@ impl Document {
                 };
                 true
             }
+            Edit::PaintFaces { faces } => {
+                let keys: Option<Vec<_>> = faces
+                    .iter()
+                    .map(|&(t, color)| Some((key(*self.triangles.get(t)?), color)))
+                    .collect();
+                let Some(keys) = keys else {
+                    return false;
+                };
+                for (t, color) in keys {
+                    match color {
+                        Some(color) => self.colors.insert(t, color),
+                        None => self.colors.remove(&t),
+                    };
+                }
+                true
+            }
+            Edit::PaintEdges { edges } => {
+                let there = self.unique_edges();
+                let ends = |a: VertexId, b: VertexId| (a.min(b), a.max(b));
+                if !edges
+                    .iter()
+                    .all(|&(a, b, _)| there.binary_search(&ends(a, b)).is_ok())
+                {
+                    return false;
+                }
+                for (a, b, style) in edges {
+                    match style {
+                        Some(style) => self.edge_styles.insert(ends(a, b), style),
+                        None => self.edge_styles.remove(&ends(a, b)),
+                    };
+                }
+                true
+            }
             // Carried out by `merge`.
             Edit::Merging { .. } => false,
             Edit::PaintAll { color } => {

@@ -81,10 +81,11 @@ pub enum Action {
     Lightness,
     Opacity,
     Width,
+    Gradient,
 }
 
 impl Action {
-    pub const ALL: [Action; 33] = [
+    pub const ALL: [Action; 34] = [
         Action::ToggleMode,
         Action::New,
         Action::Open,
@@ -118,6 +119,7 @@ impl Action {
         Action::Lightness,
         Action::Opacity,
         Action::Width,
+        Action::Gradient,
     ];
 
     pub fn context(self) -> Context {
@@ -129,7 +131,9 @@ impl Action {
             | SelectShape | SelectAll | Copy | CutFaces | Paste | Proportional | Reach => {
                 Context::Shape
             }
-            PaintFaces | PaintEdges | Pipette | Lightness | Opacity | Width => Context::Paint,
+            PaintFaces | PaintEdges | Pipette | Lightness | Opacity | Width | Gradient => {
+                Context::Paint
+            }
         }
     }
 
@@ -177,6 +181,7 @@ impl Action {
             Lightness => "Hold and move: lighter or darker",
             Opacity => "Hold and move: more or less opaque",
             Width => "Hold and move: edge width",
+            Gradient => "Lay a gradient: drag its line across the shapes to colour",
         }
     }
 
@@ -217,6 +222,7 @@ impl Action {
             Lightness => &["C"],
             Opacity => &["Shift+C"],
             Width => &["W"],
+            Gradient => &["Shift+G"],
         }
     }
 

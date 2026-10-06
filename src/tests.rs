@@ -1108,3 +1108,148 @@ fn opening_restores_the_document_and_view() {
     assert_eq!(app.files.path, Some(path));
     assert!(!app.is_unsaved());
 }
+
+/// Laying a gradient on a layer of two shapes apart (`edit` at 0 and at
+/// 400): red to blue, its line across the first.
+fn laying_red_to_blue() -> Tessera {
+    let mut app = Tessera::default();
+    edit(&mut app, 0.0);
+    edit(&mut app, 400.0);
+    let _ = app.update(Message::SetMode(Mode::Paint));
+    let gradient = |app: &mut Tessera, message| {
+        let _ = app.update(Message::Gradient(message));
+    };
+    gradient(&mut app, GradientMessage::Open(true));
+    gradient(&mut app, GradientMessage::HexTyped("#ff0000".into()));
+    gradient(
+        &mut app,
+        GradientMessage::Bar(gradient_bar::BarEvent::Pick(1)),
+    );
+    gradient(&mut app, GradientMessage::HexTyped("#0000ff".into()));
+    let line = (Point::new(100.0, 250.0), Point::new(300.0, 250.0));
+    let _ = app.update(Message::Editor(editor::Message::GradientLine(Some(line))));
+    app
+}
+
+#[test]
+fn a_gradient_shows_on_the_shapes_its_line_runs_through_and_applies_as_one_step() {
+    let mut app = laying_red_to_blue();
+    assert!(matches!(app.tool(), Tool::Gradient { line: Some(_), .. }));
+    let default = Some(document::DEFAULT_FACE);
+    // Shown, not yet painted.
+    let preview = app.gradient_preview().expect("a preview");
+    let shown = preview.color(0).unwrap();
+    assert!(shown.r > 0.3 && shown.b > 0.3, "{shown:?}");
+    assert_eq!(preview.color(1), default);
+    assert_eq!(app.document().color(0), default);
+
+    let _ = app.update(Message::Gradient(GradientMessage::Apply));
+    // Its middle halfway along: red and blue.
+    assert_eq!(app.document().color(0), Some(shown));
+    // The shape apart, not reached.
+    assert_eq!(app.document().color(1), default);
+    // Done: the line's gone, for the next.
+    assert_eq!(app.gradients.line, None);
+    assert!(app.gradient_preview().is_none());
+    let _ = app.update(Message::Undo);
+    assert_eq!(app.document().color(0), default);
+}
+
+#[test]
+fn a_see_through_gradient_lets_the_colour_there_was_show_through() {
+    let mut app = laying_red_to_blue();
+    let _ = app.update(Message::Gradient(GradientMessage::HexTyped(
+        "#0000ff33".into(),
+    )));
+    let _ = app.update(Message::Gradient(GradientMessage::Bar(
+        gradient_bar::BarEvent::Pick(0),
+    )));
+    let _ = app.update(Message::Gradient(GradientMessage::HexTyped(
+        "#0000ff33".into(),
+    )));
+    let _ = app.update(Message::Gradient(GradientMessage::Apply));
+    let veil = paint::from_hex("#0000ff33").unwrap();
+    let color = app.document().color(0).unwrap();
+    // As opaque as it was; a fifth blue over the colour it had.
+    let expected = gradient::over(veil, Some(document::DEFAULT_FACE)).unwrap();
+    assert_eq!(paint::to_hex(color), paint::to_hex(expected));
+    assert_eq!(color.a, 1.0);
+}
+
+#[test]
+fn a_gradient_laid_on_edges_colours_only_edges_keeping_their_width() {
+    let mut app = laying_red_to_blue();
+    let _ = app.update(Message::Paint(PaintMessage::SetTarget(Target::Edges)));
+    let _ = app.update(Message::Gradient(GradientMessage::Apply));
+    let document = app.document();
+    assert_eq!(document.color(0), Some(document::DEFAULT_FACE));
+    let changed: Vec<_> = document
+        .edge_styles()
+        .filter(|(_, _, style)| *style != document::DEFAULT_EDGE)
+        .collect();
+    // The first triangle's three, as wide as they were.
+    assert_eq!(changed.len(), 3, "{changed:?}");
+    assert!(
+        changed
+            .iter()
+            .all(|(a, _, style)| *a < 3 && style.width == document::DEFAULT_EDGE.width)
+    );
+}
+
+#[test]
+fn gradients_are_kept_as_presets_to_come_back_to() {
+    let mut app = laying_red_to_blue();
+    let gradient = |app: &mut Tessera, message| {
+        let _ = app.update(Message::Gradient(message));
+    };
+    let red_to_blue = app.gradients.gradient.clone();
+    gradient(&mut app, GradientMessage::NameTyped("Dusk".into()));
+    gradient(&mut app, GradientMessage::SavePreset);
+    assert_eq!(app.gradients.name, "");
+    gradient(&mut app, GradientMessage::Reverse);
+    gradient(&mut app, GradientMessage::SetKind(gradient::Kind::Radial));
+    assert_ne!(app.gradients.gradient, red_to_blue);
+    gradient(&mut app, GradientMessage::LoadPreset(0));
+    assert_eq!(app.gradients.gradient, red_to_blue);
+    // The colour picked, the first's.
+    assert_eq!(app.gradients.hex, "#ff0000");
+    gradient(&mut app, GradientMessage::RemovePreset(0));
+    assert!(app.gradients.presets.list().is_empty());
+}
+
+#[test]
+fn done_applies_the_gradient_shown_and_goes_back_to_the_brush() {
+    let mut app = laying_red_to_blue();
+    let shown = app.gradient_preview().unwrap().color(0);
+    let _ = app.update(Message::Gradient(GradientMessage::Done));
+    assert!(matches!(app.tool(), Tool::Paint { .. }));
+    assert_eq!(app.document().color(0), shown);
+    assert_eq!(app.gradients.line, None);
+    // One step.
+    let _ = app.update(Message::Undo);
+    assert_eq!(app.document().color(0), Some(document::DEFAULT_FACE));
+    // Without a line: just done, nothing changed (and nothing said).
+    let _ = app.update(Message::Gradient(GradientMessage::Open(true)));
+    let _ = app.update(Message::Gradient(GradientMessage::Done));
+    assert!(!app.gradients.open && app.notice.is_none());
+    assert_eq!(app.document().color(0), Some(document::DEFAULT_FACE));
+}
+
+#[test]
+fn esc_stops_laying_a_gradient_without_applying_it() {
+    let mut app = laying_red_to_blue();
+    let escape = Key::Named(keyboard::key::Named::Escape);
+    let _ = app.update(Message::Key(keyboard::Event::KeyPressed {
+        key: escape.clone(),
+        modified_key: escape,
+        physical_key: keyboard::key::Physical::Unidentified(
+            keyboard::key::NativeCode::Unidentified,
+        ),
+        location: keyboard::Location::Standard,
+        modifiers: keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    }));
+    assert!(matches!(app.tool(), Tool::Paint { .. }));
+    assert_eq!(app.document().color(0), Some(document::DEFAULT_FACE));
+}

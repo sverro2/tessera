@@ -163,6 +163,15 @@ pub enum Edit {
     PaintAll { color: Option<Color> },
     /// Paint every edge this style; `None` clears them all.
     PaintAllEdges { style: Option<EdgeStyle> },
+    /// Paint each of these faces its colour (`None` clears it): many at
+    /// once, as a gradient does.
+    PaintFaces {
+        faces: Vec<(TriangleId, Option<Color>)>,
+    },
+    /// Paint each of these edges its style (`None` clears it).
+    PaintEdges {
+        edges: Vec<(VertexId, VertexId, Option<EdgeStyle>)>,
+    },
 }
 
 impl Edit {

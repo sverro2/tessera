@@ -953,3 +953,32 @@ fn subdividing_nothing_that_is_an_edge_is_rejected() {
         edges: vec![(0, 7)]
     }));
 }
+
+#[test]
+fn many_faces_or_edges_are_painted_at_once_or_none_if_one_isnt_there() {
+    let mut doc = doc_with_triangle();
+    let red = Color::from_rgb(1.0, 0.0, 0.0);
+    assert!(doc.apply(Edit::PaintFaces {
+        faces: vec![(0, Some(red))]
+    }));
+    assert_eq!(doc.color(0), Some(red));
+    // A face that isn't there: nothing painted.
+    assert!(!doc.apply(Edit::PaintFaces {
+        faces: vec![(0, None), (5, Some(red))]
+    }));
+    assert_eq!(doc.color(0), Some(red));
+
+    let style = EdgeStyle {
+        color: red,
+        width: 3.0,
+    };
+    // Either way round.
+    assert!(doc.apply(Edit::PaintEdges {
+        edges: vec![(1, 0, Some(style)), (1, 2, None)]
+    }));
+    assert_eq!(doc.edge_style(0, 1), Some(style));
+    assert_eq!(doc.edge_style(1, 2), None);
+    assert!(!doc.apply(Edit::PaintEdges {
+        edges: vec![(0, 7, Some(style))]
+    }));
+}

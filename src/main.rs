@@ -15,6 +15,8 @@ mod document;
 mod editor;
 mod file;
 mod geometry;
+mod gradient;
+mod gradient_bar;
 mod icons;
 mod joints;
 mod keys;
@@ -55,8 +57,8 @@ use paint::{Brush, Hsv, Target};
 use panels::{joined, tip};
 use update::{
     BackgroundMessage, Backgrounds, ExportMessage, ExportSettings, Field, Fields, FileMessage,
-    Files, Format, KeysMessage, LayerAction, LayersPanel, MenuMessage, PageDialog, PageMessage,
-    PaintMessage, Painting, ShapeMessage, Shaping, SnapMessage,
+    Files, Format, GradientMessage, Gradients, KeysMessage, LayerAction, LayersPanel, MenuMessage,
+    PageDialog, PageMessage, PaintMessage, Painting, ShapeMessage, Shaping, SnapMessage,
 };
 
 pub fn main() -> iced::Result {
@@ -133,6 +135,8 @@ struct Tessera {
     export: ExportSettings,
     /// The brush and painting with it.
     paint: Painting,
+    /// Laying a gradient over the current layer, and the presets.
+    gradients: Gradients,
     /// The layers panel: what's selected, named, dragged, pointed at and
     /// isolated in it.
     layers_panel: LayersPanel,
@@ -214,6 +218,7 @@ enum Message {
     /// A frame, while a notice fades.
     Frame(Instant),
     Paint(PaintMessage),
+    Gradient(GradientMessage),
     Shape(ShapeMessage),
     Keys(KeysMessage),
     File(FileMessage),
@@ -417,6 +422,7 @@ impl Tessera {
                 places: places::Places::load(),
                 ..Files::default()
             },
+            gradients: Gradients::with(gradient::Presets::load()),
             ..Tessera::default()
         }
     }
@@ -428,6 +434,7 @@ impl Tessera {
         if self.current() != current {
             self.caches.backdrop.clear();
         }
+        self.refresh_gradient();
         task
     }
 
@@ -437,6 +444,7 @@ impl Tessera {
             Message::Editor(message) => self.update_canvas(message),
             Message::Layers(action) => self.layer_action(action),
             Message::Paint(message) => self.update_paint(message),
+            Message::Gradient(message) => self.update_gradient(message),
             Message::Shape(message) => self.update_shape(message),
             Message::Keys(message) => self.update_keys(message),
             Message::File(message) => self.update_file(message),
@@ -556,6 +564,7 @@ impl Tessera {
             self.backgrounds.editing = false;
             self.paint.picking = false;
             self.shape.placing_mirror = false;
+            self.gradients.open = false;
             return Task::none();
         }
         if self.dialogs.dialog_open() {
@@ -586,6 +595,8 @@ impl Tessera {
             Action::PaintFaces => Message::Paint(PaintMessage::SetTarget(Target::Faces)),
             Action::PaintEdges => Message::Paint(PaintMessage::SetTarget(Target::Edges)),
             Action::Pipette => Message::Paint(PaintMessage::TogglePicking),
+            Action::Gradient if self.gradients.open => Message::Gradient(GradientMessage::Done),
+            Action::Gradient => Message::Gradient(GradientMessage::Open(true)),
             _ => return Task::none(),
         };
         self.update(message)
@@ -737,10 +748,15 @@ impl Tessera {
             {
                 let current = self.current();
                 let (below, above) = self.layers.around(current, &self.layers_panel.isolated);
+                let mut layer =
+                    editor::SceneLayer::of(self.layers.layer(current).expect("current layer"));
+                // Laying a gradient: the layer as it would colour it (kept,
+                // so it's drawn once, not every frame).
+                if let Some(preview) = self.gradient_preview() {
+                    layer.document = preview;
+                }
                 let scene = editor::Scene {
-                    current: editor::SceneLayer::of(
-                        self.layers.layer(current).expect("current layer"),
-                    ),
+                    current: layer,
                     shown: self.layers.in_view(current, &self.layers_panel.isolated),
                     below: below.into_iter().map(editor::SceneLayer::of).collect(),
                     above: above.into_iter().map(editor::SceneLayer::of).collect(),
@@ -843,6 +859,10 @@ impl Tessera {
             },
             _ if self.shape.placing_mirror => Tool::Mirror,
             Mode::Shape => Tool::Shape,
+            Mode::Paint if self.gradients.open => Tool::Gradient {
+                line: self.gradients.line,
+                radial: self.gradients.gradient.kind == gradient::Kind::Radial,
+            },
             Mode::Paint => Tool::Paint {
                 target: self.paint.target,
                 brush: self.paint.brush,

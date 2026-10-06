@@ -106,6 +106,12 @@ impl Editor<'_> {
                 state.aim.get_or_insert(to);
             }
         }
+        // A gradient's line being dragged, but no longer laying one: let go.
+        if matches!(state.interaction, Interaction::Gradienting { .. })
+            && !matches!(self.tool, Tool::Gradient { .. })
+        {
+            state.interaction = Interaction::Idle;
+        }
         // The selection is only the shape mode's, and only of vertices still
         // there (not welded away, say, or undone).
         if self.tool != Tool::Shape || !self.shown {
@@ -168,8 +174,7 @@ impl Editor<'_> {
                 if action == Action::Undo
                     && (dragging(state.interaction) || state.interaction.is_transforming())
                 {
-                    cancel(state);
-                    return Some(canvas::Action::request_redraw().and_capture());
+                    return Some(cancel(state).and_capture());
                 }
                 self.on_action(state, action, *repeat, inside, screen)
             }
@@ -704,8 +709,7 @@ impl Editor<'_> {
         // Mid-drag, a right click cancels it: all is as it was, and letting
         // go of the left button then does nothing.
         if button == mouse::Button::Right && dragging(state.interaction) {
-            cancel(state);
-            return Some(canvas::Action::request_redraw().and_capture());
+            return Some(cancel(state).and_capture());
         }
         // Grabbed, rotating or scaling, the selection follows the cursor: a
         // click applies that; a right click cancels it.
@@ -801,6 +805,9 @@ impl Editor<'_> {
             mouse::Button::Middle => Interaction::Panning { last: pos },
             mouse::Button::Left if matches!(self.tool, Tool::Background { .. }) => {
                 Interaction::MovingBackground { last: pos }
+            }
+            mouse::Button::Left if matches!(self.tool, Tool::Gradient { .. }) => {
+                self.start_gradient(pos)
             }
             mouse::Button::Left if self.tool == Tool::Mirror => {
                 let snapped = self.mirror_end(pos);
@@ -922,6 +929,7 @@ impl Editor<'_> {
                 }
                 return canvas::Action::request_redraw().and_capture();
             }
+            Interaction::Gradienting { .. } => return self.move_gradient(state, world),
             Interaction::MovingBackground { last } => {
                 let delta = self.camera.to_world(pos) - self.camera.to_world(*last);
                 *last = pos;
@@ -1035,6 +1043,9 @@ impl Editor<'_> {
                 }
                 .and_capture(),
             );
+        }
+        if let Interaction::Gradienting { .. } = finished {
+            return Some(canvas::Action::request_redraw().and_capture());
         }
         if let Interaction::Lassoing = finished {
             let lasso = std::mem::take(&mut state.lasso);
@@ -1154,7 +1165,7 @@ impl Editor<'_> {
     ) -> Option<Action> {
         let context = match self.tool {
             Tool::Shape => Context::Shape,
-            Tool::Paint { .. } => Context::Paint,
+            Tool::Paint { .. } | Tool::Gradient { .. } => Context::Paint,
             Tool::Background { .. } | Tool::Mirror => return None,
         };
         let chord = Chord::pressed(key, physical, modifiers)?;
@@ -1192,15 +1203,24 @@ fn dragging(interaction: Interaction) -> bool {
             | Interaction::Lassoing
             | Interaction::PlacingMirror { .. }
             | Interaction::Painting { .. }
+            | Interaction::Gradienting { .. }
     )
 }
 
-/// What's going on, cancelled: all is as it was.
-fn cancel(state: &mut State) {
+/// What's going on, cancelled: all is as it was (the gradient's line
+/// too, as it was before the drag).
+fn cancel(state: &mut State) -> canvas::Action<Message> {
+    let action = match state.interaction {
+        Interaction::Gradienting { before, .. } => {
+            canvas::Action::publish(Message::GradientLine(before))
+        }
+        _ => canvas::Action::request_redraw(),
+    };
     state.interaction = Interaction::Idle;
     state.pending = None;
     state.aim = None;
     state.lasso.clear();
     state.stroke.clear();
     state.edge_stroke.clear();
+    action
 }
